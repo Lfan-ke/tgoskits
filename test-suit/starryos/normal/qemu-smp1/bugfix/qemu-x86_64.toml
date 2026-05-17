@@ -15,6 +15,7 @@ uefi = false
 to_bin = false
 shell_prefix = "root@starry:"
 test_commands = [
+    "/usr/bin/bug-starry-open-eintr-not-implemented",
     "/usr/bin/bug-futex-wait-wake",
     "/usr/bin/bug-epoll-wait-user-buffer-race",
     "/usr/bin/bug-getcwd-syscall-return",
