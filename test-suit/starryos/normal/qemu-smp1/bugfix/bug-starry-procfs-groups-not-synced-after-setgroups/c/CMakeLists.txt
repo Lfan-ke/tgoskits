@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(bug-starry-procfs-groups-not-synced-after-setgroups C)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)
+add_executable(bug-starry-procfs-groups-not-synced-after-setgroups src/main.c)
+target_compile_options(bug-starry-procfs-groups-not-synced-after-setgroups PRIVATE -Wall -Wextra -Werror)
+install(TARGETS bug-starry-procfs-groups-not-synced-after-setgroups RUNTIME DESTINATION usr/bin)
