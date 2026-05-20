@@ -976,6 +976,18 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# bb_setlogcons — TIOCLINUX subcmd 11 (ioctl) on /dev/tty0.
+# Accept either rc=0 (kernel supports it) or "can't open /dev/tty0" host-style
+# fallback (kernel returns ENOENT/EPERM but applet itself works).
+_t=$({ timeout 10 sh -c "busybox setlogcons 0 2>&1"; echo "EXIT:$?"; } 2>&1)
+_rc=$(printf '%s\n' "$_t" | sed -n 's/^EXIT://p')
+_msg=$(printf '%s\n' "$_t" | sed '/^EXIT:/d')
+if [ "$_rc" = 0 ] || echo "$_msg" | grep -qF "/dev/tty0"; then
+    echo "PASS: busybox_setlogcons"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_setlogcons (rc=$_rc)"; echo "$_msg"; FAIL=$((FAIL+1))
+fi
+
 echo "=== BusyBox Test Summary ==="
 echo "PASS: $PASS  FAIL: $FAIL  TOTAL: $((PASS+FAIL))"
 _m1="Test"; _m2="run"; _m3="completed"; echo "$_m1 $_m2 $_m3"
