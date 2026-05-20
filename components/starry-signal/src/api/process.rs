@@ -91,6 +91,18 @@ impl ProcessSignalManager {
         result
     }
 
+    /// Discards every pending process-level signal contained in `mask`.
+    ///
+    /// Used for POSIX job-control mutual cancellation: `SIGCONT` discards
+    /// pending stop signals and a stop signal discards a pending `SIGCONT`.
+    pub fn discard_pending(&self, mask: &SignalSet) {
+        let mut guard = self.pending.lock();
+        guard.discard(mask);
+        if guard.set.is_empty() {
+            self.possibly_has_signal.store(false, Ordering::Release);
+        }
+    }
+
     /// Sends a signal to the process.
     ///
     /// Returns `Some(tid)` if the signal wakes up a thread.
