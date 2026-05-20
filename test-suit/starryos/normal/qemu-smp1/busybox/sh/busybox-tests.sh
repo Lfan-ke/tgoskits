@@ -976,6 +976,24 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# bb_killall5 — sends SIGSTOP, then the requested signal (0 = test-only), then
+# SIGCONT to every process outside its own session. The property under test is
+# job control: the harness shell is briefly stopped then resumed and MUST
+# survive. We run killall5 then emit a sentinel from the SAME shell — the
+# sentinel only prints if control returned to a live, resumed shell (a broken
+# SIGSTOP/SIGCONT would leave it stopped until the 10s timeout kills it).
+# busybox killall5 returns 2 when no out-of-session process was signaled, so
+# accept rc 0/1/2; reject "applet not found".
+_t=$({ timeout 10 sh -c "busybox killall5 -0; echo KA5_RC:\$?; echo KA5_SURVIVED"; } 2>&1)
+_rc=$(printf '%s\n' "$_t" | sed -n 's/^KA5_RC://p')
+if echo "$_t" | grep -qF "KA5_SURVIVED" \
+    && { [ "$_rc" = 0 ] || [ "$_rc" = 1 ] || [ "$_rc" = 2 ]; } \
+    && ! echo "$_t" | grep -qiF "not found"; then
+    echo "PASS: busybox_killall5"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_killall5 (rc=$_rc)"; echo "$_t"; FAIL=$((FAIL+1))
+fi
+
 echo "=== BusyBox Test Summary ==="
 echo "PASS: $PASS  FAIL: $FAIL  TOTAL: $((PASS+FAIL))"
 _m1="Test"; _m2="run"; _m3="completed"; echo "$_m1 $_m2 $_m3"

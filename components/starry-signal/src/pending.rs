@@ -50,6 +50,15 @@ impl PendingSignals {
         true
     }
 
+    /// Discards every pending signal contained in `mask`.
+    ///
+    /// Used for POSIX job-control mutual cancellation: generating `SIGCONT`
+    /// discards pending stop signals, and generating a stop signal discards a
+    /// pending `SIGCONT`.
+    pub fn discard(&mut self, mask: &SignalSet) {
+        while self.dequeue_signal(mask).is_some() {}
+    }
+
     /// Dequeues the next pending signal contained in `mask`, if any.
     pub fn dequeue_signal(&mut self, mask: &SignalSet) -> Option<SignalInfo> {
         self.set.dequeue(mask).and_then(|signo| {
