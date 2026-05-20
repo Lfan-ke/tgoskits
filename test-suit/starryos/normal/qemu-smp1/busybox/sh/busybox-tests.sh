@@ -976,6 +976,22 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# bb_resize — probes the terminal size on its stderr tty (writes ESC7 ESC[r
+# ESC[999;999H ESC[6n ESC8 and reads back the cursor position), then prints a
+# shell-eval `COLUMNS=N;LINES=N;export COLUMNS LINES;` to stdout. resize uses
+# fd 2 as the terminal, so only stdout is redirected to a file: stderr stays
+# the controlling console (a real tty) for the query. Capturing via a pipe
+# (command substitution) instead would make every fd a non-tty and resize
+# would bail with ENOTTY, emitting no trailer. The starry console does not
+# answer ESC[6n, so resize falls back to COLUMNS=0;LINES=0 — the trailer that
+# matters here is still emitted.
+busybox resize >/tmp/bb_resize.out
+if grep -qF "COLUMNS=" /tmp/bb_resize.out && grep -qF "LINES=" /tmp/bb_resize.out && grep -qF "export COLUMNS LINES" /tmp/bb_resize.out; then
+    echo "PASS: busybox_resize"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_resize"; busybox cat /tmp/bb_resize.out; FAIL=$((FAIL+1))
+fi
+
 echo "=== BusyBox Test Summary ==="
 echo "PASS: $PASS  FAIL: $FAIL  TOTAL: $((PASS+FAIL))"
 _m1="Test"; _m2="run"; _m3="completed"; echo "$_m1 $_m2 $_m3"
