@@ -976,6 +976,20 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# bb_fdflush — issues the BLKFLSBUF ioctl. On a non-block fd (/dev/null) the
+# ioctl is rejected and busybox prints "Not a tty" / "Inappropriate ioctl".
+# Require that diagnostic (and reject "applet not found") so an unregistered
+# applet — which exits nonzero with "not found" — cannot pass on a bare rc!=0.
+_t=$({ timeout 10 sh -c "busybox fdflush /dev/null 2>&1"; echo "EXIT:$?"; } 2>&1)
+_rc=$(printf '%s\n' "$_t" | sed -n 's/^EXIT://p')
+_msg=$(printf '%s\n' "$_t" | sed '/^EXIT:/d')
+if { echo "$_msg" | grep -qiF "not a tty" || echo "$_msg" | grep -qiF "inappropriate"; } \
+    && ! echo "$_msg" | grep -qiF "not found"; then
+    echo "PASS: busybox_fdflush"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_fdflush (rc=$_rc)"; echo "$_msg"; FAIL=$((FAIL+1))
+fi
+
 echo "=== BusyBox Test Summary ==="
 echo "PASS: $PASS  FAIL: $FAIL  TOTAL: $((PASS+FAIL))"
 _m1="Test"; _m2="run"; _m3="completed"; echo "$_m1 $_m2 $_m3"
