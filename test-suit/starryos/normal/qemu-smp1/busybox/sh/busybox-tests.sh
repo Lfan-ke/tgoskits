@@ -976,6 +976,14 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# bb_remove_shell — applet wiring + usage banner; --help triggers bb_show_usage.
+_t=$({ timeout 10 sh -c "busybox remove-shell --help 2>&1"; } 2>&1)
+if echo "$_t" | grep -qF "Usage:" && echo "$_t" | grep -qiF "shell"; then
+    echo "PASS: busybox_remove_shell"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_remove_shell"; echo "$_t"; FAIL=$((FAIL+1))
+fi
+
 echo "=== BusyBox Test Summary ==="
 echo "PASS: $PASS  FAIL: $FAIL  TOTAL: $((PASS+FAIL))"
 _m1="Test"; _m2="run"; _m3="completed"; echo "$_m1 $_m2 $_m3"
