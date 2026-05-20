@@ -976,6 +976,19 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# bb_rdev — reports the device mounted at "/". busybox stats "/", takes its
+# st_dev, then scans /dev for a block node with a matching st_rdev. starry now
+# exposes the root disk as /dev/vda (a block node whose rdev equals the root
+# mount's device id) and lists it in /proc/mounts, so rdev prints `/dev/vda /`.
+# Host prints its own root device (e.g. `/dev/sdd /`); both match `^/dev/.+ /$`.
+# Require exactly one "/dev/<no-spaces> /" line so stray output can't slip in.
+_t=$({ timeout 10 sh -c "busybox rdev 2>&1"; } 2>&1)
+if [ "$(echo "$_t" | grep -cE "^/dev/[^[:space:]]+[[:space:]]+/$")" = 1 ]; then
+    echo "PASS: busybox_rdev"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_rdev"; echo "$_t"; FAIL=$((FAIL+1))
+fi
+
 echo "=== BusyBox Test Summary ==="
 echo "PASS: $PASS  FAIL: $FAIL  TOTAL: $((PASS+FAIL))"
 _m1="Test"; _m2="run"; _m3="completed"; echo "$_m1 $_m2 $_m3"
