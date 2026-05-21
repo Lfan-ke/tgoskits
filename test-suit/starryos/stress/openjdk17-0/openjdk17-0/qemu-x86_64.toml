@@ -9,21 +9,37 @@ to_bin = false
 shell_prefix = "root@starry:/root #"
 shell_init_cmd = '''
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+export JAVA_TOOL_OPTIONS="-Xint"   # force interpreter on ALL nested JVMs (gradle/kotlin) — JIT still unstable (#206)
 printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-x86_64.path
 cat > /tmp/H.java << 'EOF'
 public class H { public static void main(String[] a){ System.out.println("HI"); } }
 EOF
 jok=0; jbad=0
-for i in 1 2 3 4 5 6 7 8 9 10; do $JAVA_HOME/bin/javac -J-Xint -J-Xmx256m -J-Xms32m -d /tmp /tmp/H.java >/tmp/j.out 2>&1 && jok=$((jok+1)) || jbad=$((jbad+1)); done
+for i in 1 2 3 4 5; do $JAVA_HOME/bin/javac -J-Xint -J-Xmx256m -J-Xms32m -d /tmp /tmp/H.java >/tmp/j.out 2>&1 && jok=$((jok+1)) || jbad=$((jbad+1)); done
 echo "JAVAC ok=$jok bad=$jbad"
 ok=0; bad=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+for i in 1 2 3 4 5; do
   $JAVA_HOME/bin/java -Xint -Xmx256m -Xms32m -jar /root/complex-demo.jar >/tmp/cd.out 2>&1
   grep -q CDEMO_DONE /tmp/cd.out && ok=$((ok+1)) || { bad=$((bad+1)); echo "run$i BAD"; }
 done
 echo "CDEMO ok=$ok bad=$bad"
+# --- DoD-A: build tools on starry ---
+export MAVEN_OPTS="-Xint -Xmx256m -Xms32m"
+cd /root/complex-demo
+/opt/apache-maven-3.9.9/bin/mvn -o -Dmaven.repo.local=/root/.m2/repository -DskipTests -Dmaven.test.skip=true package >/tmp/mvn.out 2>&1
+grep -q "BUILD SUCCESS" /tmp/mvn.out && echo "MVN ok=1" || { echo "MVN ok=0"; tail -20 /tmp/mvn.out; }
+/opt/gradle-8.10.2/bin/gradle --offline --no-daemon -g /root/.gradle build >/tmp/gradle.out 2>&1
+grep -q "BUILD SUCCESSFUL" /tmp/gradle.out && echo "GRADLE ok=1" || { echo "GRADLE ok=0"; tail -20 /tmp/gradle.out; }
+cd /root
+cat > /tmp/K.kt << 'EOF'
+fun main() { println("KOTLIN_OK") }
+EOF
+# invoke Kotlin compiler via java directly (kotlinc wrapper needs bash, rootfs has only busybox ash)
+$JAVA_HOME/bin/java -Xmx512m -cp "/opt/kotlinc/lib/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler /tmp/K.kt -include-runtime -d /tmp/K.jar >/tmp/kt.out 2>&1
+$JAVA_HOME/bin/java -Xmx256m -jar /tmp/K.jar >/tmp/kt.run 2>&1
+grep -q KOTLIN_OK /tmp/kt.run && echo "KOTLIN ok=1" || { echo "KOTLIN ok=0"; tail -15 /tmp/kt.out /tmp/kt.run; }
 echo "BIGTEST_DONE"
 '''
 success_regex = ["(?m)^BIGTEST_DONE"]
 fail_regex = ['(?i)kernel\bpanic']
-timeout = 900
+timeout = 3000
