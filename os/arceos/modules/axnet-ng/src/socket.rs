@@ -258,6 +258,18 @@ pub enum Socket {
     Vsock(Box<VsockSocket>),
 }
 
+impl Socket {
+    /// Bytes available to read without blocking (for the `FIONREAD` ioctl /
+    /// Java `InputStream.available()`). Implemented for TCP; other socket
+    /// kinds conservatively report 0 (a valid `available()` estimate).
+    pub fn recv_available(&self) -> usize {
+        match self {
+            Socket::Tcp(tcp) => tcp.recv_available(),
+            _ => 0,
+        }
+    }
+}
+
 impl From<UdpSocket> for Socket {
     fn from(socket: UdpSocket) -> Self {
         Self::Udp(Box::new(socket))

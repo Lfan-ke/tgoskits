@@ -10,8 +10,8 @@ use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::{
     general::{O_RDWR, S_IFSOCK},
     ioctl::{
-        SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR, SIOCGIFFLAGS, SIOCGIFHWADDR,
-        SIOCGIFMAP, SIOCGIFMETRIC, SIOCGIFMTU, SIOCGIFNETMASK, SIOCGIFTXQLEN,
+        FIONREAD, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR, SIOCGIFFLAGS,
+        SIOCGIFHWADDR, SIOCGIFMAP, SIOCGIFMETRIC, SIOCGIFMTU, SIOCGIFNETMASK, SIOCGIFTXQLEN,
     },
     net::{AF_INET, ifreq},
 };
@@ -140,7 +140,12 @@ fn write_eth0_ifconf(arg: usize) -> AxResult<()> {
         }
         len = (written as i32).to_ne_bytes();
     } else {
-        len = 0i32.to_ne_bytes();
+        // SIOCGIFCONF sizing call (ifc_buf == NULL): Linux's dev_ifconf
+        // reports the total bytes needed for all interfaces so the caller can
+        // allocate the right buffer. Returning 0 here made OpenJDK's
+        // NetworkInterface.enumIPv4Interfaces malloc a 0-byte buffer and find
+        // no interfaces ("No network interfaces configured"). We expose eth0 + lo.
+        len = ((2 * IFREQ_COMPAT_LEN) as i32).to_ne_bytes();
     }
     vm_write_slice((arg + IFCONF_LEN_OFFSET) as *mut u8, &len)?;
     Ok(())
@@ -257,6 +262,12 @@ impl FileLike for Socket {
                 read_ifreq_interface(arg)?;
                 let qlen_ptr = (arg + offset_of!(ifreq, ifr_ifru)) as *mut i32;
                 qlen_ptr.vm_write(1000)?;
+            }
+            FIONREAD => {
+                // Bytes readable without blocking — Java InputStream.available()
+                // queries this on socket close; returning ENOTTY made jetty/HTTP
+                // clients throw. TCP reports its recv queue; others report 0.
+                (arg as *mut u32).vm_write(self.0.recv_available() as u32)?;
             }
             _ => return Err(AxError::NotATty),
         }

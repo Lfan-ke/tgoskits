@@ -130,6 +130,11 @@ impl TcpSocket {
         SOCKET_SET.with_socket_mut::<smol::Socket, _, _>(self.handle, f)
     }
 
+    /// Bytes currently buffered for receive (FIONREAD / `available()`).
+    pub fn recv_available(&self) -> usize {
+        self.with_smol_socket(|s| if s.can_recv() { s.recv_queue() } else { 0 })
+    }
+
     fn keep_alive_interval(&self) -> Duration {
         Duration::from_secs(self.keep_idle_secs.load(Ordering::Relaxed) as u64)
     }

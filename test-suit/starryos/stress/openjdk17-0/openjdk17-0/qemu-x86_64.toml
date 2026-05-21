@@ -35,9 +35,24 @@ cat > /tmp/K.kt << 'EOF'
 fun main() { println("KOTLIN_OK") }
 EOF
 # invoke Kotlin compiler via java directly (kotlinc wrapper needs bash, rootfs has only busybox ash)
-$JAVA_HOME/bin/java -Xmx512m -cp "/opt/kotlinc/lib/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler /tmp/K.kt -include-runtime -d /tmp/K.jar >/tmp/kt.out 2>&1
-$JAVA_HOME/bin/java -Xmx256m -jar /tmp/K.jar >/tmp/kt.run 2>&1
+# explicit -Xms required: starry heap ergonomics mis-size the initial heap ("Too small initial heap")
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -cp "/opt/kotlinc/lib/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler /tmp/K.kt -include-runtime -d /tmp/K.jar >/tmp/kt.out 2>&1
+$JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -jar /tmp/K.jar >/tmp/kt.run 2>&1
 grep -q KOTLIN_OK /tmp/kt.run && echo "KOTLIN ok=1" || { echo "KOTLIN ok=0"; tail -15 /tmp/kt.out /tmp/kt.run; }
+# --- DoD-B: JSE 标准库/语言/运行时 suite ---
+JSE_OK=0; JSE_BAD=0
+for T in NetTest AlgoTest StdlibTest ConcurrencyTest FileTest JvmTest SyntaxTest TimeTest XmlTest LangUtilTest ExtraTest CryptoTest ProcessTest NioChannelTest; do
+  $JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -cp /root/dod $T >/tmp/jse.out 2>&1
+  if grep -q "_DONE" /tmp/jse.out; then JSE_OK=$((JSE_OK+1)); else JSE_BAD=$((JSE_BAD+1)); echo "$T JSE FAIL:"; tail -4 /tmp/jse.out; fi
+done
+for J in realdep-demo jdbc-demo; do
+  $JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -jar /root/dod/$J.jar >/tmp/j.out 2>&1
+  grep -q "_DONE" /tmp/j.out && JSE_OK=$((JSE_OK+1)) || { JSE_BAD=$((JSE_BAD+1)); echo "$J FAIL:"; tail -4 /tmp/j.out; }
+done
+echo "JSE ok=$JSE_OK bad=$JSE_BAD"
+# --- DoD-C JavaEE: embedded Jetty HTTP server (loopback self-test) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/jetty-demo.jar >/tmp/jetty.out 2>&1
+grep -q JETTY_DONE /tmp/jetty.out && echo "EE-JETTY ok=1" || { echo "EE-JETTY ok=0"; tail -10 /tmp/jetty.out; }
 echo "BIGTEST_DONE"
 '''
 success_regex = ["(?m)^BIGTEST_DONE"]
