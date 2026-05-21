@@ -278,6 +278,34 @@ pub(crate) fn yield_now_unchecked() {
     current_run_queue::<NoPreemptIrqSave>().yield_current()
 }
 
+/// Begins a non-preemptible kernel section for the current task.
+///
+/// Within the section, timer-driven (involuntary) preemption is deferred, so a
+/// multi-step in-kernel operation (syscall / page-fault handling) cannot be
+/// interrupted and interleaved with another thread sharing the address space.
+/// Unlike disabling preemption via a guard, this does NOT enter an atomic
+/// context: voluntary sleeping/blocking (futex, I/O) inside the section still
+/// works, and voluntary reschedules are still honored.
+///
+/// Must be paired with [`kernel_preempt_end`].
+#[inline]
+pub fn kernel_preempt_begin() {
+    #[cfg(feature = "preempt")]
+    current().set_defer_preempt(true);
+}
+
+/// Ends the non-preemptible kernel section and honors any preemption that became
+/// pending while it was deferred.
+#[inline]
+pub fn kernel_preempt_end() {
+    #[cfg(feature = "preempt")]
+    {
+        let curr = current();
+        curr.set_defer_preempt(false);
+        crate::task::TaskInner::current_check_preempt_pending();
+    }
+}
+
 /// Current task is going to sleep for the given duration.
 ///
 /// If the feature `irq` is not enabled, it uses busy-wait instead.

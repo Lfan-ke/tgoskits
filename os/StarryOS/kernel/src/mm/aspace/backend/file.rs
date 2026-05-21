@@ -283,8 +283,17 @@ impl BackendOps for FileBackend {
                         flags - MappingFlags::WRITE
                     };
                     self.0.cache.with_page_or_insert(pn, |page, evicted| {
-                        if let Some((pn, _)) = evicted {
-                            to_be_evicted.push(pn);
+                        if let Some(evicted) = evicted {
+                            // Keep the evicted page (and thus its physical frame)
+                            // alive until `on_evict` below has torn down its mapping
+                            // and flushed the TLB. The eviction listener cannot unmap
+                            // here because the address space is already locked by this
+                            // populate, so the unmap is deferred; freeing the frame now
+                            // (by dropping the page) would leave the evicted VA mapped
+                            // to a frame that can be reallocated, so a sibling thread
+                            // preempted into userspace could read another page's data
+                            // through the stale mapping.
+                            to_be_evicted.push(evicted);
                         }
                         pt.map(addr, page.paddr(), PageSize::Size4K, map_flags)?;
                         pages += 1;
@@ -301,8 +310,11 @@ impl BackendOps for FileBackend {
             } else {
                 let inner = self.0.clone();
                 Some(Box::new(move |aspace: &mut AddrSpace| {
-                    for pn in to_be_evicted {
+                    for (pn, page) in to_be_evicted {
+                        // Unmap (and TLB-flush via the cursor) the evicted VA first,
+                        // then drop the page to free its frame — never the reverse.
                         inner.on_evict(pn, aspace);
+                        drop(page);
                     }
                 }))
             },

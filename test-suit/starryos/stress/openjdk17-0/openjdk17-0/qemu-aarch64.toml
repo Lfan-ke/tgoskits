@@ -1,0 +1,26 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "cortex-a72",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-java.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-aarch64.path
+cat > /tmp/H.java << 'EOF'
+public class H { public static void main(String[] a){ System.out.println("HI"); } }
+EOF
+jok=0; jbad=0
+for i in 1 2 3 4 5 6 7 8; do $JAVA_HOME/bin/javac -J-Xint -J-Xmx256m -J-Xms32m -d /tmp /tmp/H.java >/tmp/j.out 2>&1 && jok=$((jok+1)) || jbad=$((jbad+1)); done
+echo "JAVAC ok=$jok bad=$jbad"
+ok=0; bad=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do $JAVA_HOME/bin/java -Xint -Xmx256m -Xms32m -jar /root/complex-demo.jar >/tmp/cd.out 2>&1; grep -q CDEMO_DONE /tmp/cd.out && ok=$((ok+1)) || { bad=$((bad+1)); echo "run$i BAD"; }; done
+echo "CDEMO ok=$ok bad=$bad"
+echo "A64DONE"
+'''
+success_regex = ["(?m)^A64DONE"]
+fail_regex = ['(?i)kernel\bpanic']
+timeout = 900

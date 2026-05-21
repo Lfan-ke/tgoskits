@@ -93,6 +93,16 @@ pub struct TaskInner {
 
     #[cfg(feature = "preempt")]
     need_resched: AtomicBool,
+    /// When set, timer-driven (involuntary) preemption of this task is deferred.
+    /// Used to make in-kernel syscall/trap handling effectively non-preemptible
+    /// (a single-CPU-correct "non-preemptible kernel"), so a multi-step kernel
+    /// operation cannot be interrupted and interleaved with another thread of
+    /// the same address space. Unlike `preempt_disable_count`, it does NOT mark
+    /// an atomic context, so voluntary sleeping/blocking (futex, I/O) still
+    /// works inside the section. Voluntary reschedule (yield/block) is honored
+    /// regardless of this flag.
+    #[cfg(feature = "preempt")]
+    defer_preempt: AtomicBool,
     #[cfg(feature = "preempt")]
     preempt_disable_count: AtomicUsize,
 
@@ -308,6 +318,8 @@ impl TaskInner {
             #[cfg(feature = "preempt")]
             need_resched: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
+            defer_preempt: AtomicBool::new(false),
+            #[cfg(feature = "preempt")]
             preempt_disable_count: AtomicUsize::new(0),
             interrupted: AtomicBool::new(false),
             interrupt_waker: AtomicWaker::new(),
@@ -437,6 +449,18 @@ impl TaskInner {
 
     #[inline]
     #[cfg(feature = "preempt")]
+    pub(crate) fn set_defer_preempt(&self, defer: bool) {
+        self.defer_preempt.store(defer, Ordering::Release)
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn defer_preempt(&self) -> bool {
+        self.defer_preempt.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
     pub(crate) fn preempt_count(&self) -> usize {
         self.preempt_disable_count.load(Ordering::Acquire)
     }
@@ -463,10 +487,15 @@ impl TaskInner {
     }
 
     #[cfg(feature = "preempt")]
-    fn current_check_preempt_pending() {
+    pub(crate) fn current_check_preempt_pending() {
         use ax_kernel_guard::NoPreemptIrqSave;
         let curr = crate::current();
-        if curr.need_resched.load(Ordering::Acquire) && curr.can_preempt(0) {
+        // `defer_preempt` makes in-kernel sections non-preemptible by the timer:
+        // the reschedule is deferred until the section ends (which re-runs this
+        // check). This keeps a multi-step kernel operation atomic w.r.t. other
+        // threads on the same CPU without forbidding voluntary sleeping.
+        if curr.need_resched.load(Ordering::Acquire) && curr.can_preempt(0) && !curr.defer_preempt()
+        {
             // Note: if we want to print log msg during `preempt_resched`, we have to
             // disable preemption here, because the ax-log may cause preemption.
             let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();

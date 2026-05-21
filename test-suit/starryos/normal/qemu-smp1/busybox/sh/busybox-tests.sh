@@ -976,6 +976,87 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# bb_resize — probes the terminal size on its stderr tty (writes ESC7 ESC[r
+# ESC[999;999H ESC[6n ESC8 and reads back the cursor position), then prints a
+# shell-eval `COLUMNS=N;LINES=N;export COLUMNS LINES;` to stdout. resize uses
+# fd 2 as the terminal, so only stdout is redirected to a file: stderr stays
+# the controlling console (a real tty) for the query. Capturing via a pipe
+# (command substitution) instead would make every fd a non-tty and resize
+# would bail with ENOTTY, emitting no trailer. The starry console does not
+# answer ESC[6n, so resize falls back to COLUMNS=0;LINES=0 — the trailer that
+# matters here is still emitted.
+busybox resize >/tmp/bb_resize.out
+if grep -qF "COLUMNS=" /tmp/bb_resize.out && grep -qF "LINES=" /tmp/bb_resize.out && grep -qF "export COLUMNS LINES" /tmp/bb_resize.out; then
+    echo "PASS: busybox_resize"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_resize"; busybox cat /tmp/bb_resize.out; FAIL=$((FAIL+1))
+fi
+
+# bb_remove_shell — applet wiring + usage banner; --help triggers bb_show_usage.
+_t=$({ timeout 10 sh -c "busybox remove-shell --help 2>&1"; } 2>&1)
+if echo "$_t" | grep -qF "Usage:" && echo "$_t" | grep -qiF "shell"; then
+    echo "PASS: busybox_remove_shell"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_remove_shell"; echo "$_t"; FAIL=$((FAIL+1))
+fi
+
+# bb_rdev — reports the device mounted at "/". busybox stats "/", takes its
+# st_dev, then scans /dev for a block node with a matching st_rdev. starry now
+# exposes the root disk as /dev/vda (a block node whose rdev equals the root
+# mount's device id) and lists it in /proc/mounts, so rdev prints `/dev/vda /`.
+# Host prints its own root device (e.g. `/dev/sdd /`); both match `^/dev/.+ /$`.
+# Require exactly one "/dev/<no-spaces> /" line so stray output can't slip in.
+_t=$({ timeout 10 sh -c "busybox rdev 2>&1"; } 2>&1)
+if [ "$(echo "$_t" | grep -cE "^/dev/[^[:space:]]+[[:space:]]+/$")" = 1 ]; then
+    echo "PASS: busybox_rdev"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_rdev"; echo "$_t"; FAIL=$((FAIL+1))
+fi
+
+# bb_setlogcons — TIOCLINUX subcmd 11 (ioctl) on /dev/tty0.
+# Accept either rc=0 (kernel supports it) or "can't open /dev/tty0" host-style
+# fallback (kernel returns ENOENT/EPERM but applet itself works).
+_t=$({ timeout 10 sh -c "busybox setlogcons 0 2>&1"; echo "EXIT:$?"; } 2>&1)
+_rc=$(printf '%s\n' "$_t" | sed -n 's/^EXIT://p')
+_msg=$(printf '%s\n' "$_t" | sed '/^EXIT:/d')
+if [ "$_rc" = 0 ] || echo "$_msg" | grep -qF "/dev/tty0"; then
+    echo "PASS: busybox_setlogcons"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_setlogcons (rc=$_rc)"; echo "$_msg"; FAIL=$((FAIL+1))
+fi
+
+# bb_killall5 — sends SIGSTOP, then the requested signal (0 = test-only), then
+# SIGCONT to every process outside its own session. The property under test is
+# job control: the harness shell is briefly stopped then resumed and MUST
+# survive. We run killall5 then emit a sentinel from the SAME shell — the
+# sentinel only prints if control returned to a live, resumed shell (a broken
+# SIGSTOP/SIGCONT would leave it stopped until the 10s timeout kills it).
+# busybox killall5 returns 2 when no out-of-session process was signaled, so
+# accept rc 0/1/2; reject "applet not found".
+_t=$({ timeout 10 sh -c "busybox killall5 -0; echo KA5_RC:\$?; echo KA5_SURVIVED"; } 2>&1)
+_rc=$(printf '%s\n' "$_t" | sed -n 's/^KA5_RC://p')
+if echo "$_t" | grep -qF "KA5_SURVIVED" \
+    && { [ "$_rc" = 0 ] || [ "$_rc" = 1 ] || [ "$_rc" = 2 ]; } \
+    && ! echo "$_t" | grep -qiF "not found"; then
+    echo "PASS: busybox_killall5"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_killall5 (rc=$_rc)"; echo "$_t"; FAIL=$((FAIL+1))
+fi
+
+# bb_fdflush — issues the BLKFLSBUF ioctl. On a non-block fd (/dev/null) the
+# ioctl is rejected and busybox prints "Not a tty" / "Inappropriate ioctl".
+# Require that diagnostic (and reject "applet not found") so an unregistered
+# applet — which exits nonzero with "not found" — cannot pass on a bare rc!=0.
+_t=$({ timeout 10 sh -c "busybox fdflush /dev/null 2>&1"; echo "EXIT:$?"; } 2>&1)
+_rc=$(printf '%s\n' "$_t" | sed -n 's/^EXIT://p')
+_msg=$(printf '%s\n' "$_t" | sed '/^EXIT:/d')
+if { echo "$_msg" | grep -qiF "not a tty" || echo "$_msg" | grep -qiF "inappropriate"; } \
+    && ! echo "$_msg" | grep -qiF "not found"; then
+    echo "PASS: busybox_fdflush"; PASS=$((PASS+1))
+else
+    echo "FAIL: busybox_fdflush (rc=$_rc)"; echo "$_msg"; FAIL=$((FAIL+1))
+fi
+
 echo "=== BusyBox Test Summary ==="
 echo "PASS: $PASS  FAIL: $FAIL  TOTAL: $((PASS+FAIL))"
 _m1="Test"; _m2="run"; _m3="completed"; echo "$_m1 $_m2 $_m3"

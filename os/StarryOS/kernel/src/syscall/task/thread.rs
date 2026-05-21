@@ -24,6 +24,25 @@ pub fn sys_gettid() -> AxResult<isize> {
     Ok(current().as_thread().tid() as _)
 }
 
+/// `getcpu(unsigned *cpu, unsigned *node, struct getcpu_cache *tcache)`
+///
+/// Reports the CPU and NUMA node the calling thread is running on. Per
+/// `man 2 getcpu`, both pointers are optional and `tcache` has been unused
+/// since Linux 2.6.24, so it is ignored. StarryOS exposes a single NUMA
+/// node, so `node` is always 0.
+pub fn sys_getcpu(cpu: *mut u32, node: *mut u32, _tcache: usize) -> AxResult<isize> {
+    use ax_hal::percpu::this_cpu_id;
+    use starry_vm::VmMutPtr;
+
+    if !cpu.is_null() {
+        cpu.vm_write(this_cpu_id() as u32)?;
+    }
+    if !node.is_null() {
+        node.vm_write(0)?;
+    }
+    Ok(0)
+}
+
 /// ARCH_PRCTL codes
 ///
 /// It is only avaliable on x86_64, and is not convenient

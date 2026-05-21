@@ -646,7 +646,7 @@ impl SimpleDirOps for ThreadDir {
                 SeqFile::new_regular(fs, move || render_thread_maps(&task)).into()
             }
             "mounts" => SimpleFile::new_regular(fs, move || {
-                Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
+                Ok("/dev/vda / ext4 rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
             })
             .into(),
             "cmdline" => SimpleFile::new_regular(fs, move || {
@@ -759,7 +759,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     root.add(
         "mounts",
         SimpleFile::new_regular(fs.clone(), || {
-            Ok("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
+            Ok("/dev/vda / ext4 rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n")
         }),
     );
     root.add(

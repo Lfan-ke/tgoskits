@@ -26,6 +26,14 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
             while !thr.pending_exit() {
                 let reason = uctx.run();
 
+                // Handle the trap/syscall as a non-preemptible kernel section:
+                // the timer must not preempt and interleave another thread of
+                // this address space mid-operation (a single-CPU "non-preemptible
+                // kernel"; voluntary sleeping inside still works). Any preemption
+                // that becomes pending is honored at `kernel_preempt_end` below,
+                // i.e. exactly at the user-return boundary.
+                ax_task::kernel_preempt_begin();
+
                 set_timer_state(&curr, TimerState::Kernel);
 
                 let saved_a0 = uctx.arg0();
@@ -106,6 +114,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
 
                 set_timer_state(&curr, TimerState::User);
                 curr.clear_interrupt();
+
+                // End of the non-preemptible kernel section: honor any deferred
+                // preemption now, at the user-return boundary, before re-entering
+                // user space on the next `uctx.run()`.
+                ax_task::kernel_preempt_end();
             }
         },
         name.into(),
