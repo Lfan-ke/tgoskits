@@ -219,6 +219,22 @@ pub fn sys_setsockopt(
         }
     }
 
+    {
+        // Options Tomcat/Spring's NioEndpoint sets that the smoltcp stack cannot
+        // act on but must accept (Linux accepts them). Returning ENOPROTOOPT here
+        // broke the Tomcat acceptor with "Error setting socket options: Protocol
+        // not available". Accept + ignore: SO_LINGER (struct linger; default close),
+        // SO_OOBINLINE (urgent-data inline), IP_TOS (QoS hint).
+        use linux_raw_sys::net::{IP_TOS, SOL_SOCKET, SO_LINGER, SO_OOBINLINE};
+
+        if matches!(
+            (level, optname),
+            (SOL_SOCKET, SO_LINGER) | (SOL_SOCKET, SO_OOBINLINE) | (PROTO_IP, IP_TOS)
+        ) {
+            return Ok(0);
+        }
+    }
+
     fn get<'a, T: 'static>(val: UserConstPtr<u8>, len: socklen_t) -> AxResult<&'a T> {
         if len as usize != size_of::<T>() {
             return Err(AxError::InvalidInput);

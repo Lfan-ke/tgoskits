@@ -53,6 +53,12 @@ echo "JSE ok=$JSE_OK bad=$JSE_BAD"
 # --- DoD-C JavaEE: embedded Jetty HTTP server (loopback self-test) ---
 $JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/jetty-demo.jar >/tmp/jetty.out 2>&1
 grep -q JETTY_DONE /tmp/jetty.out && echo "EE-JETTY ok=1" || { echo "EE-JETTY ok=0"; tail -10 /tmp/jetty.out; }
+# --- DoD-C JavaEE: Spring Boot + embedded Tomcat (bind 127.0.0.1; starry IPv6 stub) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -Dserver.port=18080 -Dserver.address=127.0.0.1 -Djava.net.preferIPv4Stack=true -jar /root/dod/spring-demo.jar >/tmp/spring.out 2>&1
+grep -q SPRING_DONE /tmp/spring.out && echo "EE-SPRING ok=1" || { echo "EE-SPRING ok=0"; grep -aiE "Tomcat started|Started Spring|refused|Exception|ERROR" /tmp/spring.out | tail -8; }
+# --- DoD-C: Netty NIO TCP echo (loopback) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/netty-demo.jar >/tmp/netty.out 2>&1
+grep -q NETTY_DONE /tmp/netty.out && echo "EE-NETTY ok=1" || { echo "EE-NETTY ok=0"; tail -8 /tmp/netty.out; }
 echo "BIGTEST_DONE"
 '''
 success_regex = ["(?m)^BIGTEST_DONE"]

@@ -18,8 +18,10 @@ low-memory-base = 0x0                   # uint
 low-memory-size = 0x1000_0000           # uint
 # Base address of the high physical memory.
 high-memory-base = 0x8000_0000          # uint
-# Size of the whole physical memory. (128M)
-phys-memory-size = 0x800_0000           # uint
+# Size of the whole physical memory. (1G — bumped from 128M; multi-JVM build tools
+# OOM'd: 512M cleared maven/kotlin but gradle's daemon+build JVMs need more on
+# loongarch. loongarch qemu runs -m >=2G, so 1G physical fits.)
+phys-memory-size = 0x4000_0000          # uint
 
 # Linear mapping offset at boot time.
 phys-boot-offset = "0x9000_0000_0000_0000"      # uint
