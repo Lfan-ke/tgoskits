@@ -963,7 +963,7 @@ dependencies = [
  "chrono",
  "intrusive-collections",
  "log",
- "lru",
+ "lru 0.16.4",
  "lwext4_rust",
  "rsext4",
  "scope-local",
@@ -1642,6 +1642,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "walkdir",
+ "windows-sys 0.59.0",
  "xz2",
 ]
 
@@ -1758,6 +1759,7 @@ dependencies = [
  "log",
  "mmio-api",
  "pcie",
+ "phytium-mci-host",
  "rd-block",
  "rd-net",
  "rdif-clk",
@@ -1773,25 +1775,6 @@ dependencies = [
  "some-serial",
  "somehal",
  "spin 0.10.0",
-]
-
-[[package]]
-name = "axplat-riscv64-qemu-virt-hv"
-version = "0.5.7"
-dependencies = [
- "ax-config-macros",
- "ax-cpu",
- "ax-crate-interface",
- "ax-kspin",
- "ax-lazyinit",
- "ax-plat",
- "ax-riscv-plic",
- "axvisor_api",
- "log",
- "riscv 0.14.0",
- "riscv_goldfish",
- "sbi-rt 0.0.3",
- "some-serial",
 ]
 
 [[package]]
@@ -1929,6 +1912,7 @@ dependencies = [
  "ax-page-table-multiarch",
  "ax-percpu",
  "ax-plat-loongarch64-qemu-virt",
+ "ax-plat-riscv64-qemu-virt",
  "ax-std",
  "ax-timer-list",
  "axaddrspace",
@@ -1938,7 +1922,6 @@ dependencies = [
  "axhvc",
  "axklib",
  "axplat-dyn",
- "axplat-riscv64-qemu-virt-hv",
  "axplat-x86-qemu-q35",
  "axvcpu",
  "axvisor_api",
@@ -3376,7 +3359,7 @@ dependencies = [
 
 [[package]]
 name = "dwmmc-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitfield-struct",
  "dma-api",
@@ -4163,6 +4146,11 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heapless"
@@ -4890,6 +4878,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ktracepoint"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30aa94490986294aa3a19dc3fbc6b7eefe3fbbac18c323c4153a0cfd1a7a0b74"
+dependencies = [
+ "log",
+ "lru 0.18.0",
+ "paste",
+ "static-keys",
+ "tp-lexer",
+]
+
+[[package]]
 name = "lab"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5081,6 +5082,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 dependencies = [
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5803,6 +5813,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "phytium-mci-host"
+version = "0.1.1"
+dependencies = [
+ "bitfield-struct",
+ "dma-api",
+ "log",
+ "mmio-api",
+ "sdmmc-protocol",
+ "volatile 0.6.1",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6217,7 +6239,7 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "kasuari",
- "lru",
+ "lru 0.16.4",
  "strum 0.27.2",
  "thiserror 2.0.18",
  "unicode-segmentation",
@@ -7132,7 +7154,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdhci-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dma-api",
  "embedded-hal",
@@ -7143,7 +7165,7 @@ dependencies = [
 
 [[package]]
 name = "sdmmc-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags 2.11.1",
  "embedded-hal",
@@ -7318,9 +7340,9 @@ dependencies = [
 
 [[package]]
 name = "sg200x-bsp"
-version = "0.5.4"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "286c45286f82b7c44def11337f86aa34245f9400ed4d5f8bc901a0c3efdb4388"
+checksum = "1f964b84c5d4409059a332b84bda24bf31c472e1edd2e227353ddbf8b9471056"
 dependencies = [
  "bit-struct",
  "log",
@@ -7750,6 +7772,7 @@ dependencies = [
  "indoc",
  "inherit-methods-macro",
  "kernel-elf-parser",
+ "ktracepoint",
  "lazy_static",
  "linux-raw-sys 0.12.1",
  "lock_api",
@@ -8600,6 +8623,12 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tp-lexer"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5352c5c9721b4ded5d79c4ad60111b977601c09b202e860a3d79a6e4bdb098b0"
 
 [[package]]
 name = "tracing"
