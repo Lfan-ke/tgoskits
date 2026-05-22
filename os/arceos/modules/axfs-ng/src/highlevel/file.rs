@@ -536,7 +536,13 @@ impl CachedFile {
         if self.in_memory {
             page.data().fill(0);
         } else {
-            file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+            // The frame from `alloc_pages` is not zeroed. Read the file's bytes,
+            // then zero the rest of the page so the region beyond end-of-file in
+            // the last (partial) page reads as 0 — POSIX file-backed mmap
+            // semantics. Without this, a mapping reads stale frame data past EOF
+            // (a wild pointer in e.g. the JVM's libjimage on loongarch).
+            let read = file.read_at(page.data(), pn as u64 * PAGE_SIZE as u64)?;
+            page.data()[read..].fill(0);
         }
         cache.put(pn, page);
         Ok((cache.get_mut(&pn).unwrap(), evicted))
