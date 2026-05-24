@@ -1,0 +1,112 @@
+# loongarch64 uses `-machine virt -cpu la464 -m 4096M`.
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "4096M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-golang126.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === OFFICIAL Go 1.26 toolchain + runtime CORRECTNESS on StarryOS loongarch64 ===
+# The go.dev OFFICIAL go1.26.3 toolchain (STATICALLY linked `go` driver + static
+# pkg/tool/* compilers, GOROOT=/usr/local/go: std-lib SOURCE + compiler tools)
+# was extracted into /usr/local. Unlike golang-0 (Alpine apk = Go 1.25.10, musl-
+# DYNAMIC), this is Go 1.26 (#764 `<!-- 1.26 -->`) and needs no musl loader.
+# A comprehensive REAL Go program is staged at /proj/hello/main.go covering
+# BASIC (goroutine/channel/select/map/slice/iface) + ADVANCED (generics/defer-
+# recover/errors.Is-As-wrap/context/sync) + GO 1.26 NEW features (new(expr),
+# self-referential generic [A Adder[A]], errors.AsType[T], bytes.Buffer.Peek,
+# net/netip.Prefix.Compare, log/slog.NewMultiHandler). Go ships its OWN M:N
+# scheduler, the new Green Tea GC, epoll netpoll, SIGURG async preemption, and
+# futex-parks goroutines -- any of which can surface a StarryOS gap.
+#
+# Fully OFFLINE: GOTOOLCHAIN=local (no toolchain auto-download), GOPROXY=off +
+# GOFLAGS=-mod=mod (no module fetch -- the program is std-lib only), GOCACHE=/tmp
+# (writable build cache; `go run` compiles GOROOT/src on first use), CGO_ENABLED=0
+# (pure-Go compile -- no C toolchain needed).
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-loongarch64.path
+export PATH=/usr/local/go/bin:/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export GOROOT=/usr/local/go
+export GOTOOLCHAIN=local
+export GOPROXY=off
+export GOFLAGS=-mod=mod
+export GOCACHE=/tmp/gocache
+export GOPATH=/tmp/gopath
+export GOMODCACHE=/tmp/gopath/pkg/mod
+export CGO_ENABLED=0
+export GODEBUG=
+mkdir -p /tmp/gocache /tmp/gopath
+GO=/usr/local/go/bin/go
+GO_VER_OK=0; GO_RUN_OK=0; GO_BUILD_OK=0; GO_VET_OK=0
+
+# --- GO_VER_OK: `go version` prints a 1.26 version string ---
+echo "=== go version ==="
+$GO version > /tmp/ver.out 2>&1
+cat /tmp/ver.out
+grep -qE 'go version go1\.26' /tmp/ver.out && GO_VER_OK=1 || { echo "go version NOT 1.26"; tail -5 /tmp/ver.out; }
+
+# --- expected EXACT stdout (host go1.26.3 verified: 21 lines, deterministic) ---
+cat > /tmp/expect.txt << 'EOF'
+SUM=5050
+MAP go=3
+MAP os=1
+MAP starry=2
+SLICE copied=3 cap=4 head=2
+IFACE=tag:go/3
+TIME=2026-05-24T12:34:56Z
+GENERIC_INT=15
+GENERIC_FLOAT=0.875
+RECOVER=kaboom
+ERRIS=true
+ERRAS=true
+CTX=true
+SYNC once=1 ctr=50
+SELECT=timeout
+NEW_EXPR=26
+SELFGEN=7
+ASTYPE=99
+PEEK=sta LEN_AFTER=6
+PREFIXCMP=-1
+MULTIHANDLER=true
+HELLO_GO126_OK
+EOF
+
+# --- GO_RUN_OK: `go run` the program -> assert EXACT stdout ---
+echo "=== go run /proj/hello/main.go ==="
+cd /proj/hello
+$GO run main.go > /tmp/run.out 2>/tmp/run.err
+echo "--- stdout ---"; cat /tmp/run.out
+echo "--- stderr (tail) ---"; tail -5 /tmp/run.err
+if cmp -s /tmp/run.out /tmp/expect.txt; then GO_RUN_OK=1; echo "go run output EXACT-match"; else echo "go run MISMATCH"; diff /tmp/expect.txt /tmp/run.out 2>&1 | head -30; fi
+
+# --- GO_VET_OK: `go vet` reports no issues (clean static analysis) ---
+echo "=== go vet ==="
+$GO vet ./... > /tmp/vet.out 2>&1
+if [ -s /tmp/vet.out ]; then echo "go vet REPORTED issues:"; cat /tmp/vet.out; else GO_VET_OK=1; echo "go vet clean"; fi
+
+# --- GO_BUILD_OK: build a static binary + run it -> exact output ---
+echo "=== go build static binary ==="
+$GO build -o /tmp/hello /proj/hello/main.go > /tmp/build.out 2>&1
+if [ -x /tmp/hello ]; then
+  /tmp/hello > /tmp/bin.out 2>&1
+  if cmp -s /tmp/bin.out /tmp/expect.txt; then GO_BUILD_OK=1; echo "built binary output EXACT-match"; else echo "built-binary MISMATCH"; diff /tmp/expect.txt /tmp/bin.out 2>&1 | head -30; fi
+else
+  echo "go build FAIL"; tail -6 /tmp/build.out
+fi
+
+echo "RESULTS: GO_VER_OK=$GO_VER_OK GO_RUN_OK=$GO_RUN_OK GO_VET_OK=$GO_VET_OK GO_BUILD_OK=$GO_BUILD_OK"
+# gate via printf so the success token never appears as a literal in the script
+# text (avoids success_regex false positives from terminal echo of the command).
+if [ "$GO_VER_OK" = 1 ] && [ "$GO_RUN_OK" = 1 ] && [ "$GO_VET_OK" = 1 ] && [ "$GO_BUILD_OK" = 1 ]; then
+  printf 'GOLANG126_OK=%s\n' 1
+else
+  printf 'GOLANG126_OK=%s\n' 0
+fi
+echo "GOLANG126_DONE"
+'''
+success_regex = ["(?m)^GOLANG126_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

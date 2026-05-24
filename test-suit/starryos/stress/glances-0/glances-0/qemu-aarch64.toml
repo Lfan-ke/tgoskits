@@ -1,0 +1,79 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "cortex-a72", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-glances.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === glances (psutil-based system monitor) HEADLESS smoke on StarryOS aarch64 ===
+# #764 "monitor" category: glances = tui / client-server / web Python monitor on psutil.
+# A terminal/curses TUI and the c/s + web socket servers are NOT runnable in a headless
+# CI VT, so this exercises glances' ONE-SHOT, NON-curses stdout path:
+#   (a) `glances --version`            -> prints "Glances version:<TAB>4.4.1" + the
+#       "PsUtil version:<TAB>7.1.3" line (GLANCES_VER_OK; the colon is TAB-separated)
+#   (b) `glances --stdout cpu,mem -t 1 --stop-after 1`  -> standalone mode picks the
+#       GlancesStdout interface, runs serve_n(1) (ONE refresh, no curses), prints
+#       "cpu: {...}" and "mem: {...}" plugin dicts (psutil reads /proc/stat, /proc/meminfo,
+#       /proc/<pid>/*), then exits cleanly. We assert both plugin lines appear AND that
+#       mem.total is a plausible nonzero byte count (a second one-shot `--stdout mem.total`
+#       gives a clean "mem.total: <int>" line we range-check).
+# psutil degrades gracefully on a partial /proc (missing entries -> 0 / empty, not crash);
+# the gate verifies it produced real numbers, not just that it didn't crash.
+# glances 4.4.1-r1 + py3-psutil 7.1.3-r0 (Alpine v3.23) injected by
+# monitor-apks/prep-glances-rootfs.sh. See ~/rcore/download/monitor-apks/SOURCES.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-aarch64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+export TERM=dumb
+PY=/usr/bin/python3
+echo "=== python3 --version ==="
+$PY --version 2>&1
+GV=0; GS=0
+
+# --- DoD (a): glances --version prints a version ---
+$PY /usr/bin/glances --version > /tmp/gv.out 2>&1
+cat /tmp/gv.out
+# match "Glances version:<whitespace>X.Y" (TAB-separated; any X.Y.Z so not pinned to a release)
+grep -qE "Glances version:[[:space:]]+[0-9]+\.[0-9]+" /tmp/gv.out && GV=1 || { echo "glances --version FAIL"; tail -20 /tmp/gv.out; }
+[ "$GV" = 1 ] && echo "GLANCES_VER_OK"
+
+# --- DoD (b): one-shot non-TUI snapshot of cpu + mem (no curses) ---
+$PY /usr/bin/glances --stdout cpu,mem --time 1 --stop-after 1 --disable-plugin docker > /tmp/gs.out 2>&1
+echo "--- glances --stdout cpu,mem (one sample) ---"
+cat /tmp/gs.out
+# A clean machine-checkable mem.total line + a cpu plugin line.
+$PY /usr/bin/glances --stdout mem.total,cpu.total --time 1 --stop-after 1 --disable-plugin docker > /tmp/gs2.out 2>&1
+echo "--- glances --stdout mem.total,cpu.total ---"
+cat /tmp/gs2.out
+# Assert: a cpu plugin line, a mem plugin line, and mem.total is a nonzero integer.
+HAVE_CPU=0; HAVE_MEM=0; MEM_TOTAL_OK=0
+# plugin lines look like "cpu: {...}" / "mem: {...}" (whole-plugin) or "cpu.total: .." /
+# "mem.total: .." (attribute); accept the colon, dot, or space form.
+grep -qE "^cpu(:|\.| )" /tmp/gs.out /tmp/gs2.out && HAVE_CPU=1
+grep -qE "^mem(:|\.| )" /tmp/gs.out /tmp/gs2.out && HAVE_MEM=1
+# mem.total: <int> ; require > 1048576 (1 MiB) so it is a real RAM size, not 0/empty.
+MT=$(grep -E "^mem\.total:" /tmp/gs2.out | head -1 | sed -E 's/^mem\.total:[[:space:]]*//')
+case "$MT" in
+  ''|*[!0-9]*) MEM_TOTAL_OK=0 ;;
+  *) [ "$MT" -gt 1048576 ] && MEM_TOTAL_OK=1 || MEM_TOTAL_OK=0 ;;
+esac
+echo "  parsed: have_cpu=$HAVE_CPU have_mem=$HAVE_MEM mem_total=$MT mem_total_ok=$MEM_TOTAL_OK"
+if [ "$HAVE_CPU" = 1 ] && [ "$HAVE_MEM" = 1 ] && [ "$MEM_TOTAL_OK" = 1 ]; then GS=1; else echo "glances one-shot snapshot FAIL"; tail -30 /tmp/gs.out /tmp/gs2.out; fi
+[ "$GS" = 1 ] && echo "GLANCES_SNAP_OK"
+
+echo "RESULTS: version=$GV snapshot=$GS"
+# Gate: both the version print AND the one-shot cpu+mem snapshot must pass. Use printf
+# (NOT a literal echo "GLANCES_OK=1") so the success token never appears in the script
+# text and cannot false-positive-match the harness success_regex via the shell echo.
+if [ "$GV" = 1 ] && [ "$GS" = 1 ]; then GVAR=1; else GVAR=0; fi
+printf 'GLANCES_OK=%s\n' "$GVAR"
+echo "GLANCES_DONE"
+'''
+success_regex = ["(?m)^GLANCES_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 2400

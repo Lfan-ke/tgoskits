@@ -1,0 +1,296 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-python.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === Python native-extension CORRECTNESS on StarryOS x86_64 ===
+# Alpine musl-native python3 + py3-numpy + py3-scikit-learn + py3-opencv injected
+# into /usr (no source build; Alpine ships musl binaries for all 4 arches). Each
+# test asserts EXACT, version-stable mathematical invariants (integer/closed-form/
+# raw-buffer sha256) -> "CORRECTNESS", not exit 0. See ~/rcore/download/python-apks/SOURCES.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-x86_64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export PYTHONDONTWRITEBYTECODE=1
+# Pin BLAS/OpenMP to 1 thread: deterministic + avoids stressing Starry threading first.
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+PY=/usr/bin/python3
+echo "=== python3 --version ==="
+$PY --version 2>&1
+T1=0; T2=0; T3=0; T4=0; T5=0
+
+# --- T1: numpy (array math; EXACT integer + closed-form linear algebra) ---
+cat > /tmp/t_numpy.py << 'EOF'
+import numpy as np
+ok = True
+def chk(name, got, want):
+    global ok
+    if got != want:
+        ok = False; print("  NUMPY FAIL %s got=%r want=%r" % (name, got, want))
+    else:
+        print("  numpy ok %s = %r" % (name, got))
+A = np.arange(1,10,dtype=np.int64).reshape(3,3)
+C = A.dot(np.eye(3,dtype=np.int64)*2)        # matmul with 2*I
+chk("matmul_sum", int(C.sum()), 90)
+chk("matmul_trace", int(np.trace(C)), 30)
+v = np.array([3,1,2,5,4],dtype=np.int64)
+chk("sort", np.sort(v).tolist(), [1,2,3,4,5])
+chk("cumsum", np.cumsum(v).tolist(), [3,4,6,11,15])
+chk("dot", int(np.array([1,2,3]).dot(np.array([4,5,6]))), 32)
+chk("det", round(float(np.linalg.det(np.diag([2.,3.,4.])))), 24)
+xs = np.linalg.solve(np.array([[3.,0.],[0.,5.]]), np.array([9.,20.]))
+chk("solve", [round(float(z)) for z in xs], [3,4])
+chk("fsum", float(np.array([0.5,0.25,0.125]).sum()), 0.875)   # exact in binary
+print("NUMPY_OK" if ok else "NUMPY_BAD")
+EOF
+$PY /tmp/t_numpy.py > /tmp/t1.out 2>&1
+cat /tmp/t1.out
+grep -q "^NUMPY_OK" /tmp/t1.out && T1=1 || { echo "T1 numpy FAIL"; tail -8 /tmp/t1.out; }
+
+# --- T2: scikit-learn (fit/predict; EXACT recovered coefficients + label-invariant clusters) ---
+cat > /tmp/t_sklearn.py << 'EOF'
+import numpy as np
+ok = True
+def chk(name, cond, info=""):
+    global ok
+    if cond: print("  sklearn ok %s %s" % (name, info))
+    else: ok = False; print("  SKLEARN FAIL %s %s" % (name, info))
+# LinearRegression on perfectly linear data y=2*x0+3*x1+5 -> OLS recovers exact coeffs.
+from sklearn.linear_model import LinearRegression
+X = np.array([[0,0],[1,0],[0,1],[1,1],[2,1],[1,2]],dtype=float)
+y = 2*X[:,0] + 3*X[:,1] + 5
+lr = LinearRegression().fit(X, y)
+chk("lin_intercept", abs(lr.intercept_-5) < 1e-6, "intercept=%.6f" % lr.intercept_)
+chk("lin_coef", np.allclose(lr.coef_,[2,3],atol=1e-6), "coef=%s" % lr.coef_.tolist())
+chk("lin_predict", abs(float(lr.predict([[3,4]])[0]) - 23) < 1e-6, "pred(3,4)=%.4f" % lr.predict([[3,4]])[0])
+# KMeans on two far-apart pure clusters -> partition is exact (label id irrelevant).
+from sklearn.cluster import KMeans
+P = np.array([[0,0],[0,1],[1,0],[100,100],[100,101],[101,100]],dtype=float)
+labels = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(P)
+near = set(labels[:3].tolist()); far = set(labels[3:].tolist())
+chk("kmeans_partition", len(near)==1 and len(far)==1 and near!=far, "labels=%s" % labels.tolist())
+# LogisticRegression on linearly separable 1-D data -> predict sign is exact.
+from sklearn.linear_model import LogisticRegression
+Xc = np.array([[-3],[-2],[-1],[1],[2],[3]],dtype=float); yc=np.array([0,0,0,1,1,1])
+clf = LogisticRegression().fit(Xc, yc)
+chk("logreg", int(clf.predict([[5]])[0])==1 and int(clf.predict([[-5]])[0])==0,
+    "pred(5)=%d pred(-5)=%d" % (clf.predict([[5]])[0], clf.predict([[-5]])[0]))
+print("SKLEARN_OK" if ok else "SKLEARN_BAD")
+EOF
+$PY /tmp/t_sklearn.py > /tmp/t2.out 2>&1
+cat /tmp/t2.out
+grep -q "^SKLEARN_OK" /tmp/t2.out && T2=1 || { echo "T2 sklearn FAIL"; tail -10 /tmp/t2.out; }
+
+# --- T3: opencv (image ops; EXACT pixel values + raw-buffer sha256, version-stable) ---
+cat > /tmp/t_opencv.py << 'EOF'
+import numpy as np, hashlib, cv2
+ok = True
+def chk(name, cond, info=""):
+    global ok
+    if cond: print("  opencv ok %s %s" % (name, info))
+    else: ok = False; print("  OPENCV FAIL %s %s" % (name, info))
+print("  cv2 version", cv2.__version__)
+# BGR2GRAY uses fixed-point integer weights -> identical across opencv versions.
+img = np.zeros((4,4,3),dtype=np.uint8); img[:2]=[10,20,30]; img[2:]=[200,100,50]
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+chk("gray_pixels", gray.flatten().tolist()==[22]*8+[96]*8, "flat=%s" % gray.flatten().tolist())
+chk("gray_sha256",
+    hashlib.sha256(gray.tobytes()).hexdigest()=="1089201e8d888b0f9ef27f7cac6a0a8278979425c58dcd7da0004e71a0bae46d")
+# nearest-neighbor resize = exact pixel replication.
+small = np.array([[0,255],[128,64]],dtype=np.uint8)
+big = cv2.resize(small,(4,4),interpolation=cv2.INTER_NEAREST)
+chk("resize_sha256",
+    hashlib.sha256(big.tobytes()).hexdigest()=="0c45115614dc9b395f95c1f6f28dbc0aeb8d3fbc16910a49f0fe2c515a59bc1a")
+# binary threshold = exact.
+_, th = cv2.threshold(np.array([[0,100,150,200]],dtype=np.uint8),127,255,cv2.THRESH_BINARY)
+chk("threshold", th.flatten().tolist()==[0,0,255,255], "th=%s" % th.flatten().tolist())
+# PNG round-trip: encode then decode must reproduce the SAME pixels (lossless),
+# even though the encoded byte stream may differ by libpng version.
+buf = cv2.imencode('.png', gray)[1]
+dec = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+chk("png_roundtrip", np.array_equal(dec, gray), "decoded shape=%s" % (dec.shape,))
+print("OPENCV_OK" if ok else "OPENCV_BAD")
+EOF
+$PY /tmp/t_opencv.py > /tmp/t3.out 2>&1
+cat /tmp/t3.out
+grep -q "^OPENCV_OK" /tmp/t3.out && T3=1 || { echo "T3 opencv FAIL"; tail -10 /tmp/t3.out; }
+
+# --- T4: pure-CPython language + stdlib (NO C-extension; 3.12-stable invariants) ---
+# Exercises the interpreter itself + the pure-Python stdlib: structural pattern
+# match (seq/map/guard), exception groups + except*, walrus, tomllib, dataclasses
+# (frozen+order), pathlib pure-path algebra, asyncio.gather + wait_for timeout,
+# and unicode UTF-8 round-trip + unicodedata + NFC/NFD normalization. EXACT asserts.
+cat > /tmp/t_lang.py << 'PYLANG_EOF'
+import sys, asyncio, tomllib, unicodedata
+from dataclasses import dataclass, FrozenInstanceError
+from pathlib import PurePosixPath
+ok = True
+def chk(name, cond, info=""):
+    global ok
+    if cond: print("  lang ok %s %s" % (name, info))
+    else: ok = False; print("  LANG FAIL %s %s" % (name, info))
+
+# --- match/case: sequence, mapping, and guard patterns ---
+def classify(v):
+    match v:
+        case [1, 2, *rest]:
+            return ("seq", rest)
+        case {"k": val} if val > 10:
+            return ("map_guard", val)
+        case {"k": val}:
+            return ("map", val)
+        case _:
+            return ("other", None)
+chk("match_seq", classify([1, 2, 3, 4]) == ("seq", [3, 4]))
+chk("match_map_guard", classify({"k": 42}) == ("map_guard", 42))
+chk("match_map", classify({"k": 5}) == ("map", 5))
+chk("match_wild", classify(99) == ("other", None))
+
+# --- exception groups + except* (PEP 654) ---
+caught = []
+try:
+    raise ExceptionGroup("eg", [ValueError("v"), KeyError("k"), ValueError("v2")])
+except* ValueError as eg:
+    caught.append(("VE", len(eg.exceptions)))
+except* KeyError as eg:
+    caught.append(("KE", len(eg.exceptions)))
+chk("except_star", sorted(caught) == [("KE", 1), ("VE", 2)], "%s" % caught)
+
+# --- walrus operator (PEP 572) ---
+data = [1, 2, 3, 4, 5]
+chk("walrus", (n := len(data)) == 5 and n * 2 == 10)
+
+# --- tomllib (PEP 680): parse a TOML document ---
+doc = tomllib.loads('title = "starry"\n[server]\nport = 8080\nhosts = ["a", "b"]\n')
+chk("tomllib", doc["title"] == "starry" and doc["server"]["port"] == 8080 and doc["server"]["hosts"] == ["a", "b"])
+
+# --- dataclasses: frozen (immutable) + order (comparison) ---
+@dataclass(frozen=True, order=True)
+class Point:
+    x: int
+    y: int
+p1 = Point(1, 2); p2 = Point(1, 3)
+frozen_ok = False
+try:
+    p1.x = 99  # frozen -> raises
+except FrozenInstanceError:
+    frozen_ok = True
+chk("dataclass_frozen", frozen_ok)
+chk("dataclass_order", p1 < p2 and p1 == Point(1, 2) and hash(p1) == hash(Point(1, 2)))
+
+# --- pathlib.PurePosixPath: pure path algebra (no filesystem) ---
+pp = PurePosixPath("/usr/lib") / "python3.12" / "site.py"
+chk("pathlib", str(pp) == "/usr/lib/python3.12/site.py" and pp.name == "site.py"
+    and pp.suffix == ".py" and pp.parts == ("/", "usr", "lib", "python3.12", "site.py"))
+
+# --- asyncio.gather + wait_for timeout ---
+async def worker(k):
+    await asyncio.sleep(0)
+    return k * k
+async def slow():
+    await asyncio.sleep(10)
+async def amain():
+    results = await asyncio.gather(worker(2), worker(3), worker(4))
+    timed_out = False
+    try:
+        await asyncio.wait_for(slow(), timeout=0.05)
+    except asyncio.TimeoutError:
+        timed_out = True
+    return results, timed_out
+res, to = asyncio.run(amain())
+chk("asyncio_gather", res == [4, 9, 16])
+chk("asyncio_timeout", to is True)
+
+# --- unicode: UTF-8 round-trip + unicodedata.name + NFC/NFD normalization ---
+# non-ASCII written as \u escapes (NORMALIZATION-PROOF + pure-ASCII source, 4-arch portable):
+# café (e-acute NFC) + 世界 (CJK) + \U0001F600 (emoji).
+s = "café-世界-\U0001F600"
+b = s.encode("utf-8")
+chk("utf8_roundtrip", b.decode("utf-8") == s and len(b) == 17)
+chk("unicodedata_name", unicodedata.name("世") == "CJK UNIFIED IDEOGRAPH-4E16"
+    and unicodedata.name("\U0001F600") == "GRINNING FACE")
+# NFC = precomposed e-acute (1 code point); NFD = "e" + U+0301 combining acute (2 code points).
+nfc = unicodedata.normalize("NFC", "\u00e9")
+nfd = unicodedata.normalize("NFD", "\u00e9")
+chk("unicode_nfc_nfd", nfc == "\u00e9" and len(nfc) == 1 and nfd == "e\u0301" and len(nfd) == 2)
+
+print("PYLANG_OK" if ok else "PYLANG_BAD")
+PYLANG_EOF
+$PY /tmp/t_lang.py > /tmp/t4.out 2>&1
+cat /tmp/t4.out
+grep -q "^PYLANG_OK" /tmp/t4.out && T4=1 || { echo "T4 lang FAIL"; tail -10 /tmp/t4.out; }
+
+# --- T5: version-gated 3.14 features (Route B). On 3.12 (Route A) this SKIPs and
+# still passes; on 3.14 it asserts PEP750 t-strings, PEP758 bare-except, PEP734
+# concurrent.interpreters, PEP784 compression.zstd, and reports the GIL state.
+# The 3.14-only SYNTAX (t"..." / bare except) is kept inside a compile()d string
+# so the 3.12 parser never sees it (it would be a SyntaxError at module load).
+cat > /tmp/t_py314.py << 'PY314_EOF'
+import sys
+if sys.version_info < (3, 14):
+    print("PY314_SKIP (python %d.%d < 3.14)" % sys.version_info[:2])
+    print("PY314_OK")
+    sys.exit(0)
+
+SRC = r"""
+ok = True
+def chk(name, cond, info=""):
+    global ok
+    if cond: print("  py314 ok %s %s" % (name, info))
+    else: ok = False; print("  PY314 FAIL %s %s" % (name, info))
+
+# --- PEP 750: t-strings -> string.templatelib.Template ---
+from string.templatelib import Template, Interpolation
+name = "starry"
+tmpl = t"hello {name}!"
+chk("tstring_type", isinstance(tmpl, Template))
+parts = list(tmpl)
+strs = [p for p in parts if isinstance(p, str)]
+interps = [p for p in parts if isinstance(p, Interpolation)]
+chk("tstring_parts", strs == ["hello ", "!"] and len(interps) == 1 and interps[0].value == "starry")
+
+# --- PEP 758: except without parentheses around multiple types ---
+caught = None
+try:
+    raise ValueError("x")
+except ValueError, KeyError:
+    caught = "multi"
+chk("except_no_parens", caught == "multi")
+
+# --- PEP 734: concurrent.interpreters -> a fresh subinterpreter ---
+from concurrent import interpreters
+interp = interpreters.create()
+interp.exec("x = 6 * 7")
+chk("subinterpreter", interp is not None)
+interp.close()
+
+# --- PEP 784: compression.zstd round-trip ---
+from compression import zstd
+raw = b"starry-os " * 100
+comp = zstd.compress(raw)
+chk("zstd_roundtrip", zstd.decompress(comp) == raw and len(comp) < len(raw))
+
+# --- free-threading build introspection (informational, no assert) ---
+print("GIL_ENABLED=%s" % sys._is_gil_enabled())
+
+print("PY314_OK" if ok else "PY314_BAD")
+"""
+exec(compile(SRC, "t_py314_inner", "exec"))
+PY314_EOF
+$PY /tmp/t_py314.py > /tmp/t5.out 2>&1
+cat /tmp/t5.out
+grep -q "^PY314_OK" /tmp/t5.out && T5=1 || { echo "T5 py314 FAIL"; tail -10 /tmp/t5.out; }
+
+echo "RESULTS: numpy=$T1 sklearn=$T2 opencv=$T3 lang=$T4 py314=$T5"
+if [ "$T1" = 1 ] && [ "$T2" = 1 ] && [ "$T3" = 1 ] && [ "$T4" = 1 ] && [ "$T5" = 1 ]; then V=1; else V=0; fi
+printf 'PYTHON_NATIVE_OK=%s\n' "$V"
+echo "PYTHON_NATIVE_DONE"
+'''
+success_regex = ["(?m)^PYTHON_NATIVE_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

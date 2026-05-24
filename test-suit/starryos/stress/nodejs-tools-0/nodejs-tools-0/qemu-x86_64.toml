@@ -1,0 +1,84 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-nodejs-tools.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# --- Node.js TOOLING tier: eslint + babel + terser + express (StarryOS x86_64) ---
+# The pure-JS node tools of #764 that are NOT blocked by the V8-mmap bug (npm/vue/astro
+# ARE blocked and are excluded). Each tool is a small, self-contained node run that stays
+# below the node-heavy-JS-load threshold of StarryOS bug #242. Outputs are compared to a
+# host REF built with the SAME node v22.22.2 (+ same pinned package versions), so the guest
+# result is byte-deterministic. node binary at /usr/bin/node. See SOURCES-tools-suite.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-x86_64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export CI=1
+NODE=/usr/bin/node
+export NODE_OPTIONS="--max-old-space-size=1024"
+# V8 JIT probe (same fallback as nodejs-0); --jitless if PROT_EXEC mmap crashes.
+NODE_FLAGS=""
+$NODE -e 'process.exit(0)' >/tmp/probe.out 2>&1
+if [ $? -ne 0 ]; then echo "JIT probe failed -> --jitless"; tail -3 /tmp/probe.out; NODE_FLAGS="--jitless"; export NODE_OPTIONS="$NODE_OPTIONS --jitless"; fi
+echo "=== node $($NODE $NODE_FLAGS --version 2>&1) ==="
+
+SUITE=/proj/tools-suite
+NM=$SUITE/node_modules
+ESLINT_OK=0; BABEL_OK=0; TERSER_OK=0; EXPRESS_OK=0
+
+# --- 1) eslint: lint a clean sample.js against a CommonJS flat config -> exit 0, 0 issues ---
+echo "===== eslint (flat config) ====="
+cd $SUITE/eslint-proj
+$NODE $NODE_FLAGS $NM/eslint/bin/eslint.js --no-config-lookup -c eslint.config.js sample.js -f json >/tmp/eslint.json 2>/tmp/eslint.err; rc=$?
+cat /tmp/eslint.json; echo
+# Path-independent assertion: exit 0 AND every count zero (errorCount + warningCount).
+if [ $rc -eq 0 ] && $NODE $NODE_FLAGS -e '
+  const r=JSON.parse(require("fs").readFileSync("/tmp/eslint.json","utf8"));
+  let e=0,w=0; for(const f of r){e+=f.errorCount;w+=f.warningCount;}
+  if(e===0 && w===0){console.log("ESLINT_CHECK=OK");process.exit(0);}
+  console.log("ESLINT_CHECK=FAIL errors="+e+" warnings="+w);process.exit(1);' ; then
+  echo "ESLINT_RESULT=PASS"; ESLINT_OK=1
+else echo "ESLINT_RESULT=FAIL rc=$rc"; tail -10 /tmp/eslint.err; fi
+
+# --- 2) babel: @babel/cli transpile an ES2020 sample to stdout -> EXACT bytes vs REF ---
+echo "===== babel (@babel/cli transpile) ====="
+cd $SUITE/babel-proj
+$NODE $NODE_FLAGS $NM/@babel/cli/bin/babel.js --config-file ./babel.config.json src.js >/tmp/babel.out 2>/tmp/babel.err; rc=$?
+echo "--- first 4 lines of transpiled output ---"; head -4 /tmp/babel.out
+if [ $rc -eq 0 ] && diff -u $SUITE/REF/babel.out /tmp/babel.out >/tmp/babel.diff 2>&1; then
+  echo "BABEL_RESULT=PASS_BYTE_IDENTICAL"; BABEL_OK=1
+else echo "BABEL_RESULT=FAIL rc=$rc"; head -20 /tmp/babel.diff; tail -5 /tmp/babel.err; fi
+
+# --- 3) terser: minify a sample to stdout -> EXACT bytes vs REF ---
+echo "===== terser (minify) ====="
+cd $SUITE/terser-proj
+$NODE $NODE_FLAGS $NM/terser/bin/terser src.js --compress --mangle --module >/tmp/terser.out 2>/tmp/terser.err; rc=$?
+echo "--- minified output ---"; cat /tmp/terser.out
+if [ $rc -eq 0 ] && diff -u $SUITE/REF/terser.out /tmp/terser.out >/tmp/terser.diff 2>&1; then
+  echo "TERSER_RESULT=PASS_BYTE_IDENTICAL"; TERSER_OK=1
+else echo "TERSER_RESULT=FAIL rc=$rc"; head -20 /tmp/terser.diff; tail -5 /tmp/terser.err; fi
+
+# --- 4) express: start app on 127.0.0.1:PORT, loopback HTTP GET -> 200 + EXACT JSON body ---
+echo "===== express (loopback HTTP GET) ====="
+cd $SUITE/express-proj
+PORT=18080 $NODE $NODE_FLAGS app.js >/tmp/express.out 2>/tmp/express.err; rc=$?
+cat /tmp/express.out
+EXP='{"ok":true,"service":"express-proj","value":42,"items":["a","b","c"]}'
+if [ $rc -eq 0 ] && grep -q '^EXPRESS_GET=OK' /tmp/express.out && grep -Fxq "STATUS=200" /tmp/express.out && grep -Fxq "BODY=$EXP" /tmp/express.out && [ "$(cat $SUITE/REF/express.body)" = "$EXP" ]; then
+  echo "EXPRESS_RESULT=PASS"; EXPRESS_OK=1
+else echo "EXPRESS_RESULT=FAIL rc=$rc"; tail -10 /tmp/express.err; fi
+
+echo "=== SUMMARY eslint=$ESLINT_OK babel=$BABEL_OK terser=$TERSER_OK express=$EXPRESS_OK ==="
+if [ "$ESLINT_OK" = 1 ] && [ "$BABEL_OK" = 1 ] && [ "$TERSER_OK" = 1 ] && [ "$EXPRESS_OK" = 1 ]; then
+  V=1
+else V=0; fi
+printf 'NODEJS_TOOLS_OK=%s\n' "$V"
+echo "NODEJS_TOOLS_DONE"
+'''
+success_regex = ["(?m)^NODEJS_TOOLS_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

@@ -18,10 +18,20 @@ low-memory-base = 0x0                   # uint
 low-memory-size = 0x1000_0000           # uint
 # Base address of the high physical memory.
 high-memory-base = 0x8000_0000          # uint
-# Size of the whole physical memory. (1G — bumped from 128M; multi-JVM build tools
-# OOM'd: 512M cleared maven/kotlin but gradle's daemon+build JVMs need more on
-# loongarch. loongarch qemu runs -m >=2G, so 1G physical fits.)
-phys-memory-size = 0x4000_0000          # uint
+# Size of the whole physical memory. (8G = 0x2_0000_0000.)
+# loongarch maps ALL physical RAM through DMWIN0 (boot.rs `csrwr 0x180`), which is
+# RAM-size-agnostic, and the post-boot kernel aspace linear-maps every RAM region
+# (axmm::new_kernel_aspace) into the 64-bit kernel window kernel-aspace-size
+# (0x0000_ffff_ffff_f000), so >4G RAM is fully addressable. The size below is plain
+# `usize` end-to-end: axconfig-gen emits `pub const PHYS_MEMORY_SIZE: usize`, and
+# mem.rs uses usize arithmetic (saturating_sub) — no u32 truncation anywhere.
+# Bumped from 3.875G: gradle's daemon+build JVM footprint exceeds 3.875G on loongarch
+# (populate-OOM even on a fresh boot); 8G gives ample headroom. The matching qemu
+# invocation must pass `-m 8192M` so the high region [high-memory-base ..) is backed.
+# NOTE: a smaller `-m` (e.g. arceos `-m 128M`) leaves the high region unbacked and
+# faults `add_memory`; the proper long-term fix is DTB-based RAM-size detection at
+# boot (tracked separately) so one value serves every `-m`.
+phys-memory-size = 0x2_0000_0000        # uint
 
 # Linear mapping offset at boot time.
 phys-boot-offset = "0x9000_0000_0000_0000"      # uint

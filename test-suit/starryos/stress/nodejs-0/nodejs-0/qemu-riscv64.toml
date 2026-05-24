@@ -1,0 +1,131 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "rv64", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-nodejs.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# --- Node.js (musl-native, Alpine v3.22) on StarryOS riscv64 ---
+# node + runtime deps closure injected into /usr; musl loader path covers /lib + /usr/lib.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-riscv64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+# V8 JIT uses RWX/PROT_EXEC mmap + code patching; if that crashes on Starry,
+# fall back to --jitless (interpreter-only, analogous to java -Xint). Probe once.
+NODE=/usr/bin/node
+NODE_FLAGS=""
+$NODE -e 'process.exit(0)' >/tmp/probe.out 2>&1
+if [ $? -ne 0 ]; then
+  echo "JIT probe failed -> using --jitless"; cat /tmp/probe.out | tail -3
+  NODE_FLAGS="--jitless"
+fi
+echo "=== node --version ==="
+$NODE $NODE_FLAGS --version 2>&1
+# --- T1: basic eval (arithmetic) ---
+$NODE $NODE_FLAGS -e 'console.log("NODEJS_OK="+(1+1===2?1:0))' >/tmp/t1.out 2>&1
+cat /tmp/t1.out
+grep -q "NODEJS_OK=1" /tmp/t1.out && T1=1 || { T1=0; echo "T1 FAIL"; tail -5 /tmp/t1.out; }
+# --- T2: compute (fibonacci) + fs (write/read/stat) + crypto (sha256, hmac, random) ---
+cat > /tmp/big.js << 'EOF'
+const fs = require('fs');
+const crypto = require('crypto');
+let ok = true;
+// compute
+function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2); }
+if (fib(25) !== 75025) { ok = false; console.log("COMPUTE FAIL"); } else console.log("COMPUTE ok fib25=75025");
+// fs
+const p = '/tmp/node_fs_test.txt';
+const data = 'starry-node-' + Date.now();
+fs.writeFileSync(p, data);
+const back = fs.readFileSync(p, 'utf8');
+const st = fs.statSync(p);
+if (back !== data || st.size !== Buffer.byteLength(data)) { ok = false; console.log("FS FAIL"); }
+else console.log("FS ok size=" + st.size);
+// crypto: sha256 known vector
+const h = crypto.createHash('sha256').update('abc').digest('hex');
+if (h !== 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') { ok = false; console.log("SHA256 FAIL " + h); }
+else console.log("SHA256 ok");
+// crypto: hmac + random bytes
+const mac = crypto.createHmac('sha256', 'key').update('msg').digest('hex');
+const rnd = crypto.randomBytes(16).toString('hex');
+if (mac.length !== 64 || rnd.length !== 32) { ok = false; console.log("HMAC/RANDOM FAIL"); }
+else console.log("HMAC+RANDOM ok");
+console.log(ok ? "BIGJS_OK" : "BIGJS_FAIL");
+EOF
+$NODE $NODE_FLAGS /tmp/big.js >/tmp/t2.out 2>&1
+cat /tmp/t2.out
+grep -q "BIGJS_OK" /tmp/t2.out && T2=1 || { T2=0; echo "T2 FAIL"; tail -8 /tmp/t2.out; }
+# --- T3: tiny HTTP server on 127.0.0.1 + self-request ---
+cat > /tmp/http.js << 'EOF'
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, {'Content-Type': 'text/plain'});
+  res.end('HELLO_FROM_STARRY_NODE');
+});
+server.listen(18090, '127.0.0.1', () => {
+  const req = http.get({host: '127.0.0.1', port: 18090, path: '/'}, (res) => {
+    let body = '';
+    res.on('data', (c) => body += c);
+    res.on('end', () => {
+      console.log(body === 'HELLO_FROM_STARRY_NODE' ? "HTTP_OK" : "HTTP_FAIL body=" + body);
+      server.close(() => process.exit(0));
+    });
+  });
+  req.on('error', (e) => { console.log("HTTP_FAIL " + e.message); process.exit(1); });
+});
+setTimeout(() => { console.log("HTTP_TIMEOUT"); process.exit(1); }, 15000);
+EOF
+$NODE $NODE_FLAGS /tmp/http.js >/tmp/t3.out 2>&1
+cat /tmp/t3.out
+grep -q "HTTP_OK" /tmp/t3.out && T3=1 || { T3=0; echo "T3 FAIL (http; non-fatal)"; tail -6 /tmp/t3.out; }
+# --- T4: modern JS language features + worker_threads (real V8 isolate concurrency) ---
+# BigInt arithmetic, optional-chaining + nullish, Array.prototype.at, private class
+# fields (#x), structuredClone deep copy, TextEncoder/TextDecoder UTF-8 round-trip,
+# and a real worker_threads Worker that posts a computed value back to the main
+# isolate. The Worker spawns a SECOND V8 isolate on its own OS thread -> exercises
+# Starry thread create/join + cross-isolate message passing (high Starry value).
+cat > /tmp/modern.js << 'EOF'
+const { Worker, isMainThread } = require('worker_threads');
+let ok = true;
+function chk(name, cond) { if (cond) console.log("  modern ok " + name); else { ok = false; console.log("  MODERN FAIL " + name); } }
+chk("bigint", (2n ** 64n) === 18446744073709551616n && (10n ** 18n + 1n) === 1000000000000000001n);
+const obj = { a: { b: null } };
+chk("optchain", obj?.a?.b?.c === undefined && (obj?.a?.b ?? "dflt") === "dflt" && (obj?.x?.y ?? 7) === 7);
+chk("array_at", [10, 20, 30].at(-1) === 30 && [10, 20, 30].at(0) === 10);
+class Counter { #x = 0; inc() { this.#x++; return this.#x; } has() { return #x in this; } }
+const c = new Counter();
+chk("private_field", c.inc() === 1 && c.inc() === 2 && c.has() === true);
+const orig = { n: 1, arr: [1, 2, { deep: "v" }] };
+const clone = structuredClone(orig);
+clone.arr[2].deep = "changed";
+chk("structuredClone", orig.arr[2].deep === "v" && clone.arr[2].deep === "changed" && clone.n === 1);
+const s = "héllo-世界-🚀";
+const enc = new TextEncoder().encode(s);
+const dec = new TextDecoder("utf-8").decode(enc);
+chk("text_roundtrip", dec === s && enc.length === 18);
+function finish() {
+  const w = new Worker("const {parentPort}=require('worker_threads'); parentPort.postMessage(6*7);", { eval: true });
+  const timer = setTimeout(() => { console.log("MODERN_FAIL worker_timeout"); process.exit(1); }, 15000);
+  w.on("message", (m) => {
+    clearTimeout(timer);
+    chk("worker_thread", m === 42);
+    console.log(ok ? "MODERN_OK" : "MODERN_FAIL");
+    w.terminate().then(() => process.exit(0));
+  });
+  w.on("error", (e) => { clearTimeout(timer); console.log("MODERN_FAIL worker_error " + e.message); process.exit(1); });
+}
+if (isMainThread) finish();
+EOF
+$NODE $NODE_FLAGS /tmp/modern.js >/tmp/t4.out 2>&1
+cat /tmp/t4.out
+grep -q "^MODERN_OK" /tmp/t4.out && T4=1 || { T4=0; echo "T4 FAIL (modern js / worker_threads)"; tail -10 /tmp/t4.out; }
+echo "RESULTS: T1=$T1 T2=$T2 T3=$T3 T4=$T4"
+if [ "$T1" = 1 ] && [ "$T2" = 1 ] && [ "$T4" = 1 ]; then V=1; else V=0; fi
+printf 'NODEJS_ALL_OK=%s\n' "$V"
+echo "BIGTEST_DONE"
+'''
+success_regex = ["(?m)^NODEJS_ALL_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200

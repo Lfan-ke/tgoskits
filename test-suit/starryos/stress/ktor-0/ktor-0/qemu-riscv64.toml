@@ -1,0 +1,55 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "rv64",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-java.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-riscv64.path
+# --- Ktor (Kotlin async web, Netty engine; loopback 127.0.0.1:18082) ---
+# Launch the host-compiled Ktor fat jar; it binds 127.0.0.1:18082 and prints KTOR_READY.
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/ktor-demo.jar >/tmp/ktor.out 2>&1 &
+JPID=$!
+# Wait for the engine to accept connections (slow -Xint + emulated-arch warmup; up to ~180s).
+ready=0
+for i in $(seq 1 180); do
+  grep -q KTOR_READY /tmp/ktor.out && { ready=1; break; }
+  kill -0 $JPID 2>/dev/null || break
+  sleep 1
+done
+PASS=0; FAIL=0
+# Raw HTTP/1.0 over busybox nc (GET + POST), assert exact status line + body.
+get() { printf 'GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' "$1" | timeout 15 nc 127.0.0.1 18082; }
+post() { b="$2"; printf 'POST %s HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: %s\r\n\r\n%s' "$1" "${#b}" "$b" | timeout 15 nc 127.0.0.1 18082; }
+chk() { # name resp expect_status expect_body
+  st=$(printf '%s' "$2" | head -1 | tr -d '\r')
+  bd=$(printf '%s' "$2" | awk 'f{print} /^\r?$/{f=1}' | tr -d '\r' | head -1)
+  if echo "$st" | grep -q "$3" && [ "$bd" = "$4" ]; then PASS=$((PASS+1)); echo "OK   $1 [$st] body=[$bd]";
+  else FAIL=$((FAIL+1)); echo "FAIL $1 [$st] body=[$bd] (want '$3' body=[$4])"; fi
+}
+chkstatus() { # name resp expect_status  (body not checked, e.g. 404)
+  st=$(printf '%s' "$2" | head -1 | tr -d '\r')
+  if echo "$st" | grep -q "$3"; then PASS=$((PASS+1)); echo "OK   $1 [$st]"; else FAIL=$((FAIL+1)); echo "FAIL $1 [$st] (want '$3')"; fi
+}
+if [ "$ready" = "1" ]; then
+  chk "/ping"        "$(get /ping)"              "200 OK"      "KTOR_PONG"
+  chk "/add/3/4"     "$(get /add/3/4)"           "200 OK"      '{"a":3,"b":4,"sum":7}'
+  chk "/add/foo/4"   "$(get /add/foo/4)"         "400 Bad"     "BAD_INT"
+  chk "/echo"        "$(get '/echo?msg=hello')"  "200 OK"      '{"echo":"hello","len":5}'
+  chk "/sum"         "$(post /sum '{"nums":[1,2,3,4]}')" "200 OK" '{"total":10,"count":4}'
+  chkstatus "/nope"  "$(get /nope)"              "404 Not Found"
+else
+  echo "KTOR_NOT_READY"; grep -aiE "KTOR_ERR|Exception|Error" /tmp/ktor.out | tail -10
+fi
+kill $JPID 2>/dev/null
+echo "KTOR_RESULT pass=$PASS fail=$FAIL"
+V=0; [ "$ready" = "1" ] && [ "$FAIL" = "0" ] && [ "$PASS" = "6" ] && V=1
+printf 'KTOR_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^KTOR_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 3000

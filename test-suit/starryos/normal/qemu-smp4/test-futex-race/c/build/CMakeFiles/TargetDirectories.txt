@@ -1,0 +1,7 @@
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-futex-race/c/build/CMakeFiles/test-futex-race.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-futex-race/c/build/CMakeFiles/edit_cache.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-futex-race/c/build/CMakeFiles/rebuild_cache.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-futex-race/c/build/CMakeFiles/list_install_components.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-futex-race/c/build/CMakeFiles/install.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-futex-race/c/build/CMakeFiles/install/local.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-futex-race/c/build/CMakeFiles/install/strip.dir

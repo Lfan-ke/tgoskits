@@ -1,0 +1,83 @@
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "4096M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-python-arrow.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === Apache Parquet I/O correctness via pyarrow on StarryOS loongarch64 ===
+# pyarrow 21.0.0 (musl-native) on the python3 runtime. Builds an in-memory Arrow Table
+# (int + string columns), writes it to a Parquet file with pyarrow.parquet.write_table,
+# reads it back with read_table, and asserts the round-tripped data EXACTLY equals the
+# original (schema field names/types AND every value). This exercises the heavy Arrow
+# C++ stack on musl: libarrow / libparquet / libthrift / libprotobuf + the Snappy/Zstd
+# compression codecs + mmap/threads/file I/O of the columnar Parquet format. Not exit-0:
+# it round-trips real data through a real Parquet file on disk and compares it back.
+# pyarrow + Arrow/Parquet C++ libs injected by prep-python-arrow-rootfs.sh (Alpine v3.23
+# musl apks: py3-pyarrow + libarrow*/libparquet + closure). See ~/rcore/download/python-apks/SOURCES.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-loongarch64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+PY=/usr/bin/python3
+echo "=== python3 --version ==="
+$PY --version 2>&1
+echo "=== pyarrow version ==="
+$PY -c "import pyarrow as pa; print('pyarrow', pa.__version__)" 2>&1
+
+# --- DoD: Parquet write -> read -> exact round-trip equality ---
+cat > /tmp/t_pyarrow.py << 'EOF'
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# Original Table: a few columns, ints + strings (and an int64 / float64 mix).
+ids    = pa.array([1, 2, 3, 4, 5], type=pa.int32())
+bigs   = pa.array([100, 200, 300, 400, 500], type=pa.int64())
+names  = pa.array(["alice", "bob", "carol", "dave", "erin"], type=pa.string())
+scores = pa.array([1.5, 2.5, 3.5, 4.5, 5.5], type=pa.float64())
+tags   = pa.array(["x", "yy", "zzz", "", "w"], type=pa.string())
+table = pa.table(
+    {"id": ids, "big": bigs, "name": names, "score": scores, "tag": tags}
+)
+print("  built table rows=%d cols=%d schema=%s"
+      % (table.num_rows, table.num_columns, [f.name for f in table.schema]))
+
+# Write to a real Parquet file on disk, then read it back.
+path = "/tmp/t.parquet"
+pq.write_table(table, path)
+import os
+sz = os.path.getsize(path)
+print("  wrote %s (%d bytes)" % (path, sz))
+back = pq.read_table(path)
+print("  read back rows=%d cols=%d" % (back.num_rows, back.num_columns))
+
+# EXACT round-trip equality: schema (names + types) AND all values.
+schema_ok = table.schema.equals(back.schema)
+values_ok = table.equals(back)
+# Spot-check actual cell values too (defense in depth, independent of .equals()).
+cells_ok = (
+    back.column("id").to_pylist()    == [1, 2, 3, 4, 5]
+    and back.column("big").to_pylist()   == [100, 200, 300, 400, 500]
+    and back.column("name").to_pylist()  == ["alice", "bob", "carol", "dave", "erin"]
+    and back.column("score").to_pylist() == [1.5, 2.5, 3.5, 4.5, 5.5]
+    and back.column("tag").to_pylist()   == ["x", "yy", "zzz", "", "w"]
+)
+print("  schema_equal=%s values_equal=%s cells_equal=%s" % (schema_ok, values_ok, cells_ok))
+ok = bool(schema_ok and values_ok and cells_ok and sz > 0)
+print("PYARROW_RT_OK" if ok else "PYARROW_RT_BAD")
+EOF
+$PY /tmp/t_pyarrow.py > /tmp/pa.out 2>&1
+cat /tmp/pa.out
+PA=0
+grep -q "^PYARROW_RT_OK" /tmp/pa.out && PA=1 || { echo "pyarrow Parquet round-trip FAIL"; tail -20 /tmp/pa.out; }
+# Shell-controlled gate (so the success token is emitted ONLY after the round-trip passed).
+if [ "$PA" = 1 ]; then V=1; else V=0; fi; printf 'PYARROW_OK=%s\n' "$V"
+echo "PYARROW_DONE"
+'''
+success_regex = ["(?m)^PYARROW_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 2400

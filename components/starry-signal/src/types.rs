@@ -216,6 +216,31 @@ impl SignalInfo {
         result
     }
 
+    /// Construct a SignalInfo for a memory-access fault (SIGSEGV/SIGBUS/etc.).
+    ///
+    /// POSIX requires `si_addr` to hold the faulting address. HotSpot's
+    /// safepoint-poll signal handler in particular reads `si_addr` to recognize
+    /// an access to the (thread-local) polling page; reporting 0 — as
+    /// [`Self::new_kernel`] does — makes it misclassify the poll fault.
+    pub fn new_fault(signo: Signo, code: i32, addr: usize) -> Self {
+        // FIXME: Zeroable
+        let mut result: Self = unsafe { mem::zeroed() };
+        result.set_signo(signo);
+        result.set_code(code);
+        // SAFETY: the union is zeroed above; `_sigfault` is the valid variant
+        // for fault signals, and `_addr` carries the faulting address.
+        unsafe {
+            result
+                .0
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigfault
+                ._addr = addr as *mut core::ffi::c_void;
+        }
+        result
+    }
+
     pub fn new_user(signo: Signo, code: i32, pid: u32, uid: u32) -> Self {
         // FIXME: Zeroable
         let mut result: Self = unsafe { mem::zeroed() };

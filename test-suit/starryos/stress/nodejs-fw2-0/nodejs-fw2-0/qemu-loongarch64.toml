@@ -1,0 +1,94 @@
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "4096M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-nodejs-fw.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# --- Node.js HEAVY JS-framework builds: vue-mixed + astro-islands (StarryOS loongarch64) ---
+# These are the two HEAVY bundler builds that complete the #764 nodejs coverage:
+#   vue-mixed:     Vue3+Vite with FIVE preprocessors in one SFC set —
+#                  less+pug+js / ts+scss+html / jsx / tsx / stylus
+#   astro-islands: Astro5 static build with a Vue island + a React island + bootstrap3 css
+# Both run the SAME bundler / deps / inputs as the proven-correct react-vite (nodejs-fw-0),
+# but their build graphs are far larger. On current StarryOS they hit the node-heavy-JS-load
+# crash (bug #242, non-deterministic SIGSEGV e.g. rip=0x60164cdd / register-garbage faults
+# while V8 churns a very large/complex JS program — npm-cli SIGSEGVs the same way). So THIS
+# CASE IS EXPECTED TO FAIL until #242 is fixed. Once it is, these should pass byte-identical
+# to the host REF with no other change (same WASM-rollup pipeline as react-vite). See notes/36.
+#
+# Shares the rootfs-<arch>-nodejs-fw.img (vue-mixed + astro-islands already injected with
+# vendored node_modules + REF.sha256 by prep-nodejs-fw-rootfs.sh). npm-cli itself SIGSEGVs
+# on Starry, so we launch each bundler DIRECTLY via node — exactly what `npm run build`
+# execs internally.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-loongarch64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export npm_config_offline=true
+export npm_config_audit=false
+export npm_config_fund=false
+export npm_config_update_notifier=false
+export CI=1
+NODE=/usr/bin/node
+export NODE_OPTIONS="--max-old-space-size=1024"
+NODE_FLAGS=""
+$NODE -e 'process.exit(0)' >/tmp/probe.out 2>&1
+if [ $? -ne 0 ]; then echo "JIT probe failed -> --jitless"; tail -3 /tmp/probe.out; NODE_FLAGS="--jitless"; export NODE_OPTIONS="$NODE_OPTIONS --jitless"; fi
+echo "=== node $($NODE $NODE_FLAGS --version 2>&1) ==="
+
+# build_and_check <project> <build-entry...> : run the bundler, then sha256-compare dist vs REF
+build_and_check() {
+  proj="$1"; shift
+  echo "===== PROJECT $proj ====="
+  cd /proj/$proj || { echo "$proj NO_DIR"; return 1; }
+  rm -rf dist
+  $NODE $NODE_FLAGS "$@" >/tmp/$proj.build.out 2>&1
+  rc=$?
+  tail -6 /tmp/$proj.build.out
+  if [ $rc -ne 0 ]; then echo "$proj BUILD_FAIL rc=$rc"; tail -20 /tmp/$proj.build.out; echo "${proj}_RESULT=FAIL_BUILD"; return 1; fi
+  echo "$proj build OK"
+  miss=0; bad=0; n=0
+  while read -r want path; do
+    n=$((n+1)); f="dist/${path#./}"
+    if [ ! -f "$f" ]; then echo "  MISSING $f"; miss=$((miss+1)); continue; fi
+    got=$($NODE $NODE_FLAGS -e 'const c=require("crypto"),fs=require("fs");process.stdout.write(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$f")
+    [ "$got" != "$want" ] && { echo "  DIFF $path"; echo "    want=$want"; echo "    got =$got"; bad=$((bad+1)); }
+  done < REF.sha256
+  extra=0
+  for f in $(cd dist && find . -type f | sort); do grep -q "  ${f}\$" REF.sha256 || { echo "  EXTRA dist/$f"; extra=$((extra+1)); }; done
+  echo "  checked=$n missing=$miss diff=$bad extra=$extra"
+  if [ $miss -eq 0 ] && [ $bad -eq 0 ] && [ $extra -eq 0 ]; then echo "${proj}_RESULT=PASS_BYTE_IDENTICAL"; return 0
+  else echo "${proj}_RESULT=FAIL_CONTENT_DIFF"; return 1; fi
+}
+
+# functional smoke: required marker strings present + every emitted JS chunk parses in node
+func_check() {
+  proj="$1"; shift
+  cd /proj/$proj || return 1
+  ok=1
+  for marker in "$@"; do
+    if grep -rqF "$marker" dist/ 2>/dev/null; then echo "  func[$proj] found: $marker"; else echo "  func[$proj] MISSING: $marker"; ok=0; fi
+  done
+  for js in $(cd dist && find . -name '*.js' | sort); do
+    $NODE $NODE_FLAGS --check "dist/$js" >/tmp/chk.out 2>&1 || { echo "  func[$proj] JS PARSE FAIL dist/$js"; tail -3 /tmp/chk.out; ok=0; }
+  done
+  [ $ok -eq 1 ] && echo "${proj}_FUNC=OK" || echo "${proj}_FUNC=FAIL"
+}
+
+RA=FAIL; RV=FAIL
+# astro-islands first (vite under the hood, no scss), then vue-mixed (5 preprocessors).
+build_and_check astro-islands node_modules/astro/astro.js   build  && RA=PASS; func_check astro-islands "Astro Islands" "rendered-by-vue-island" "rendered-by-react-island"
+build_and_check vue-mixed     node_modules/vite/bin/vite.js build  && RV=PASS; func_check vue-mixed     "Vue Mixed Frameworks" "hello-less-pug"
+
+echo "=== SUMMARY astro-islands=$RA vue-mixed=$RV ==="
+# Gate: BOTH heavy builds must be byte-identical to host REF. Until #242 is fixed this
+# stays FAIL (honest: heavy node JS-load crash blocks them). Once #242 is fixed, flip to PASS.
+if [ "$RA" = PASS ] && [ "$RV" = PASS ]; then V=1; else V=0; fi; printf 'NODEJS_FW2_OK=%s\n' "$V"
+echo "NODEJS_FW2_DONE"
+'''
+success_regex = ["(?m)^NODEJS_FW2_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 7200

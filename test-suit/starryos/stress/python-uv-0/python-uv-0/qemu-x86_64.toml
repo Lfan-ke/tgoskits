@@ -1,0 +1,46 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-python-uv.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = """
+# === uv (Astral Python package manager) offline smoke on StarryOS ===
+# uv = standalone Rust/musl binary /usr/bin/uv (24.7MB). Hermetic DoD (network OFF):
+# version + create a venv with the SYSTEM python (no managed-python download) +
+# the venv python runs + uv pip list (local). See ~/rcore/download/python-apks/SOURCES.md.
+printf '/lib
+/usr/lib
+' > /etc/ld-musl-$(uname -m).path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export UV_OFFLINE=1
+export UV_PYTHON_DOWNLOADS=never
+export UV_PYTHON_PREFERENCE=only-system
+export UV_CACHE_DIR=/root/.cache/uv
+UV=/usr/bin/uv
+PY=/usr/bin/python3.12
+U1=0; U2=0; U3=0
+echo "=== uv --version ==="
+$UV --version > /tmp/uv1.out 2>&1; cat /tmp/uv1.out
+grep -qiE 'uv [0-9]' /tmp/uv1.out && U1=1 || echo "T1 uv --version FAIL"
+echo "=== uv venv (system python3.12, offline) ==="
+rm -rf /tmp/ve
+$UV venv --python $PY --python-preference only-system /tmp/ve > /tmp/uv2.out 2>&1; rc=$?
+cat /tmp/uv2.out
+if [ $rc -eq 0 ] && [ -x /tmp/ve/bin/python ]; then U2=1; else echo "T2 uv venv FAIL rc=$rc"; fi
+echo "=== venv python runs + uv pip list ==="
+/tmp/ve/bin/python -c "import sys; print('VENV_PREFIX='+sys.prefix)" > /tmp/uv3.out 2>&1
+$UV pip list --python /tmp/ve/bin/python >> /tmp/uv3.out 2>&1
+cat /tmp/uv3.out
+grep -q "VENV_PREFIX=/tmp/ve" /tmp/uv3.out && U3=1 || echo "T3 venv-python FAIL"
+echo "RESULTS: version=$U1 venv=$U2 venvpy=$U3"
+if [ "$U1" = 1 ] && [ "$U2" = 1 ] && [ "$U3" = 1 ]; then V=1; else V=0; fi; printf 'PYTHON_UV_OK=%s\n' "$V"
+echo "PYTHON_UV_DONE"
+"""
+success_regex = ["(?m)^PYTHON_UV_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 2400

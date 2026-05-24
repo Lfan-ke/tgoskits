@@ -11,7 +11,8 @@ use linux_raw_sys::{
     general::{O_RDWR, S_IFSOCK},
     ioctl::{
         FIONREAD, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFDSTADDR, SIOCGIFFLAGS,
-        SIOCGIFHWADDR, SIOCGIFMAP, SIOCGIFMETRIC, SIOCGIFMTU, SIOCGIFNETMASK, SIOCGIFTXQLEN,
+        SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMAP, SIOCGIFMETRIC, SIOCGIFMTU, SIOCGIFNETMASK,
+        SIOCGIFTXQLEN,
     },
     net::{AF_INET, ifreq},
 };
@@ -37,6 +38,11 @@ const IFCONF_LEN_OFFSET: usize = 0;
 const IFCONF_BUF_OFFSET: usize = 8;
 const ETH0_MTU: i32 = 1500;
 const LO_MTU: i32 = 65536;
+// Interface indices: lo is 1, eth0 is 2 (Linux convention). Mirrors
+// packet.rs's ETH0_IFINDEX; AF_INET sockets query these via SIOCGIFINDEX
+// (if_nametoindex / getifaddrs), used by gradle/netty/ros2 net enumeration.
+const ETH0_IFINDEX: i32 = 2;
+const LO_IFINDEX: i32 = 1;
 
 pub struct Socket(pub SocketInner, u32);
 
@@ -200,6 +206,13 @@ impl FileLike for Socket {
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
         match cmd {
             SIOCGIFCONF => write_eth0_ifconf(arg)?,
+            SIOCGIFINDEX => {
+                let idx: i32 = match read_ifreq_interface(arg)? {
+                    NetInterface::Eth0 => ETH0_IFINDEX,
+                    NetInterface::Loopback => LO_IFINDEX,
+                };
+                write_ifreq_data(arg, &idx.to_ne_bytes())?;
+            }
             SIOCGIFFLAGS => {
                 let flags = match read_ifreq_interface(arg)? {
                     NetInterface::Eth0 => IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,

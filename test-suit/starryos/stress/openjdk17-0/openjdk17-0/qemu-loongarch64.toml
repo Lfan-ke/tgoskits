@@ -1,5 +1,5 @@
 args = [
-    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "2048M",
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "8192M",
     "-device", "virtio-blk-pci,drive=disk0",
     "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-java.img",
     "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
@@ -14,22 +14,35 @@ printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /et
 cat > /tmp/H.java << 'EOF'
 public class H { public static void main(String[] a){ System.out.println("HI"); } }
 EOF
+# --- aggregate gate: count every suite; OPENJDK17_OK=1 ONLY when PASS==TOTAL.
+# acc <1|0> records one suite result (TOTAL always++, PASS++ on success). This
+# closes the old hole where BIGTEST_DONE was emitted unconditionally so an EE
+# demo failing (ok=0) still passed the case. Now ANY ok=0 -> PASS<TOTAL -> fail.
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); else echo "  SUITE FAIL ($TOTAL)"; fi; }
 jok=0; jbad=0
 for i in 1 2 3 4 5; do $JAVA_HOME/bin/javac -J-Xint -J-Xmx256m -J-Xms32m -d /tmp /tmp/H.java >/tmp/j.out 2>&1 && jok=$((jok+1)) || jbad=$((jbad+1)); done
 echo "JAVAC ok=$jok bad=$jbad"
+[ "$jbad" = 0 ] && acc 1 || acc 0
 ok=0; bad=0
 for i in 1 2 3 4 5; do
   $JAVA_HOME/bin/java -Xint -Xmx256m -Xms32m -jar /root/complex-demo.jar >/tmp/cd.out 2>&1
   grep -q CDEMO_DONE /tmp/cd.out && ok=$((ok+1)) || { bad=$((bad+1)); echo "run$i BAD"; }
 done
 echo "CDEMO ok=$ok bad=$bad"
+[ "$bad" = 0 ] && acc 1 || acc 0
 # --- DoD-A: build tools on starry ---
 export MAVEN_OPTS="-Xint -Xmx256m -Xms32m"
 cd /root/complex-demo
 /opt/apache-maven-3.9.9/bin/mvn -o -Dmaven.repo.local=/root/.m2/repository -DskipTests -Dmaven.test.skip=true package >/tmp/mvn.out 2>&1
-grep -q "BUILD SUCCESS" /tmp/mvn.out && echo "MVN ok=1" || { echo "MVN ok=0"; tail -20 /tmp/mvn.out; }
-/opt/gradle-8.10.2/bin/gradle --offline --no-daemon -g /root/.gradle build >/tmp/gradle.out 2>&1
-grep -q "BUILD SUCCESSFUL" /tmp/gradle.out && echo "GRADLE ok=1" || { echo "GRADLE ok=0"; tail -20 /tmp/gradle.out; }
+if grep -q "BUILD SUCCESS" /tmp/mvn.out; then echo "MVN ok=1"; acc 1; else echo "MVN ok=0"; tail -20 /tmp/mvn.out; acc 0; fi
+# gradle@loongarch: loongarch usable RAM is now 8G (phys-memory-size = 0x2_0000_0000,
+# qemu -m 8192M), so the build JVM no longer has to be squeezed under a 3.5G ceiling.
+# Give the gradle build JVM a generous heap + large metaspace (its footprint exceeds
+# 3.875G, which is why the previous 3.875G config populate-OOM'd). -Xint stays because
+# the loongarch JIT is still unstable (#206). 1G heap + 2G metaspace fits comfortably in 8G.
+GRADLE_OPTS="-Xint -Xms64m -Xmx512m" /opt/gradle-8.10.2/bin/gradle --offline --no-daemon -Dorg.gradle.jvmargs="-Xint -Xms128m -Xmx1024m -XX:MaxMetaspaceSize=2048m" -g /root/.gradle build >/tmp/gradle.out 2>&1
+if grep -q "BUILD SUCCESSFUL" /tmp/gradle.out; then echo "GRADLE ok=1"; acc 1; else echo "GRADLE ok=0"; tail -20 /tmp/gradle.out; acc 0; fi
 cd /root
 cat > /tmp/K.kt << 'EOF'
 fun main() { println("KOTLIN_OK") }
@@ -38,10 +51,10 @@ EOF
 # explicit -Xms required: starry heap ergonomics mis-size the initial heap ("Too small initial heap")
 $JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -cp "/opt/kotlinc/lib/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler /tmp/K.kt -include-runtime -d /tmp/K.jar >/tmp/kt.out 2>&1
 $JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -jar /tmp/K.jar >/tmp/kt.run 2>&1
-grep -q KOTLIN_OK /tmp/kt.run && echo "KOTLIN ok=1" || { echo "KOTLIN ok=0"; tail -15 /tmp/kt.out /tmp/kt.run; }
+if grep -q KOTLIN_OK /tmp/kt.run; then echo "KOTLIN ok=1"; acc 1; else echo "KOTLIN ok=0"; tail -15 /tmp/kt.out /tmp/kt.run; acc 0; fi
 # --- DoD-B: JSE 标准库/语言/运行时 suite ---
 JSE_OK=0; JSE_BAD=0
-for T in NetTest AlgoTest StdlibTest ConcurrencyTest FileTest JvmTest SyntaxTest TimeTest XmlTest LangUtilTest ExtraTest CryptoTest ProcessTest NioChannelTest; do
+for T in NetTest AlgoTest StdlibTest ConcurrencyTest ConcurrencyDeep FileTest JvmTest SyntaxTest TimeTest XmlTest LangUtilTest ExtraTest CryptoTest ProcessTest NioChannelTest; do
   $JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -cp /root/dod $T >/tmp/jse.out 2>&1
   if grep -q "_DONE" /tmp/jse.out; then JSE_OK=$((JSE_OK+1)); else JSE_BAD=$((JSE_BAD+1)); echo "$T JSE FAIL:"; tail -4 /tmp/jse.out; fi
 done
@@ -50,11 +63,54 @@ for J in realdep-demo jdbc-demo; do
   grep -q "_DONE" /tmp/j.out && JSE_OK=$((JSE_OK+1)) || { JSE_BAD=$((JSE_BAD+1)); echo "$J FAIL:"; tail -4 /tmp/j.out; }
 done
 echo "JSE ok=$JSE_OK bad=$JSE_BAD"
+# account each JSE sub-suite individually into the aggregate gate.
+TOTAL=$((TOTAL+JSE_OK+JSE_BAD)); PASS=$((PASS+JSE_OK))
+[ "$JSE_BAD" = 0 ] || echo "  SUITE FAIL (JSE: $JSE_BAD sub-suites)"
 # --- DoD-C JavaEE: embedded Jetty HTTP server (loopback self-test) ---
 $JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/jetty-demo.jar >/tmp/jetty.out 2>&1
-grep -q JETTY_DONE /tmp/jetty.out && echo "EE-JETTY ok=1" || { echo "EE-JETTY ok=0"; tail -10 /tmp/jetty.out; }
+if grep -q JETTY_DONE /tmp/jetty.out; then echo "EE-JETTY ok=1"; acc 1; else echo "EE-JETTY ok=0"; tail -10 /tmp/jetty.out; acc 0; fi
+# --- DoD-C JavaEE: Spring Boot + embedded Tomcat (bind 127.0.0.1; starry IPv6 stub) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -Dserver.port=18080 -Dserver.address=127.0.0.1 -Djava.net.preferIPv4Stack=true -jar /root/dod/spring-demo.jar >/tmp/spring.out 2>&1
+if grep -q SPRING_DONE /tmp/spring.out; then echo "EE-SPRING ok=1"; acc 1; else echo "EE-SPRING ok=0"; grep -aiE "Tomcat started|Started Spring|refused|Exception|ERROR" /tmp/spring.out | tail -8; acc 0; fi
+# --- DoD-C: Netty NIO TCP echo (loopback) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/netty-demo.jar >/tmp/netty.out 2>&1
+if grep -q NETTY_DONE /tmp/netty.out; then echo "EE-NETTY ok=1"; acc 1; else echo "EE-NETTY ok=0"; tail -8 /tmp/netty.out; acc 0; fi
+# --- DoD-C: SQLite3 (xerial sqlite-jdbc; ORM 地基) ---
+$JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -jar /root/dod/sqlite-demo.jar >/tmp/sqlite.out 2>&1
+if grep -q SQLITE_DONE /tmp/sqlite.out; then echo "EE-SQLITE ok=1"; acc 1; else echo "EE-SQLITE ok=0"; grep -aiE "SQLITE_NATIVE_FAIL|SQLITE_ERR|Exception" /tmp/sqlite.out | tail -5; acc 0; fi
+# --- DoD-C: MyBatis ORM (sqlite3 后端) ---
+$JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -jar /root/dod/mybatis-demo.jar >/tmp/mybatis.out 2>&1
+if grep -q MYBATIS_DONE /tmp/mybatis.out; then echo "EE-MYBATIS ok=1"; acc 1; else echo "EE-MYBATIS ok=0"; grep -aiE "FAIL|native|UnsatisfiedLink|Exception" /tmp/mybatis.out | tail -5; acc 0; fi
+# --- DoD-C: Lombok (注解处理器 / 编译期代码生成) ---
+$JAVA_HOME/bin/java -Xint -Xms32m -Xmx256m -jar /root/dod/lombok-demo.jar >/tmp/lombok.out 2>&1
+if grep -q LOMBOK_DONE /tmp/lombok.out; then echo "EE-LOMBOK ok=1"; acc 1; else echo "EE-LOMBOK ok=0"; tail -8 /tmp/lombok.out; acc 0; fi
+# --- DoD-C: Hibernate ORM/JPA (sqlite3 后端, 复用 musl JNI) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -jar /root/dod/hibernate-demo.jar >/tmp/hibernate.out 2>&1
+if grep -q HIBERNATE_DONE /tmp/hibernate.out; then echo "EE-HIBERNATE ok=1"; acc 1; else echo "EE-HIBERNATE ok=0"; grep -aiE "HIBERNATE_ERR|HIBERNATE_NATIVE_FAIL|UnsatisfiedLink|Exception|FAIL" /tmp/hibernate.out | tail -6; acc 0; fi
+# --- DoD-C / P5: Spring Data JPA × sqlite3 (全栈 ORM×框架集成) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx640m -jar /root/dod/springdata-demo.jar >/tmp/sdj.out 2>&1
+if grep -q SDJ_DONE /tmp/sdj.out; then echo "EE-SPRINGDATA ok=1"; acc 1; else echo "EE-SPRINGDATA ok=0"; grep -aiE "SDJ_ERR|SDJ_NATIVE_FAIL|APPLICATION FAILED|UnsatisfiedLink|Exception|FAIL" /tmp/sdj.out | tail -6; acc 0; fi
+# --- DoD-C / P6: Spring Boot (Kotlin) — data class/高阶函数/空安全 + Spring DI ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -jar /root/dod/springkt-demo.jar >/tmp/springkt.out 2>&1
+if grep -q SPRINGKT_DONE /tmp/springkt.out; then echo "EE-SPRINGKT ok=1"; acc 1; else echo "EE-SPRINGKT ok=0"; grep -aiE "FAIL|APPLICATION FAILED|Exception" /tmp/springkt.out | tail -6; acc 0; fi
+# --- DoD-C / P6: Undertow embedded HTTP (loopback 127.0.0.1) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/undertow-demo.jar >/tmp/undertow.out 2>&1
+if grep -q UNDERTOW_DONE /tmp/undertow.out; then echo "EE-UNDERTOW ok=1"; acc 1; else echo "EE-UNDERTOW ok=0"; grep -aiE "UNDERTOW_ERR|FAIL|Exception" /tmp/undertow.out | tail -6; acc 0; fi
+# --- DoD-C / P6: R2DBC reactive DB (r2dbc-h2 + Reactor) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/r2dbc-demo.jar >/tmp/r2dbc.out 2>&1
+if grep -q R2DBC_DONE /tmp/r2dbc.out; then echo "EE-R2DBC ok=1"; acc 1; else echo "EE-R2DBC ok=0"; grep -aiE "R2DBC_ERR|FAIL|Exception" /tmp/r2dbc.out | tail -6; acc 0; fi
+# --- DoD-C / P7: Kotlin coroutines runtime (kotlinx-coroutines, host-compiled jar) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/coroutines-demo.jar >/tmp/coroutines.out 2>&1
+if grep -q COROUTINES_DONE /tmp/coroutines.out; then echo "EE-COROUTINES ok=1"; acc 1; else echo "EE-COROUTINES ok=0"; grep -aiE "FAIL|Exception" /tmp/coroutines.out | tail -6; acc 0; fi
+# --- DoD-C / P6: Exposed (Kotlin ORM/DSL on sqlite3, host-compiled jar) ---
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -jar /root/dod/exposed-demo.jar >/tmp/exposed.out 2>&1
+if grep -q EXPOSED_DONE /tmp/exposed.out; then echo "EE-EXPOSED ok=1"; acc 1; else echo "EE-EXPOSED ok=0"; grep -aiE "EXPOSED_ERR|EXPOSED_NATIVE_FAIL|UnsatisfiedLink|FAIL|Exception" /tmp/exposed.out | tail -6; acc 0; fi
+# --- aggregate gate: emit the gated token ONLY when every suite passed (PASS==TOTAL).
+echo "AGGREGATE: PASS=$PASS TOTAL=$TOTAL"
+if [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then V=1; else V=0; fi
+printf 'OPENJDK17_OK=%s\n' "$V"
 echo "BIGTEST_DONE"
 '''
-success_regex = ["(?m)^BIGTEST_DONE"]
-fail_regex = ['(?i)kernel\bpanic']
-timeout = 5400
+success_regex = ["(?m)^OPENJDK17_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 7000

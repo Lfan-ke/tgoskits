@@ -1,0 +1,7 @@
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp1/syscall/test-uid-gid-re-setters/c/build/CMakeFiles/test-uid-gid-re-setters.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp1/syscall/test-uid-gid-re-setters/c/build/CMakeFiles/edit_cache.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp1/syscall/test-uid-gid-re-setters/c/build/CMakeFiles/rebuild_cache.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp1/syscall/test-uid-gid-re-setters/c/build/CMakeFiles/list_install_components.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp1/syscall/test-uid-gid-re-setters/c/build/CMakeFiles/install.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp1/syscall/test-uid-gid-re-setters/c/build/CMakeFiles/install/local.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp1/syscall/test-uid-gid-re-setters/c/build/CMakeFiles/install/strip.dir

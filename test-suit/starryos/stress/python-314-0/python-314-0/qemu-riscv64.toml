@@ -1,0 +1,199 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "rv64", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-python314.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === Python 3.14 LANGUAGE + new-stdlib feature CORRECTNESS on StarryOS riscv64 ===
+# ROUTE B: Alpine *edge* musl-native python3 3.14.3 (interpreter + pure stdlib ONLY;
+# NO numpy/sklearn/opencv -> those stay on python-0/3.12). This case EXERCISES the
+# 3.14-ONLY syntax + stdlib that python-0's compile()-gated T5 can NEVER run on 3.12
+# (where it takes PY314_SKIP). Every check is an EXACT assertion (not exit 0); the
+# success token is emitted via printf so it never appears as shell command text that
+# success_regex could falsely match. See ~/rcore/download/python-apks/SOURCES.md +
+# ~/rcore/notes/40-fangan2-test-fix-log.md (§D 3.14 features, §E completeness, §G gate).
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-riscv64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export PYTHONDONTWRITEBYTECODE=1
+PY=/usr/bin/python3
+echo "=== python3 --version (must be 3.14.x) ==="
+$PY --version 2>&1
+
+# The 3.14-only SYNTAX (t-strings, parenless except) is a SyntaxError to the 3.12
+# host parser, so python-0 kept it inside compile(); here the interpreter IS 3.14
+# so we can write it as plain source. We still funnel the PASS token through printf.
+cat > /tmp/t_py314.py << 'PY314_EOF'
+import sys
+ok = True
+def chk(name, cond, info=""):
+    global ok
+    if cond:
+        print("  py314 ok %s %s" % (name, info))
+    else:
+        ok = False
+        print("  PY314 FAIL %s %s" % (name, info))
+
+# Hard precondition: this rootfs MUST be 3.14+, otherwise the whole point (running
+# the 3.14-only features for real, not SKIP) is void -> fail loudly.
+chk("version_is_314", sys.version_info[:2] >= (3, 14),
+    "version=%d.%d" % sys.version_info[:2])
+if sys.version_info[:2] < (3, 14):
+    print("PY314_BAD"); sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# PEP 750 — Template strings (t-strings). A t"..." literal evaluates to a
+# string.templatelib.Template, NOT a str. The Template exposes:
+#   .strings        -> tuple[str, ...]  the literal text chunks
+#   .interpolations -> tuple[Interpolation, ...]  the {expr} fields
+#   .values         -> tuple[Any, ...]  the evaluated interpolation values
+# and is iterable, yielding the static strings and Interpolation objects in
+# source order. Each Interpolation carries .value/.expression/.conversion/
+# .format_spec. We assert structure + values + interleave order EXACTLY.
+# ---------------------------------------------------------------------------
+from string.templatelib import Template, Interpolation
+name = "starry"
+n = 42
+tmpl = t"hi {name} = {n!r:>4}"
+chk("tstring_type", type(tmpl) is Template and not isinstance(tmpl, str))
+chk("tstring_strings", tmpl.strings == ("hi ", " = ", ""), "strings=%r" % (tmpl.strings,))
+chk("tstring_values", tmpl.values == ("starry", 42), "values=%r" % (tmpl.values,))
+# .values must agree with the per-Interpolation .value (cross-check the two APIs)
+chk("tstring_values_consistent",
+    tmpl.values == tuple(i.value for i in tmpl.interpolations))
+chk("tstring_ninterp", len(tmpl.interpolations) == 2)
+i0, i1 = tmpl.interpolations
+chk("tstring_interp0", isinstance(i0, Interpolation) and i0.value == "starry"
+    and i0.expression == "name" and i0.conversion is None and i0.format_spec == "")
+chk("tstring_interp1", i1.value == 42 and i1.expression == "n"
+    and i1.conversion == "r" and i1.format_spec == ">4",
+    "expr=%r conv=%r fmt=%r" % (i1.expression, i1.conversion, i1.format_spec))
+# iteration interleaves static text and Interpolation objects in source order
+seq = list(tmpl)
+# PEP750: Template.__iter__ SKIPS empty strings; trailing "" in .strings is NOT yielded by iteration (real py3.14 yields 4 items S,I,S,I — verified on starry).
+shape = [("S", x) if isinstance(x, str) else ("I", x.expression) for x in seq]
+chk("tstring_iter", shape == [("S", "hi "), ("I", "name"), ("S", " = "),
+                              ("I", "n")], "shape=%r" % (shape,))
+
+# ---------------------------------------------------------------------------
+# PEP 758 — except / except* may omit the parentheses around a tuple of
+# exception types. Pre-3.14 `except A, B:` was a SyntaxError; 3.14 accepts it
+# as "catch A or B". We exercise both the plain and the star (group) forms.
+# ---------------------------------------------------------------------------
+caught = None
+try:
+    raise KeyError("k")
+except ValueError, KeyError:            # PEP 758: no parens, multiple types
+    caught = "multi"
+chk("except_no_parens", caught == "multi", "caught=%r" % caught)
+
+star_caught = []
+try:
+    raise ExceptionGroup("eg", [ValueError("v"), KeyError("k")])
+except* ValueError, KeyError:           # PEP 758 in the star form
+    star_caught.append("grp")
+chk("except_star_no_parens", star_caught == ["grp"], "%r" % star_caught)
+
+# ---------------------------------------------------------------------------
+# PEP 734 — concurrent.interpreters: spawn a *real* isolated subinterpreter,
+# run code in it, and prove isolation (state set in the sub does NOT leak to
+# the main interpreter's globals). list_all() must include the new interp;
+# get_main() must differ from a freshly created one.
+# ---------------------------------------------------------------------------
+from concurrent import interpreters
+main_interp = interpreters.get_main()
+interp = interpreters.create()
+chk("subinterp_created", interp is not None and interp != main_interp,
+    "id main=%r sub=%r" % (main_interp.id, interp.id))
+chk("subinterp_listed", interp in interpreters.list_all())
+interp.exec("leaked = 6 * 7")                 # binds in the SUB's globals only
+chk("subinterp_isolated", "leaked" not in globals())   # must NOT leak to main
+# a second exec sees the sub's own prior state (proves persistent sub namespace)
+interp.exec("assert leaked == 42, 'sub state lost'")
+interp.close()
+chk("subinterp_closed", interp not in interpreters.list_all())
+
+# ---------------------------------------------------------------------------
+# PEP 784 — the new `compression` package namespace. compression.zlib /
+# compression.bz2 re-export the classic modules under the unified namespace
+# (always available). compression.zstd adds stdlib Zstandard, but its _zstd C
+# extension is NOT built in Alpine's edge python3 apk -> we DETECT capability:
+# if _zstd is present we assert a real compress/decompress round-trip; if not,
+# we assert the namespace module still imports + reports unavailability (this is
+# a distro build choice, NOT a StarryOS fault -> must not fail the gate).
+# ---------------------------------------------------------------------------
+import compression.zlib as czlib
+raw = b"starry-os-3.14 " * 64
+z = czlib.compress(raw, 9)
+chk("compression_zlib", czlib.decompress(z) == raw and len(z) < len(raw),
+    "in=%d out=%d" % (len(raw), len(z)))
+import compression.bz2 as cbz2
+b = cbz2.compress(raw, 9)
+chk("compression_bz2", cbz2.decompress(b) == raw and len(b) < len(raw))
+try:
+    from compression import zstd as czstd
+    comp = czstd.compress(raw)
+    chk("compression_zstd", czstd.decompress(comp) == raw and len(comp) < len(raw),
+        "roundtrip in=%d out=%d" % (len(raw), len(comp)))
+except ImportError as e:
+    # _zstd not built in this distro python -> namespace import path itself is the
+    # 3.14 feature; report and DO NOT fail (capability-gated, honest boundary).
+    print("  py314 note compression.zstd UNAVAILABLE (no _zstd in this build: %s)" % e)
+
+# ---------------------------------------------------------------------------
+# PEP 779 — free-threading is now officially supported; sys._is_gil_enabled()
+# reports whether the GIL is active. Alpine's apk is the *default* (GIL-enabled,
+# abi tag cpython-314, NOT 314t) build, so this returns True. Informational: we
+# only assert the API EXISTS and returns a bool (the actual value depends on the
+# build flavor and is not a correctness criterion here).
+# ---------------------------------------------------------------------------
+gil = sys._is_gil_enabled()
+chk("gil_introspection", isinstance(gil, bool))
+print("  py314 info GIL_ENABLED=%s" % gil)
+
+# ---------------------------------------------------------------------------
+# PEP 649 / 749 — annotations are now lazily evaluated and introspected via the
+# new `annotationlib` module with a Format enum (VALUE / FORWARDREF / STRING).
+# get_annotations(obj, format=Format.STRING) yields annotations as source-text
+# strings WITHOUT evaluating them (so even forward refs to undefined names work).
+# ---------------------------------------------------------------------------
+import annotationlib
+def annotated(a: int, b: "UndefinedLater") -> str: ...
+val = annotationlib.get_annotations(annotated, format=annotationlib.Format.VALUE)
+chk("annotationlib_value", val["a"] is int and val["return"] is str,
+    "val=%r" % (val,))
+s = annotationlib.get_annotations(annotated, format=annotationlib.Format.STRING)
+chk("annotationlib_string", s == {"a": "int", "b": "UndefinedLater", "return": "str"},
+    "str=%r" % (s,))
+
+# ---------------------------------------------------------------------------
+# 3.14 control-flow: PEP 765 made `return`/`break`/`continue` inside a `finally`
+# a SyntaxWarning (still runs). We confirm a finally clause runs deterministically
+# on normal completion (well-defined, version-stable) without relying on the
+# discouraged control-flow-in-finally pattern.
+# ---------------------------------------------------------------------------
+trace = []
+def with_finally():
+    try:
+        trace.append("try")
+        return "v"
+    finally:
+        trace.append("finally")
+r = with_finally()
+chk("finally_runs", r == "v" and trace == ["try", "finally"], "trace=%r" % (trace,))
+
+print("PY314_OK" if ok else "PY314_BAD")
+PY314_EOF
+$PY /tmp/t_py314.py > /tmp/t5.out 2>&1
+cat /tmp/t5.out
+if grep -q "^PY314_OK" /tmp/t5.out; then V=1; else V=0; echo "PY314 FAIL"; tail -20 /tmp/t5.out; fi
+printf 'PYTHON314_OK=%s\n' "$V"
+echo "PYTHON314_DONE"
+'''
+success_regex = ["(?m)^PYTHON314_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

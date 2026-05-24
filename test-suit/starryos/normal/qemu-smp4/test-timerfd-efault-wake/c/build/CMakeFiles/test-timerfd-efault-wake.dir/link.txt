@@ -1,0 +1,1 @@
+/usr/bin/cc -Wno-error=stringop-overflow "CMakeFiles/test-timerfd-efault-wake.dir/src/main.c.o" -o test-timerfd-efault-wake 

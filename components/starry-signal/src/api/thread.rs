@@ -282,7 +282,7 @@ impl ThreadSignalManager {
         let frame: SignalFrame = unsafe { frame_ptr.vm_read_uninit()?.assume_init() };
 
         *uctx = frame.uctx;
-        frame.ucontext.mcontext.restore(uctx);
+        frame.ucontext.restore(uctx);
 
         *self.blocked.lock() = frame.ucontext.sigmask;
         self.possibly_has_signal.store(true, Ordering::Release);

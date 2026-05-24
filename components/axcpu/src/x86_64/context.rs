@@ -160,7 +160,7 @@ struct ContextSwitchFrame {
 /// See <https://www.felixcloutier.com/x86/fxsave> for more details.
 #[allow(missing_docs)]
 #[repr(C, align(16))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FxsaveArea {
     pub fcw: u16,
     pub fsw: u16,
@@ -178,6 +178,7 @@ pub struct FxsaveArea {
 const _: () = assert!(core::mem::size_of::<FxsaveArea>() == 512);
 
 /// Extended state of a task, such as FP/SIMD states.
+#[derive(Clone)]
 pub struct ExtendedState {
     /// Memory region for the FXSAVE/FXRSTOR instruction.
     pub fxsave_area: FxsaveArea,

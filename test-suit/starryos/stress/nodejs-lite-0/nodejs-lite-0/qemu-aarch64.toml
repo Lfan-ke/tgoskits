@@ -1,0 +1,81 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "cortex-a72", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-nodejs-lite.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# --- Node.js LIGHT ecosystem: preprocessors + cjs/esm interop + Kotlin/JS (StarryOS aarch64) ---
+# These three projects are deliberately SMALL: each is a self-contained node run (one
+# preprocessor compile via its direct Node API; a few-module interop graph; one emitted
+# Kotlin/JS module). They stay below the node-heavy-JS-load threshold of StarryOS bug
+# #242 (the full vite/astro multi-preprocessor builds in nodejs-fw-0 DO trip #242), so
+# this case can pass NOW. Content-correctness: every output is compared byte-for-byte to
+# a host REF built with the SAME node v22.22.2 (+ same package versions). See notes/36.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-aarch64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export CI=1
+NODE=/usr/bin/node
+export NODE_OPTIONS="--max-old-space-size=1024"
+# V8 JIT probe (same fallback as nodejs-0); --jitless if PROT_EXEC mmap crashes.
+NODE_FLAGS=""
+$NODE -e 'process.exit(0)' >/tmp/probe.out 2>&1
+if [ $? -ne 0 ]; then echo "JIT probe failed -> --jitless"; tail -3 /tmp/probe.out; NODE_FLAGS="--jitless"; export NODE_OPTIONS="$NODE_OPTIONS --jitless"; fi
+echo "=== node $($NODE $NODE_FLAGS --version 2>&1) ==="
+
+# sha256_check <dir> <REF.sha256> : every file listed in the REF manifest must exist in
+# <dir> with a byte-identical sha256, and there must be NO extra files. Returns 0 on match.
+sha256_check() {
+  d="$1"; ref="$2"; miss=0; bad=0; n=0
+  while read -r want path; do
+    n=$((n+1)); f="$d/${path#./}"
+    if [ ! -f "$f" ]; then echo "  MISSING $f"; miss=$((miss+1)); continue; fi
+    got=$($NODE $NODE_FLAGS -e 'const c=require("crypto"),fs=require("fs");process.stdout.write(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$f")
+    [ "$got" != "$want" ] && { echo "  DIFF $path"; echo "    want=$want"; echo "    got =$got"; bad=$((bad+1)); }
+  done < "$ref"
+  extra=0
+  for f in $(cd "$d" && find . -type f | sort); do grep -q "  ${f}\$" "$ref" || { echo "  EXTRA $d/$f"; extra=$((extra+1)); }; done
+  echo "  checked=$n missing=$miss diff=$bad extra=$extra"
+  [ $miss -eq 0 ] && [ $bad -eq 0 ] && [ $extra -eq 0 ]
+}
+
+P=0; F=0   # pass / fail counters
+
+# --- 1) pp-standalone: less / stylus / scss / pug, each via direct Node API ---
+echo "===== pp-standalone (less/stylus/scss/pug) ====="
+cd /proj/pp-standalone && rm -rf dist
+$NODE $NODE_FLAGS build.mjs >/tmp/pp.out 2>&1; rc=$?
+tail -6 /tmp/pp.out
+if [ $rc -eq 0 ] && grep -q '^PP_BUILD=OK' /tmp/pp.out && sha256_check dist REF.sha256; then
+  echo "PP_RESULT=PASS_BYTE_IDENTICAL"; P=$((P+1))
+else echo "PP_RESULT=FAIL"; tail -20 /tmp/pp.out; F=$((F+1)); fi
+
+# --- 2) cjs-esm interop: CommonJS <-> ESM (default/named/dynamic-import, .cjs/.mjs) ---
+echo "===== cjs-esm interop ====="
+cd /proj/cjs-esm && rm -rf dist
+$NODE $NODE_FLAGS run.mjs >/tmp/ce.out 2>&1; rc=$?
+tail -6 /tmp/ce.out
+if [ $rc -eq 0 ] && grep -q '^CJSESM_BUILD=OK' /tmp/ce.out && sha256_check dist REF.sha256; then
+  echo "CJSESM_RESULT=PASS_BYTE_IDENTICAL"; P=$((P+1))
+else echo "CJSESM_RESULT=FAIL"; tail -20 /tmp/ce.out; F=$((F+1)); fi
+
+# --- 3) kotlin-js: run the host-compiled emitted module, compare stdout to REF.out ---
+echo "===== kotlin-js (run host-emitted app.js) ====="
+cd /proj/kotlin-js
+$NODE $NODE_FLAGS app.js >/tmp/kt.out 2>&1; rc=$?
+cat /tmp/kt.out
+if [ $rc -eq 0 ] && diff -u REF.out /tmp/kt.out >/tmp/kt.diff 2>&1; then
+  echo "KOTLINJS_RESULT=PASS_OUTPUT_MATCH"; P=$((P+1))
+else echo "KOTLINJS_RESULT=FAIL rc=$rc"; cat /tmp/kt.diff; F=$((F+1)); fi
+
+echo "=== SUMMARY pass=$P fail=$F ==="
+if [ "$P" = 3 ] && [ "$F" = 0 ]; then V=1; else V=0; fi; printf 'NODEJS_LITE_OK=%s\n' "$V"
+echo "NODEJS_LITE_DONE"
+'''
+success_regex = ["(?m)^NODEJS_LITE_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

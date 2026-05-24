@@ -72,4 +72,8 @@ impl UContext {
             mcontext: MContext::new(uctx),
         }
     }
+
+    pub fn restore(&self, uctx: &mut UserContext) {
+        self.mcontext.restore(uctx);
+    }
 }

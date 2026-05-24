@@ -1,0 +1,24 @@
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "8192M",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-java.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+export JAVA_TOOL_OPTIONS="-Xint"
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-loongarch64.path
+cd /root/complex-demo
+# `gradle build`(非 help)才触发 compileJava → DefaultJavaToolchainService 装饰失败点。--stacktrace 打完整 Caused-by。
+GRADLE_OPTS="-Xint -Xms64m -Xmx512m" /opt/gradle-8.10.2/bin/gradle --offline --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xint -Xms128m -Xmx1024m -XX:MaxMetaspaceSize=2048m" -g /root/.gradle build >/tmp/gradle.out 2>&1
+echo "=== gradle exit=$? ==="
+echo "=== TRACE ==="
+grep -aiE 'FAILURE|What went wrong|Caused by|decorated|Could not generate|defineClass|defineHidden|defineAnonymous|Unsafe|MethodHandle|Lookup|LinkageError|VerifyError|InternalError|NoClassDef|UnsupportedOperation|InaccessibleObject|at org.gradle|at jdk.internal|at java.lang.invoke|at java.base|Native Method' /tmp/gradle.out | head -70
+echo "GRADLE_TRACE_DONE"
+'''
+success_regex = ["(?m)^GRADLE_TRACE_DONE"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

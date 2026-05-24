@@ -1,0 +1,87 @@
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "4096M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-golang.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === Go toolchain + runtime CORRECTNESS on StarryOS loongarch64 ===
+# Alpine v3.23 `go` apk (Go 1.25.10, GOROOT=/usr/lib/go: std-lib SOURCE + compiler
+# tools + the musl-dynamic-PIE `/usr/bin/go` driver) injected into /. A small REAL
+# Go program is staged at /proj/hello/main.go. Getting `go version` + `go run`
+# working at all is the milestone: Go ships its OWN M:N scheduler, a concurrent GC,
+# epoll-based netpoll, SIGURG async preemption, and parks goroutines via futex --
+# any of which can surface a StarryOS gap.
+#
+# Fully OFFLINE: GOTOOLCHAIN=local (no toolchain auto-download), GOPROXY=off +
+# GOFLAGS=-mod=mod (no module fetch -- the program is std-lib only), GOCACHE=/tmp
+# (writable build cache; `go run` compiles GOROOT/src on first use), CGO_ENABLED=0
+# (pure-Go compile -- no C toolchain / no binutils needed).
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-loongarch64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export GOROOT=/usr/lib/go
+export GOTOOLCHAIN=local
+export GOPROXY=off
+export GOFLAGS=-mod=mod
+export GOCACHE=/tmp/gocache
+export GOPATH=/tmp/gopath
+export GOMODCACHE=/tmp/gopath/pkg/mod
+export CGO_ENABLED=0
+export GODEBUG=
+mkdir -p /tmp/gocache /tmp/gopath
+GO=/usr/bin/go
+GO_VER_OK=0; GO_RUN_OK=0; GO_BUILD_OK=0
+
+# --- GO_VER_OK: `go version` prints a version string ---
+echo "=== go version ==="
+$GO version > /tmp/ver.out 2>&1
+cat /tmp/ver.out
+grep -qE 'go version go1\.' /tmp/ver.out && GO_VER_OK=1 || { echo "go version FAIL"; tail -5 /tmp/ver.out; }
+
+# --- GO_RUN_OK: `go run` a real program -> assert EXACT stdout ---
+# Exercises goroutines+channel+WaitGroup (M:N scheduler + futex), a map op
+# (runtime hashmap + GC), and a fixed-instant time format. Output is
+# order-independent -> deterministic regardless of goroutine scheduling.
+echo "=== go run /proj/hello/main.go ==="
+cd /proj/hello
+$GO run main.go > /tmp/run.out 2>/tmp/run.err
+echo "--- stdout ---"; cat /tmp/run.out
+echo "--- stderr (tail) ---"; tail -5 /tmp/run.err
+cat > /tmp/expect.txt << 'EOF'
+SUM=5050
+MAP go=3
+MAP os=1
+MAP starry=2
+TIME=2026-05-24T12:34:56Z
+GENERIC_INT=15
+GENERIC_FLOAT=0.875
+RECOVER=kaboom
+ERRIS=true
+SELECT=timeout
+HELLO_GO_OK
+EOF
+if cmp -s /tmp/run.out /tmp/expect.txt; then GO_RUN_OK=1; echo "go run output EXACT-match"; else echo "go run MISMATCH"; diff /tmp/expect.txt /tmp/run.out 2>&1 | head; fi
+
+# --- (optional) GO_BUILD_OK: build a static binary + run it -> exact output ---
+# Non-fatal: if `go build` works it further exercises the linker + a fresh
+# process exec of a Go-compiled ELF.
+echo "=== go build static binary ==="
+$GO build -o /tmp/hello /proj/hello/main.go > /tmp/build.out 2>&1
+if [ -x /tmp/hello ]; then
+  /tmp/hello > /tmp/bin.out 2>&1
+  if cmp -s /tmp/bin.out /tmp/expect.txt; then GO_BUILD_OK=1; echo "built binary output EXACT-match"; else echo "built-binary MISMATCH"; diff /tmp/expect.txt /tmp/bin.out 2>&1 | head; fi
+else
+  echo "go build FAIL (non-fatal)"; tail -6 /tmp/build.out
+fi
+
+echo "RESULTS: GO_VER_OK=$GO_VER_OK GO_RUN_OK=$GO_RUN_OK GO_BUILD_OK=$GO_BUILD_OK"
+if [ "$GO_VER_OK" = 1 ] && [ "$GO_RUN_OK" = 1 ]; then V=1; else V=0; fi; printf 'GOLANG_OK=%s\n' "$V"
+echo "GOLANG_DONE"
+'''
+success_regex = ["(?m)^GOLANG_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

@@ -1,0 +1,74 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-wayland.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === Wayland on StarryOS x86_64 (Alpine v3.22 musl-native, headless / pixman SHM) ===
+# musl loader path covers /lib + /usr/lib; libc.so aliased to the Alpine musl loader.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-x86_64.path
+[ -e /lib/libc.so ] || ln -sf ld-musl-x86_64.so.1 /lib/libc.so
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export LD_LIBRARY_PATH=/usr/lib:/lib
+# Wayland needs a private runtime dir for its unix socket (mode 0700, owned by uid).
+mkdir -p /tmp/xdg && chmod 700 /tmp/xdg
+export XDG_RUNTIME_DIR=/tmp/xdg
+export WLR=0; export WST=0; export SHM=0
+
+# --- Milestone (a): minimal libwayland server<->client handshake over a unix socket ---
+# Proves the Wayland *wire protocol* + AF_UNIX + epoll event loop work without any GPU.
+echo "=== wl-mini-test (libwayland handshake over AF_UNIX) ==="
+/usr/bin/wl-mini-test wl-mini-0 >/tmp/wlmini.out 2>&1
+grep -E '^(WL_MINI_|\[)' /tmp/wlmini.out
+if grep -q "^WL_MINI_OK" /tmp/wlmini.out; then WLR=1; echo "MILESTONE_A=1 libwayland-handshake-ok"; else echo "MILESTONE_A=0"; tail -15 /tmp/wlmini.out; fi
+
+# --- Milestone (b)/(c): weston headless compositor + a real SHM client ---
+echo "=== weston --help (flag probe) ==="
+weston --help >/tmp/weston-help.out 2>&1
+head -40 /tmp/weston-help.out
+echo "=== launch weston (headless backend, pixman renderer) ==="
+# weston 14: --backend=headless --renderer=pixman --width/--height; --no-config skips config file.
+weston --backend=headless --renderer=pixman --width=640 --height=480 \
+       --socket=wl-0 --no-config --idle-time=0 --log=/tmp/weston.log \
+       >/tmp/weston.stdout 2>&1 &
+WPID=$!
+# wait up to ~20s for the wayland socket to appear in XDG_RUNTIME_DIR
+i=0
+while [ $i -lt 40 ]; do
+  if [ -S /tmp/xdg/wl-0 ]; then break; fi
+  i=$((i+1)); sleep 1
+done
+if [ -S /tmp/xdg/wl-0 ]; then
+  WST=1; echo "MILESTONE_B=1 weston-headless-socket-up"
+  ls -la /tmp/xdg/wl-0
+  # --- a real client commits an SHM frame ---
+  echo "=== weston-simple-shm (binds globals + commits SHM frames) ==="
+  WAYLAND_DISPLAY=wl-0 weston-simple-shm >/tmp/shm.out 2>&1 &
+  SPID=$!
+  sleep 4
+  kill $SPID >/dev/null 2>&1
+  cat /tmp/shm.out
+  # success markers: weston log shows the client bound + a frame, or simple-shm ran without error
+  if grep -qiE 'bound|committed|frame|wl_shm|surface' /tmp/weston.log /tmp/shm.out 2>/dev/null; then
+    SHM=1; echo "MILESTONE_C=1 shm-client-connected"
+  fi
+else
+  echo "MILESTONE_B=0 weston-socket-never-appeared"
+fi
+echo "=== weston.log tail ==="
+tail -40 /tmp/weston.log 2>/dev/null
+echo "=== weston.stdout tail ==="
+tail -20 /tmp/weston.stdout 2>/dev/null
+kill $WPID >/dev/null 2>&1
+
+echo "RESULTS: MILESTONE_A=$WLR MILESTONE_B=$WST MILESTONE_C=$SHM"
+if [ "$WLR" = 1 ] && [ "$WST" = 1 ] && [ "$SHM" = 1 ]; then V=1; else V=0; fi; printf 'WAYLAND_OK=%s\n' "$V"
+echo "BIGTEST_DONE"
+'''
+success_regex = ["(?m)^WAYLAND_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 3000

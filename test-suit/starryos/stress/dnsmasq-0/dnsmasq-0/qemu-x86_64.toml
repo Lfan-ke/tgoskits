@@ -1,0 +1,88 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-openwrt.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === dnsmasq DNS server (openwrt category, #764) on StarryOS x86_64 ===
+# Launch the musl-native dnsmasq 2.91 in the FOREGROUND (-k / --no-daemon: no double-fork),
+# DNS-ONLY (no --dhcp-range -> no DHCP, so it never touches the AF_PACKET raw-socket path),
+# bound to the loopback 127.0.0.1:5353, with a single static answer:
+#   --address=/test.local/1.2.3.4   -> any A query for *.test.local resolves to 1.2.3.4
+# Then issue a real loopback DNS query with busybox nslookup and assert the answer is
+# 1.2.3.4. dnsmasq + dnsmasq-common injected by prep-openwrt-rootfs.sh. Loopback works
+# in-guest without -netdev; the net device is kept anyway.
+# See ~/rcore/download/openwrt-apks/SOURCES.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-x86_64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+mkdir -p /run /var/empty
+DNSMASQ=/usr/sbin/dnsmasq
+echo "=== dnsmasq --version ==="
+$DNSMASQ --version 2>&1 | head -2
+DNSMASQ_OK=0
+
+# --- config test (--test) surfaces the first missing-syscall error early ---
+$DNSMASQ --test 2>&1 | head -5
+
+# --- launch dnsmasq in the background; DNS-only, loopback, static A record ---
+# -k          : keep in foreground (do not daemonize)
+# --port=5353 : unprivileged UDP/TCP port on loopback (avoids needing :53)
+# --no-resolv : do not read /etc/resolv.conf (no upstream; fully self-contained)
+# --no-hosts  : do not read /etc/hosts
+# --user=root --group=root : stay as root, no setuid()/getpwnam("dnsmasq")
+# --address=/test.local/1.2.3.4 : the answer we will assert on
+# --log-facility=- : log to stderr (serial console), not syslog
+$DNSMASQ -k --port=5353 --no-resolv --no-hosts \
+    --user=root --group=root \
+    --listen-address=127.0.0.1 --bind-interfaces \
+    --address=/test.local/1.2.3.4 \
+    --log-facility=- > /tmp/dnsmasq.err 2>&1 &
+DPID=$!
+echo "  dnsmasq launched pid=$DPID"
+
+# --- wait for it to bind 127.0.0.1:5353, then query it ---
+ANS=""
+up=0
+i=0
+while [ "$i" -lt 40 ]; do
+    ANS=$(nslookup test.local 127.0.0.1:5353 2>/dev/null)
+    # busybox nslookup syntax for an explicit server+port is HOST SERVER (port via :)
+    if echo "$ANS" | grep -q "1.2.3.4"; then up=1; break; fi
+    # some busybox builds want "HOST SERVER" without :port -> try port 5353 form
+    ANS=$(nslookup test.local 127.0.0.1#5353 2>/dev/null)
+    if echo "$ANS" | grep -q "1.2.3.4"; then up=1; break; fi
+    kill -0 "$DPID" 2>/dev/null || { echo "  dnsmasq exited before binding"; break; }
+    i=$((i+1))
+    sleep 1
+done
+
+if [ "$up" = 1 ]; then
+    echo "  nslookup answer contains 1.2.3.4 -> resolved OK"
+    echo "$ANS" | grep "1.2.3.4" | head -2
+    DNSMASQ_OK=1
+else
+    echo "  dnsmasq did not answer test.local=1.2.3.4 on 127.0.0.1:5353"
+    echo "  last nslookup output:"; echo "$ANS"
+fi
+
+# --- on failure, dump dnsmasq stderr so the first failing syscall is captured ---
+if [ "$DNSMASQ_OK" != 1 ]; then
+    echo "=== dnsmasq.err (look for socket/bind/UDP/setsockopt errors) ==="
+    cat /tmp/dnsmasq.err 2>/dev/null
+fi
+
+kill "$DPID" 2>/dev/null
+kill -9 "$DPID" 2>/dev/null
+
+echo "RESULT: dnsmasq_resolve=$DNSMASQ_OK"
+if [ "$DNSMASQ_OK" = 1 ]; then V=1; else V=0; fi; printf 'DNSMASQ_OK=%s\n' "$V"
+echo "DNSMASQ_DONE"
+'''
+success_regex = ["(?m)^DNSMASQ_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200

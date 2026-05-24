@@ -1,5 +1,6 @@
 use ax_hal::uspace::{ExceptionInfo, ExceptionKind, ReturnReason, UserContext};
 use ax_task::TaskInner;
+use linux_raw_sys::general::{SEGV_ACCERR, SEGV_MAPERR};
 use starry_process::Pid;
 use starry_signal::{SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
@@ -43,13 +44,34 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 match reason {
                     ReturnReason::Syscall => handle_syscall(&mut uctx),
                     ReturnReason::PageFault(addr, flags) => {
-                        if !thr.proc_data.aspace().lock().handle_page_fault(addr, flags) {
-                            info!(
-                                "{:?}: segmentation fault at {:#x} {:?}",
-                                thr.proc_data.proc, addr, flags
+                        let aspace = thr.proc_data.aspace();
+                        let mut aspace = aspace.lock();
+                        if !aspace.handle_page_fault(addr, flags) {
+                            // POSIX (and HotSpot's safepoint-poll handler, which
+                            // reads si_addr to recognize the polling page) expect
+                            // si_addr to be the faulting address. Distinguish an
+                            // unmapped address (MAPERR) from a permission fault on
+                            // a mapped area (ACCERR).
+                            let code = if aspace.find_area(addr).is_some() {
+                                SEGV_ACCERR
+                            } else {
+                                SEGV_MAPERR
+                            };
+                            drop(aspace);
+                            warn!(
+                                "{:?}: segmentation fault at {:#x} {:?} code={} rip={:#x} sp={:#x}",
+                                thr.proc_data.proc,
+                                addr,
+                                flags,
+                                code,
+                                uctx.ip(),
+                                uctx.sp()
                             );
-                            raise_signal_fatal(SignalInfo::new_kernel(Signo::SIGSEGV), &uctx)
-                                .expect("Failed to send SIGSEGV");
+                            raise_signal_fatal(
+                                SignalInfo::new_fault(Signo::SIGSEGV, code as i32, addr.as_usize()),
+                                &uctx,
+                            )
+                            .expect("Failed to send SIGSEGV");
                         }
                     }
                     ReturnReason::Interrupt => {}

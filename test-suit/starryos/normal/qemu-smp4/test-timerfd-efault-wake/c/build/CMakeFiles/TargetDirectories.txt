@@ -1,0 +1,7 @@
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-timerfd-efault-wake/c/build/CMakeFiles/test-timerfd-efault-wake.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-timerfd-efault-wake/c/build/CMakeFiles/edit_cache.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-timerfd-efault-wake/c/build/CMakeFiles/rebuild_cache.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-timerfd-efault-wake/c/build/CMakeFiles/list_install_components.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-timerfd-efault-wake/c/build/CMakeFiles/install.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-timerfd-efault-wake/c/build/CMakeFiles/install/local.dir
+/home/heke/rcore/tgoskits/test-suit/starryos/normal/qemu-smp4/test-timerfd-efault-wake/c/build/CMakeFiles/install/strip.dir

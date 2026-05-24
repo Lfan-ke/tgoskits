@@ -1,0 +1,149 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "rv64", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-python-fw.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === Python web/LLM FRAMEWORK correctness on StarryOS riscv64 ===
+# Pure-python frameworks (django/fastapi+uvicorn/strawberry-graphql/langchain) on the
+# musl-native python3 runtime. Each test checks a real RESPONSE/BODY/chain output, not
+# exit 0. fastapi+uvicorn = real ASGI server + loopback HTTP request (status 200 + JSON
+# body). strawberry = a GraphQL query executed -> exact result dict. langchain = a
+# fully-deterministic OFFLINE chain (FakeListLLM, no network/key) -> exact output.
+# Frameworks injected by prep-python-fw-rootfs.sh (django/fastapi/uvicorn/pydantic/
+# graphql-core via apk; strawberry-graphql/langchain via py3-none-any wheel).
+# See ~/rcore/download/python-apks/SOURCES.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-riscv64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+PY=/usr/bin/python3
+echo "=== python3 --version ==="
+$PY --version 2>&1
+D1=0; D2=0; D3=0; D4=0
+
+# --- T1: Django (minimal WSGI app; HTTP 200 + exact body via test Client, no socket) ---
+cat > /tmp/t_django.py << 'EOF'
+import django
+from django.conf import settings
+settings.configure(DEBUG=True, ALLOWED_HOSTS=['*'], ROOT_URLCONF=__name__,
+                   DATABASES={}, SECRET_KEY='starry-test-key',
+                   MIDDLEWARE=[], INSTALLED_APPS=[])
+from django.urls import path
+from django.http import JsonResponse, HttpResponse
+def hello(request):
+    return HttpResponse("DJANGO_BODY_OK")
+def add(request, a, b):
+    return JsonResponse({"sum": int(a)+int(b)})
+urlpatterns = [path('hello/', hello), path('add/<int:a>/<int:b>/', add)]
+django.setup()
+from django.test import Client
+c = Client()
+r1 = c.get('/hello/')
+r2 = c.get('/add/2/3/')
+ok = (r1.status_code==200 and r1.content==b"DJANGO_BODY_OK"
+      and r2.status_code==200 and r2.json()=={"sum":5})
+print("  django hello status=%d body=%r" % (r1.status_code, r1.content))
+print("  django add status=%d json=%s" % (r2.status_code, r2.json()))
+print("DJANGO_OK" if ok else "DJANGO_BAD")
+EOF
+$PY /tmp/t_django.py > /tmp/d1.out 2>&1
+cat /tmp/d1.out
+grep -q "^DJANGO_OK" /tmp/d1.out && D1=1 || { echo "T1 django FAIL"; tail -12 /tmp/d1.out; }
+
+# --- T2: FastAPI + uvicorn (REAL ASGI server, loopback HTTP request -> 200 + JSON body) ---
+cat > /tmp/t_fastapi.py << 'EOF'
+import threading, time, json, urllib.request
+import uvicorn
+from fastapi import FastAPI
+app = FastAPI()
+@app.get("/ping")
+def ping(): return {"msg": "FASTAPI_PONG"}
+@app.get("/mul/{a}/{b}")
+def mul(a: int, b: int): return {"product": a*b}
+config = uvicorn.Config(app, host="127.0.0.1", port=18091, log_level="error", loop="asyncio")
+server = uvicorn.Server(config)
+th = threading.Thread(target=server.run, daemon=True); th.start()
+# wait for the server to come up
+up = False
+for _ in range(60):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:18091/ping", timeout=1); up=True; break
+    except Exception: time.sleep(0.5)
+ok = up
+if up:
+    b1 = json.loads(urllib.request.urlopen("http://127.0.0.1:18091/ping", timeout=3).read())
+    r2 = urllib.request.urlopen("http://127.0.0.1:18091/mul/6/7", timeout=3)
+    b2 = json.loads(r2.read())
+    print("  fastapi ping=%s mul.status=%d mul=%s" % (b1, r2.status, b2))
+    ok = (b1=={"msg":"FASTAPI_PONG"} and r2.status==200 and b2=={"product":42})
+else:
+    print("  fastapi server did not come up")
+server.should_exit = True
+print("FASTAPI_OK" if ok else "FASTAPI_BAD")
+EOF
+$PY /tmp/t_fastapi.py > /tmp/d2.out 2>&1
+cat /tmp/d2.out
+grep -q "^FASTAPI_OK" /tmp/d2.out && D2=1 || { echo "T2 fastapi+uvicorn FAIL"; tail -12 /tmp/d2.out; }
+
+# --- T3: Strawberry GraphQL (define schema, run a query -> exact result dict) ---
+cat > /tmp/t_strawberry.py << 'EOF'
+import strawberry
+@strawberry.type
+class Query:
+    @strawberry.field
+    def greeting(self, name: str) -> str:
+        return "hello " + name
+    @strawberry.field
+    def add(self, a: int, b: int) -> int:
+        return a + b
+schema = strawberry.Schema(query=Query)
+res = schema.execute_sync('{ greeting(name: "starry") add(a: 20, b: 22) }')
+ok = (res.errors is None and res.data == {"greeting": "hello starry", "add": 42})
+print("  strawberry errors=%s data=%s" % (res.errors, res.data))
+print("STRAWBERRY_OK" if ok else "STRAWBERRY_BAD")
+EOF
+$PY /tmp/t_strawberry.py > /tmp/d3.out 2>&1
+cat /tmp/d3.out
+grep -q "^STRAWBERRY_OK" /tmp/d3.out && D3=1 || { echo "T3 strawberry FAIL"; tail -12 /tmp/d3.out; }
+
+# --- T4: LangChain (DETERMINISTIC OFFLINE chain: FakeListLLM, no network/key) ---
+# Real LLM inference needs network + an API key/local model and is NON-deterministic;
+# it is intentionally OUT OF CI SCOPE (see SOURCES.md). This verifies the langchain
+# RUNTIME + chain composition (PromptTemplate | LLM | OutputParser) runs and produces
+# the exact pre-seeded response on StarryOS -> "langchain works", reproducibly.
+cat > /tmp/t_langchain.py << 'EOF'
+from langchain_core.language_models.fake import FakeListLLM
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+llm = FakeListLLM(responses=["LANGCHAIN_CHAIN_OUTPUT_42"])
+prompt = PromptTemplate.from_template("Answer about {topic}")
+chain = prompt | llm | StrOutputParser()
+out = chain.invoke({"topic": "starry"})
+ok = (out == "LANGCHAIN_CHAIN_OUTPUT_42")
+print("  langchain chain output=%r" % out)
+# also exercise a second deterministic step (Runnable composition)
+from langchain_core.runnables import RunnableLambda
+chain2 = chain | RunnableLambda(lambda s: s.upper())
+out2 = chain2.invoke({"topic": "x"})
+ok = ok and (out2 == "LANGCHAIN_CHAIN_OUTPUT_42")
+print("  langchain runnable-lambda output=%r" % out2)
+print("LANGCHAIN_OK" if ok else "LANGCHAIN_BAD")
+EOF
+$PY /tmp/t_langchain.py > /tmp/d4.out 2>&1
+cat /tmp/d4.out
+grep -q "^LANGCHAIN_OK" /tmp/d4.out && D4=1 || { echo "T4 langchain FAIL (offline chain)"; tail -12 /tmp/d4.out; }
+
+echo "RESULTS: django=$D1 fastapi_uvicorn=$D2 strawberry=$D3 langchain=$D4"
+# Gate on django + fastapi + strawberry (apk-backed, most reliable); langchain reported.
+if [ "$D1" = 1 ] && [ "$D2" = 1 ] && [ "$D3" = 1 ]; then V=1; else V=0; fi; printf 'PYTHON_FW_OK=%s\n' "$V"
+echo "PYTHON_FW_DONE"
+'''
+success_regex = ["(?m)^PYTHON_FW_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 2400

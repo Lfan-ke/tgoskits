@@ -413,9 +413,23 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         // Mark the task as blocked, this has to be done before adding it to the wait queue
         // while holding the lock of the wait queue.
         curr.set_state(TaskState::Blocked);
-        curr.set_in_wait_queue(true);
 
-        wq_guard.push_back(curr.clone());
+        // A task must appear in this wait queue at most once. Under SMP a
+        // `wait_until` whose condition is still false can re-enter
+        // `blocked_resched` while the task is *already* queued here (its prior
+        // enqueue not yet consumed by a `notify`). Pushing again would leave a
+        // stale duplicate entry: a later `notify_one_with` then pops that stale
+        // copy and hands it the resource a second time. For `axsync::RawMutex`
+        // this hands the lock to a task that already owns it, tripping the
+        // "tried to acquire mutex it already owns" assertion under SMP
+        // (intermittent panic at axsync mutex.rs, e.g. via concurrent
+        // page-cache access). The enqueue is guarded against duplicates here;
+        // the already-present entry is sufficient to wake the task. The scan is
+        // cheap (wait queues are short) and only runs on the blocking slow path.
+        curr.set_in_wait_queue(true);
+        if !wq_guard.iter().any(|t| curr.ptr_eq(t)) {
+            wq_guard.push_back(curr.clone());
+        }
         // Drop the lock of wait queue explictly.
         drop(wq_guard);
 

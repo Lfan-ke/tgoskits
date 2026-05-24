@@ -176,7 +176,11 @@ impl Configurable for GeneralOptions {
                     .store(timeout.as_nanos() as u64, Ordering::Relaxed);
             }
             O::SendBuffer(_) | O::ReceiveBuffer(_) => {
-                // TODO(mivik): implement buffer size options
+                // smoltcp uses fixed-size UDP/TCP buffers, so the requested
+                // SO_SNDBUF/SO_RCVBUF cannot change the backing storage. Accept
+                // the request (Linux never rejects it) but ignore it; the
+                // per-protocol get_option reports the real fixed capacity so
+                // that buffer-probing apps converge on the actual size.
             }
             O::RecvErr(_) => {
                 // TODO: Retrieve ICMP errors via errqueue

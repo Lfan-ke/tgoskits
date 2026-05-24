@@ -1,0 +1,80 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-openwrt.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === dropbear SSH server (openwrt category, #764) on StarryOS x86_64 ===
+# dropbear needs: a host key (dropbearkey -> getrandom/urandom entropy + file write),
+# a listening TCP socket (socket/bind/listen/accept on 127.0.0.1:2222), and entropy at
+# accept time to seed the SSH KEX. A *full* interactive session would additionally need
+# /dev/ptmx + openpty, but the SERVER-SIDE banner ("SSH-2.0-dropbear...") is emitted right
+# after accept(), BEFORE any PTY is allocated -> reading the banner proves bind + accept +
+# host-key load + entropy all work, without needing a PTY or a real SSH client.
+# dropbear + libutmps/libskarnet/libz injected by prep-openwrt-rootfs.sh.
+# See ~/rcore/download/openwrt-apks/SOURCES.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-x86_64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+mkdir -p /etc/dropbear /run /var/empty
+DBKEY=/usr/bin/dropbearkey
+DROPBEAR=/usr/sbin/dropbear
+KEY=/etc/dropbear/dropbear_ed25519_host_key
+DROPBEAR_OK=0
+
+echo "=== dropbear -V ==="
+$DROPBEAR -V 2>&1 | head -2
+
+# --- 1) generate an ed25519 host key (exercises getrandom/urandom entropy + file write) ---
+echo "=== dropbearkey -t ed25519 ==="
+$DBKEY -t ed25519 -f "$KEY" > /tmp/dropbearkey.log 2>&1
+KEYRC=$?
+cat /tmp/dropbearkey.log
+if [ "$KEYRC" != 0 ] || [ ! -s "$KEY" ]; then
+    echo "  dropbearkey FAILED (rc=$KEYRC) -- entropy (getrandom//dev/urandom) or file write may be missing"
+fi
+
+# --- 2) launch dropbear in the foreground bound to loopback 127.0.0.1:2222 ---
+# -F : foreground (no fork to background)
+# -E : log to stderr (serial console)
+# -r KEY : use our generated host key
+# -p 127.0.0.1:2222 : listen only on loopback, unprivileged port
+# -s : disable password logins (we only test the banner, never authenticate)
+$DROPBEAR -F -E -r "$KEY" -p 127.0.0.1:2222 -s > /tmp/dropbear.err 2>&1 &
+DPID=$!
+echo "  dropbear launched pid=$DPID"
+
+# --- 3) trigger a connection, then PROVE dropbear served it via its own log ---
+# busybox nc cannot reliably capture the SSH banner (it closes before the read),
+# so instead we trigger an accept and check dropbear's log for "Child connection
+# from" -- that proves socket/bind/listen/accept + host-key load + entropy all
+# work on StarryOS. printf (not a literal echo) is used for the gate so the
+# success token never appears in the script text (avoids a false-positive match
+# of the shell's command echo).
+i=0
+while [ "$i" -lt 20 ]; do
+    nc -w 2 127.0.0.1 2222 </dev/null >/dev/null 2>&1
+    grep -q "Child connection from 127.0.0.1" /tmp/dropbear.err && break
+    kill -0 "$DPID" 2>/dev/null || { echo "  dropbear exited before accepting"; break; }
+    i=$((i+1)); sleep 1
+done
+echo "=== dropbear.err (first lines) ==="
+head -8 /tmp/dropbear.err 2>/dev/null
+if grep -q "Child connection from 127.0.0.1" /tmp/dropbear.err && [ -s "$KEY" ]; then
+    DROPBEAR_OK=1
+fi
+kill "$DPID" 2>/dev/null
+kill -9 "$DPID" 2>/dev/null
+printf 'RESULT dropbear_serve=%s
+' "$DROPBEAR_OK"
+printf 'DROPBEAR_OK=%s
+' "$DROPBEAR_OK"
+echo "DROPBEAR_DONE"
+'''
+success_regex = ["(?m)^DROPBEAR_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200

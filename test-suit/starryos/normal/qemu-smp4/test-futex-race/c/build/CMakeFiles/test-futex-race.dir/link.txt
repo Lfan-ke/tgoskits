@@ -1,0 +1,1 @@
+/usr/bin/cc "CMakeFiles/test-futex-race.dir/src/main.c.o" -o test-futex-race 

@@ -99,6 +99,12 @@ impl Configurable for UdpSocket {
                 });
             }
             O::SendBuffer(size) => {
+                // The smoltcp UDP buffer is a fixed UDP_TX_BUF_LEN. Report that
+                // real capacity (NOT the user-requested value): probing apps
+                // such as Fast-DDS/asio set a large size, then re-read to learn
+                // the actual cap. Echoing the request back would make every
+                // size look like it "stuck", defeating the probe; reporting the
+                // true fixed cap lets the probe converge correctly.
                 **size = UDP_TX_BUF_LEN;
             }
             O::ReceiveBuffer(size) => {

@@ -1,0 +1,74 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-ros2.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# --- ROS 2 Jazzy C++ talker -> listener over Fast-DDS shared-memory on StarryOS ---
+# glibc .deb binaries run via gcompat (libc.so.6 -> libgcompat.so.0, /lib64/ld-linux-x86-64.so.2).
+export ROS_DIR=/opt/ros/jazzy
+# Loader path: ROS sys-deps (glibc libstdc++/libgcc) BEFORE /usr/lib — Alpine musl libstdc++ has a NULL ctype classic_table → Fast-DDS NULL-derefs → crash.
+printf '/lib\n/lib64\n%s/lib\n/opt/ros/sysdeps\n/usr/lib\n' "$ROS_DIR" > /etc/ld-musl-x86_64.path
+# also expose via LD_LIBRARY_PATH for gcompat glibc-style resolution
+export LD_LIBRARY_PATH=$ROS_DIR/lib:/opt/ros/sysdeps:/usr/lib:/lib:/lib64
+# Two shims: libcompat_shim (pthread_cond_clockwait, __isoc23_*, LFS *64) + libextra_shim (libstdc++/libgcc glibc syms: __*_chk, __cpu_model/__cpu_indicator_init, _dl_find_object, ...).
+export LD_PRELOAD=/opt/ros/sysdeps/libcompat_shim.so:/opt/ros/sysdeps/libextra_shim.so
+export AMENT_PREFIX_PATH=$ROS_DIR
+export ROS_HOME=/root/.ros
+export ROS_LOG_DIR=/tmp/roslog
+mkdir -p /root/.ros /tmp/roslog /dev/shm 2>/dev/null
+# Fast-DDS over UDPv4 on loopback only. The shared-memory transport hangs on
+# StarryOS (cross-process /dev/shm mmap + robust-mutex semantics are not fully
+# supported), so we force a UDPv4-only participant via the XML default profile.
+# Discovery uses unicast 127.0.0.1 (initialPeersList in the XML); no multicast
+# (StarryOS lacks IP_ADD_MEMBERSHIP) and no SHM. RMW_FASTRTPS_USE_QOS_FROM_XML=1
+# makes rmw_fastrtps honor the XML, and SYSTEM_DEFAULT discovery keeps rmw from
+# injecting its own SHM/UDP transports (its LOCALHOST/OFF branches always add a
+# SHM transport).
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/ros/fastdds_udp.xml
+export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+export RMW_FASTRTPS_USE_QOS_FROM_XML=1
+export ROS_AUTOMATIC_DISCOVERY_RANGE=SYSTEM_DEFAULT
+export ROS_DOMAIN_ID=0
+# rclcpp/rcutils logging is block-buffered when stdout is a file, so messages
+# can sit unflushed and be lost when the node is SIGKILLed. Force unbuffered
+# stdout logging so "Publishing"/"I heard" land in the capture files promptly.
+export RCUTILS_LOGGING_USE_STDOUT=1
+export RCUTILS_LOGGING_BUFFERED_STREAM=0
+TALKER=$ROS_DIR/lib/demo_nodes_cpp/talker
+LISTENER=$ROS_DIR/lib/demo_nodes_cpp/listener
+# Run listener in background, talker in background; capture both.
+$LISTENER >/tmp/listener.out 2>&1 &
+LPID=$!
+$TALKER >/tmp/talker.out 2>&1 &
+TPID=$!
+# Let them discover over UDP loopback and exchange a few messages.
+i=0
+while [ $i -lt 30 ]; do
+  grep -q "I heard" /tmp/listener.out 2>/dev/null && break
+  i=$((i+1))
+  sleep 1
+done
+kill -9 $TPID $LPID 2>/dev/null
+echo "=== talker.out (last 8) ==="
+grep -aE "Publishing|error|Error|not found|symbol|cannot|Segmentation" /tmp/talker.out | tail -8
+echo "=== listener.out (last 8) ==="
+grep -aE "I heard|error|Error|not found|symbol|cannot|Segmentation" /tmp/listener.out | tail -8
+if grep -q "I heard" /tmp/listener.out 2>/dev/null; then
+  V=1
+else
+  V=0
+  echo "--- diag: talker tail ---"; tail -15 /tmp/talker.out
+  echo "--- diag: listener tail ---"; tail -15 /tmp/listener.out
+fi
+printf 'ROS2_PUBSUB_OK=%s\n' "$V"
+echo "BIGTEST_DONE"
+'''
+success_regex = ["(?m)^ROS2_PUBSUB_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200

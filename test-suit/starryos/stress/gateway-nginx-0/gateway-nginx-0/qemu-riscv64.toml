@@ -1,0 +1,75 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "rv64", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-gateway-nginx.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === nginx web server (gateway category, #764) on StarryOS riscv64 ===
+# Launch the musl-native nginx 1.28.3 in the FOREGROUND/SINGLE-process mode (daemon off;
+# master_process off; error_log stderr) bound to 127.0.0.1:8080, then issue a real
+# loopback HTTP request with busybox wget and assert the body is exactly "NGINX_OK_BODY".
+# nginx + pcre2/zlib/libssl3/libcrypto3 injected by prep-gateway-nginx-rootfs.sh; the
+# minimal /etc/nginx/nginx.conf returns the fixed body via `return 200`. Loopback works
+# in-guest without -netdev; the net device is kept anyway. See ~/rcore/download/gateway-apks/SOURCES.md.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-riscv64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+# Runtime dirs nginx needs (pid + temp paths from nginx.conf).
+mkdir -p /run /var/log/nginx /var/lib/nginx/tmp
+grep -q "^nginx:" /etc/passwd || echo "nginx:x:100:101:nginx:/var/lib/nginx:/sbin/nologin" >> /etc/passwd
+grep -q "^nginx:" /etc/group || echo "nginx:x:101:" >> /etc/group
+NGINX=/usr/sbin/nginx
+echo "=== nginx -v ==="
+$NGINX -v 2>&1
+NGINX_OK=0
+
+# --- config syntax test (also surfaces the first missing-syscall error early) ---
+$NGINX -c /etc/nginx/nginx.conf -t > /tmp/nginx.test 2>&1
+cat /tmp/nginx.test
+
+# --- launch nginx in the background; stderr -> /tmp/nginx.err ---
+$NGINX -c /etc/nginx/nginx.conf > /tmp/nginx.err 2>&1 &
+NPID=$!
+echo "  nginx launched pid=$NPID"
+
+# --- wait for it to bind 127.0.0.1:8080 (retry the request) ---
+BODY=""
+up=0
+i=0
+while [ "$i" -lt 40 ]; do
+    BODY=$(wget -qO- http://127.0.0.1:8080/ 2>/dev/null)
+    if [ -n "$BODY" ]; then up=1; break; fi
+    # bail out early if nginx already died
+    kill -0 "$NPID" 2>/dev/null || { echo "  nginx exited before binding"; break; }
+    i=$((i+1))
+    sleep 1
+done
+
+if [ "$up" = 1 ]; then
+    echo "  wget body=[$BODY]"
+    [ "$BODY" = "NGINX_OK_BODY" ] && NGINX_OK=1 || echo "  body MISMATCH (expected NGINX_OK_BODY)"
+else
+    echo "  nginx did not serve on 127.0.0.1:8080"
+fi
+
+# --- on failure, dump nginx stderr so the first missing syscall is captured ---
+if [ "$NGINX_OK" != 1 ]; then
+    echo "=== nginx.err (look for socket/bind/epoll/eventfd/sendfile errors) ==="
+    cat /tmp/nginx.err 2>/dev/null
+fi
+
+# --- stop nginx ---
+kill "$NPID" 2>/dev/null
+kill -9 "$NPID" 2>/dev/null
+
+echo "RESULT: nginx_serve=$NGINX_OK"
+if [ "$NGINX_OK" = 1 ]; then V=1; else V=0; fi; printf 'NGINX_OK=%s\n' "$V"
+echo "NGINX_DONE"
+'''
+success_regex = ["(?m)^NGINX_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200
