@@ -23,7 +23,7 @@ printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /et
 cat > /tmp/H.java << 'EOF'
 public class H { public static void main(String[] a){ System.out.println("HI"); } }
 EOF
-# --- aggregate gate: count every suite; OPENJDK17_OK=1 ONLY when PASS==TOTAL.
+# --- aggregate gate: count every suite; the success token ONLY when PASS==TOTAL.
 # acc <1|0> records one suite result (TOTAL always++, PASS++ on success). This
 # closes the old hole where BIGTEST_DONE was emitted unconditionally so an EE
 # demo failing (ok=0) still passed the case. Now ANY ok=0 -> PASS<TOTAL -> fail.

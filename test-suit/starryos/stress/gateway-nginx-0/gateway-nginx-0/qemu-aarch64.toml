@@ -25,7 +25,7 @@ grep -q "^nginx:" /etc/group || echo "nginx:x:101:" >> /etc/group
 NGINX=/usr/sbin/nginx
 echo "=== nginx -v ==="
 $NGINX -v 2>&1
-NGINX_OK=0
+SERVE_OK=0
 
 # --- config syntax test (also surfaces the first missing-syscall error early) ---
 $NGINX -c /etc/nginx/nginx.conf -t > /tmp/nginx.test 2>&1
@@ -51,13 +51,13 @@ done
 
 if [ "$up" = 1 ]; then
     echo "  wget body=[$BODY]"
-    [ "$BODY" = "NGINX_OK_BODY" ] && NGINX_OK=1 || echo "  body MISMATCH (expected NGINX_OK_BODY)"
+    [ "$BODY" = "NGINX_OK_BODY" ] && SERVE_OK=1 || echo "  body MISMATCH (expected NGINX_OK_BODY)"
 else
     echo "  nginx did not serve on 127.0.0.1:8080"
 fi
 
 # --- on failure, dump nginx stderr so the first missing syscall is captured ---
-if [ "$NGINX_OK" != 1 ]; then
+if [ "$SERVE_OK" != 1 ]; then
     echo "=== nginx.err (look for socket/bind/epoll/eventfd/sendfile errors) ==="
     cat /tmp/nginx.err 2>/dev/null
 fi
@@ -66,8 +66,8 @@ fi
 kill "$NPID" 2>/dev/null
 kill -9 "$NPID" 2>/dev/null
 
-echo "RESULT: nginx_serve=$NGINX_OK"
-if [ "$NGINX_OK" = 1 ]; then V=1; else V=0; fi; printf 'NGINX_OK=%s\n' "$V"
+echo "RESULT: nginx_serve=$SERVE_OK"
+if [ "$SERVE_OK" = 1 ]; then V=1; else V=0; fi; printf 'NGINX_OK=%s\n' "$V"
 echo "NGINX_DONE"
 '''
 success_regex = ["(?m)^NGINX_OK=1"]

@@ -49,7 +49,7 @@ PYEOF
 
 # --- launch JupyterLab headless, loopback, no auth, in the background ----------
 echo "=== launching: jupyter lab --no-browser --ip=127.0.0.1 --port=$PORT ==="
-$PY -m jupyterlab --no-browser --ip=127.0.0.1 --port=$PORT \
+$PY -m jupyterlab --allow-root --no-browser --ip=127.0.0.1 --port=$PORT \
     --ServerApp.token='' --ServerApp.password='' \
     --ServerApp.disable_check_xsrf=True --ServerApp.open_browser=False \
     --notebook-dir=/tmp/jl/nb > /tmp/jl/server.log 2>&1 &
