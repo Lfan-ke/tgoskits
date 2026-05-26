@@ -144,6 +144,16 @@ fn get_run_queue(index: usize) -> &'static mut AxRunQueue {
     unsafe { RUN_QUEUES[index].assume_init_mut() }
 }
 
+#[cfg(all(feature = "smp", feature = "ipi"))]
+fn kick_remote_cpu(cpu_id: usize) {
+    if cpu_id != this_cpu_id() {
+        ax_hal::irq::send_ipi(
+            ax_hal::irq::IPI_IRQ,
+            ax_hal::irq::IpiTarget::Other { cpu_id },
+        );
+    }
+}
+
 /// Selects the appropriate run queue for the provided task.
 ///
 /// * In a single-core system, this function always returns a reference to the global run queue.
@@ -178,6 +188,44 @@ pub(crate) fn select_run_queue<G: BaseGuard>(task: &AxTaskRef) -> AxRunQueueRef<
     {
         // When SMP is enabled, select the run queue based on the task's CPU affinity and load balance.
         let index = select_run_queue_index(task.cpumask());
+        AxRunQueueRef {
+            inner: get_run_queue(index),
+            state: irq_state,
+            _phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+/// Selects a run queue for waking a blocked task.
+///
+/// Unlike new task placement, wakeups prefer the CPU that performs the wakeup
+/// when the task affinity allows it. This keeps most wakeups local while still
+/// falling back to the task's previous CPU or the normal selector if affinity
+/// requires it.
+#[inline]
+pub(crate) fn select_wake_run_queue<G: BaseGuard>(task: &AxTaskRef) -> AxRunQueueRef<'static, G> {
+    let irq_state = G::acquire();
+    #[cfg(not(feature = "smp"))]
+    {
+        let _ = task;
+        AxRunQueueRef {
+            inner: unsafe { RUN_QUEUE.current_ref_mut_raw() },
+            state: irq_state,
+            _phantom: core::marker::PhantomData,
+        }
+    }
+    #[cfg(feature = "smp")]
+    {
+        let current_cpu = this_cpu_id();
+        let last_cpu = task.cpu_id() as usize;
+        let cpumask = task.cpumask();
+        let index = if cpumask.get(current_cpu) {
+            current_cpu
+        } else if last_cpu < ax_config::plat::MAX_CPU_NUM && cpumask.get(last_cpu) {
+            last_cpu
+        } else {
+            select_run_queue_index(cpumask)
+        };
         AxRunQueueRef {
             inner: get_run_queue(index),
             state: irq_state,
@@ -239,13 +287,14 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     ///
     /// This function is used to add a new task to the scheduler.
     pub fn add_task(&mut self, task: AxTaskRef) {
-        debug!(
-            "task add: {} on run_queue {}",
-            task.id_name(),
-            self.inner.cpu_id
-        );
+        let cpu_id = self.inner.cpu_id;
+        debug!("task add: {} on run_queue {}", task.id_name(), cpu_id);
         assert!(task.is_ready());
+        #[cfg(feature = "smp")]
+        task.set_cpu_id(cpu_id as _);
         self.inner.scheduler.lock().add_task(task);
+        #[cfg(all(feature = "smp", feature = "ipi"))]
+        kick_remote_cpu(cpu_id);
     }
 
     /// Unblock one task by inserting it into the run queue.
@@ -272,6 +321,8 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
                 #[cfg(feature = "preempt")]
                 crate::current().set_preempt_pending(true);
             }
+            #[cfg(all(feature = "smp", feature = "ipi"))]
+            kick_remote_cpu(cpu_id);
         }
     }
 }
@@ -417,17 +468,15 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         // A task must appear in this wait queue at most once. Under SMP a
         // `wait_until` whose condition is still false can re-enter
         // `blocked_resched` while the task is *already* queued here (its prior
-        // enqueue not yet consumed by a `notify`). Pushing again would leave a
-        // stale duplicate entry: a later `notify_one_with` then pops that stale
-        // copy and hands it the resource a second time. For `axsync::RawMutex`
-        // this hands the lock to a task that already owns it, tripping the
-        // "tried to acquire mutex it already owns" assertion under SMP
-        // (intermittent panic at axsync mutex.rs, e.g. via concurrent
-        // page-cache access). The enqueue is guarded against duplicates here;
-        // the already-present entry is sufficient to wake the task. The scan is
-        // cheap (wait queues are short) and only runs on the blocking slow path.
-        curr.set_in_wait_queue(true);
-        if !wq_guard.iter().any(|t| curr.ptr_eq(t)) {
+        // enqueue not yet consumed by a `notify`). A preemptive future wake can
+        // also re-enter a wait path before a previous wait-queue entry has been
+        // consumed. Pushing again would leave a stale duplicate entry: a later
+        // `notify_one_with` then pops that stale copy and hands the task the
+        // resource a second time. For `axsync::RawMutex` this hands the lock
+        // to a task that already owns it, tripping the "tried to acquire mutex
+        // it already owns" assertion under SMP. Guard via `in_wait_queue()`.
+        if !curr.in_wait_queue() {
+            curr.set_in_wait_queue(true);
             wq_guard.push_back(curr.clone());
         }
         // Drop the lock of wait queue explictly.
