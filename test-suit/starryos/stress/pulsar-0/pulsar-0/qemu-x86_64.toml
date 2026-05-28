@@ -42,9 +42,12 @@ export PULSAR_LOG_IMMEDIATE_FLUSH=true
 export JAVA_TOOL_OPTIONS="-Xint -Xmx1536m -Xms256m -Xss1m -XX:ErrorFile=/tmp/hs_err.log -XX:OnError= -XX:OnOutOfMemoryError= -XX:+ExitOnOutOfMemoryError"
 mkdir -p /tmp/pulsar-data
 cd /tmp/pulsar-data
+# See notes/45 for the multi-iteration silent-exit investigation. Current state:
+# pulsar JVM reaches BK DbLedgerStorage init then silently dies between two
+# adjacent logger.info calls (no Java exception, no hs_err.log). Resume by
+# writing a minimal Java BkRepro program OR instrumenting starry sys_exit /
+# sys_exit_group / sys_kill with debug! to capture the actual JVM exit syscall.
 $PULSAR_HOME/bin/pulsar standalone --wipe-data --no-functions-worker > /tmp/pulsar.out 2>&1 &
-PULSAR_BG_PID=$!
-echo "JVM_PID=$PULSAR_BG_PID"
 PID=$!
 SRV_READY=0
 for i in $(seq 1 1800); do
