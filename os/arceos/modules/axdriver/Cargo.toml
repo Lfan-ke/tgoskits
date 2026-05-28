@@ -20,7 +20,7 @@ input = ["dep:ax-driver-input"]
 vsock = ["ax-driver-vsock"]
 
 # Enabled by features `virtio-*`
-virtio = ["dep:ax-driver-virtio", "dep:ax-alloc", "dep:ax-hal", "dep:ax-config"]
+virtio = ["dep:ax-driver-virtio", "dep:ax-alloc", "dep:ax-hal", "dep:ax-config", "dep:axklib"]
 
 # various types of drivers
 virtio-blk = ["block", "virtio", "ax-driver-virtio/block"]
@@ -61,3 +61,4 @@ ax-crate-interface.workspace = true
 log.workspace = true
 smallvec = { version = "1.15", features = ["const_generics", "union"] }
 axplat-dyn = { workspace = true, optional = true }
+axklib = { workspace = true, optional = true }

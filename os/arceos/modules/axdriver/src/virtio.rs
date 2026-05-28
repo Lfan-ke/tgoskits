@@ -289,7 +289,14 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     }
 
     #[inline]
-    unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
+    unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
+        // Establish a kernel mapping for the BAR before returning the virt.
+        // `ax_mm::iomap` (via axklib FFI shim) is idempotent: AlreadyExists is
+        // rewritten via map_linear_overwrite, so low BARs (already mapped by
+        // axconfig MMIO_RANGES) are harmless. For high BARs (>= 4 GiB on x86 q35
+        // with -m >= ~3 GiB; QEMU places virtio 64-bit BARs at 768 GiB phys),
+        // this is the path that lets device_status writes succeed (#242 / pulsar).
+        let _ = axklib::mem::iomap((paddr as usize).into(), size);
         let vaddr = hal_phys_to_virt_addr(paddr);
         nonnull_from_hal_address(vaddr, "mmio_phys_to_virt")
     }

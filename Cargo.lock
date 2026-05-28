@@ -808,6 +808,7 @@ dependencies = [
  "ax-driver-vsock",
  "ax-errno",
  "ax-hal",
+ "axklib",
  "axplat-dyn",
  "cfg-if",
  "log",
