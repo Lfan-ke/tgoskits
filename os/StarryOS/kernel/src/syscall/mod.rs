@@ -4,6 +4,8 @@ mod ipc;
 mod mm;
 mod net;
 mod resources;
+#[cfg(target_arch = "riscv64")]
+mod riscv_hwprobe;
 mod signal;
 mod sync;
 mod sys;
@@ -14,6 +16,8 @@ use ax_errno::{AxError, LinuxError};
 use ax_hal::uspace::UserContext;
 use syscalls::Sysno;
 
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv_hwprobe::*;
 pub use self::{
     fs::*, io_mpx::*, ipc::*, mm::*, net::*, resources::*, signal::*, sync::*, sys::*, task::*,
     time::*,
@@ -570,6 +574,14 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::seccomp => sys_seccomp(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         #[cfg(target_arch = "riscv64")]
         Sysno::riscv_flush_icache => sys_riscv_flush_icache(),
+        #[cfg(target_arch = "riscv64")]
+        Sysno::riscv_hwprobe => sys_riscv_hwprobe(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+        ),
 
         // sync
         Sysno::membarrier => sys_membarrier(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),

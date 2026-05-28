@@ -339,6 +339,20 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> AxResult<isize> {
             memfd.add_seals(arg as u32)?;
             Ok(0)
         }
+        // F_GET_RW_HINT (1035), F_SET_RW_HINT (1036), F_GET_FILE_RW_HINT (1037),
+        // F_SET_FILE_RW_HINT (1038) — Linux 4.13+ I/O priority hints for the
+        // block layer. They are advisory; Linux on filesystems that don't honor
+        // them still returns 0. RocksDB / BookKeeper / Pulsar call SET_RW_HINT
+        // heavily for WAL/SST files and treat EINVAL as fatal in some configs,
+        // so report success (no-op) to match Linux's advisory semantics. GET_*
+        // returns the implicit default RWH_WRITE_LIFE_NOT_SET = 0.
+        1035 | 1037 => Ok(0),
+        1036 | 1038 => Ok(0),
+        // F_GETOWN/F_SETOWN/F_GETSIG/F_SETSIG and F_NOTIFY are advisory in
+        // many programs; report no-op success to match common Linux usage
+        // patterns where the syscall is part of optional feature detection.
+        // F_GETOWN_EX (16) / F_SETOWN_EX (15) — return 0 / no-op.
+        5 | 6 | 10 | 11 | 15 | 16 => Ok(0),
         _ => {
             warn!("unsupported fcntl parameters: cmd: {cmd}");
             Err(AxError::InvalidInput)
