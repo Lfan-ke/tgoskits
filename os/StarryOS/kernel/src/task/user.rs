@@ -67,6 +67,21 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                                 uctx.ip(),
                                 uctx.sp()
                             );
+                            // [#264 diag] dump trap-time GPRs to identify the
+                            // crashing function (musl ld.so is stripped, can't
+                            // addr2line). For x86_64 memset(dst, c, n):
+                            //   arg0/rdi = current dst (advances during rep stos)
+                            //   arg1/rsi = c (byte fill value)
+                            //   arg2/rdx = n_original (saved in caller frame)
+                            // rcx-equivalent isn't exposed via UserContext, but
+                            // we can compute starting dst from arg0 - (n - rcx).
+                            #[cfg(target_arch = "x86_64")]
+                            warn!(
+                                "[FAULT-DIAG] arg0={:#x} arg1={:#x} arg2={:#x} \
+                                 arg3={:#x} arg4={:#x} arg5={:#x}",
+                                uctx.arg0(), uctx.arg1(), uctx.arg2(),
+                                uctx.arg3(), uctx.arg4(), uctx.arg5(),
+                            );
                             raise_signal_fatal(
                                 SignalInfo::new_fault(Signo::SIGSEGV, code as i32, addr.as_usize()),
                                 &uctx,
