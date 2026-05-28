@@ -1,0 +1,49 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-trino.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-x86_64.path
+# --- Trino 435 (distributed SQL engine) via io.trino.testing.LocalQueryRunner ----------
+# WHY NOT the full trino-server-476: that wants Java 24+, a multi-GB heap, G1/JIT, off-heap
+# slices, dozens of modules and a Discovery/coordinator HTTP cluster — unrealistic under
+# starry's -Xint + single-core + emulated-arch + capped-RAM. LocalQueryRunner is the SAME
+# engine (parser -> analyzer -> planner -> optimizer -> local execution) the server runs,
+# embedded in ONE JVM with no HTTP cluster, plus the built-in TPCH connector (pure compute,
+# generates data on the fly, no storage). Trino 435 is the LAST Java-17-compatible line
+# (436+ require Java 22+), so this reuses the 4-arch musl OpenJDK17 base image directly.
+# Host-validated on JDK17: TRINO_RESULT ok=3 fail=0 + TRINO_DONE.
+# -Xint: starry JIT instability (#206). -Xmx1024m/MaxMetaspaceSize=512m: explicit sizing
+# (starry ergonomic heap under-reports RAM #206); the demo's documented invocation.
+#
+# WHY -Djna.boot.library.path + -Djna.nounpack: io.trino.util.MachineInfo -> OSHI -> JNA
+# triggers JNA's Native.<clinit>, which by default UNPACKS the glibc-linked libjnidispatch.so
+# bundled in jna.jar to a temp file and dlopens it. On musl (StarryOS/Alpine) musl's loader
+# can't relocate a glibc-built .so and the JVM aborts (SIGSEGV in Java_com_sun_jna_Native_
+# sizeof). The faithful fix — what real Alpine does — is to install Alpine's
+# java-jna-native (musl-built libjnidispatch.so) plus the matching JNA jar version. The
+# prep script swaps jna-5.13.0.jar (trino's bundled) for jna-5.15.0.jar (Alpine's version,
+# host-validated drop-in with OSHI 6.4.8 + trino 435: ok=3 fail=0) and stages Alpine's musl
+# libjnidispatch.so at /root/trino/jna/. -Djna.nounpack=true tells JNA NOT to extract the
+# bundled glibc .so; -Djna.boot.library.path points it at the musl one. SQL engine fully
+# unmodified, JNA native call path entirely real.
+$JAVA_HOME/bin/java -Xint -Xms256m -Xmx1024m -XX:MaxMetaspaceSize=512m \
+  -Djna.boot.library.path=/root/trino/jna -Djna.nounpack=true \
+  -cp '/root/trino/trino-demo.jar:/root/trino/trino-libs/*' \
+  org.starry.dod.TrinoDemo > /tmp/trino.out 2>&1
+cat /tmp/trino.out
+# Gate: the engine ran all 3 queries (ok=3 fail=0) AND printed TRINO_DONE. The TRINO_OK
+# literal appears ONLY in this final printf (anti-false-positive: TrinoDemo itself emits
+# TRINO_RESULT / TRINO_DONE, never the success token).
+V=0; grep -q '^TRINO_RESULT ok=3 fail=0$' /tmp/trino.out && grep -q '^TRINO_DONE$' /tmp/trino.out && V=1
+printf 'TRINO_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^TRINO_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 4500

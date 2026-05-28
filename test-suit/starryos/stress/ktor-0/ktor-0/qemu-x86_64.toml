@@ -1,7 +1,7 @@
 args = [
     "-nographic", "-m", "2048M", "-smp", "4",
     "-device", "virtio-blk-pci,drive=disk0",
-    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-java.img",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-ktor.img",
     "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
 ]
 uefi = false
@@ -10,44 +10,55 @@ shell_prefix = "root@starry:/root #"
 shell_init_cmd = '''
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-x86_64.path
-# --- Ktor (Kotlin async web, Netty engine; loopback 127.0.0.1:18082) ---
-# Launch the host-compiled Ktor fat jar; it binds 127.0.0.1:18082 and prints KTOR_READY.
-$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/dod/ktor-demo.jar >/tmp/ktor.out 2>&1 &
+# --- Ktor 2.3.12 (Kotlin 1.9.25 async web, Netty engine; loopback 127.0.0.1:18082) ---
+# Host-compiled fat jar (Kotlin compiled on host to dodge on-starry kotlinc crash #237).
+# Binds 127.0.0.1:18082, prints KTOR_READY, then blocks. Exercises Kotlin coroutines +
+# Netty NIO event loop + Ktor routing + kotlinx.serialization JSON content-negotiation.
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx256m -jar /root/ktor/ktor-demo.jar >/tmp/ktor.out 2>&1 &
 JPID=$!
-# Wait for the engine to accept connections (slow -Xint + emulated-arch warmup; up to ~180s).
-ready=0
-for i in $(seq 1 180); do
-  grep -q KTOR_READY /tmp/ktor.out && { ready=1; break; }
+SRV_READY=0
+for i in $(seq 1 240); do
+  grep -q KTOR_READY /tmp/ktor.out && { SRV_READY=1; break; }
   kill -0 $JPID 2>/dev/null || break
   sleep 1
 done
-PASS=0; FAIL=0
-# Raw HTTP/1.0 over busybox nc (GET + POST), assert exact status line + body.
-get() { printf 'GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' "$1" | timeout 15 nc 127.0.0.1 18082; }
-post() { b="$2"; printf 'POST %s HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: %s\r\n\r\n%s' "$1" "${#b}" "$b" | timeout 15 nc 127.0.0.1 18082; }
-chk() { # name resp expect_status expect_body
-  st=$(printf '%s' "$2" | head -1 | tr -d '\r')
-  bd=$(printf '%s' "$2" | awk 'f{print} /^\r?$/{f=1}' | tr -d '\r' | head -1)
-  if echo "$st" | grep -q "$3" && [ "$bd" = "$4" ]; then PASS=$((PASS+1)); echo "OK   $1 [$st] body=[$bd]";
-  else FAIL=$((FAIL+1)); echo "FAIL $1 [$st] body=[$bd] (want '$3' body=[$4])"; fi
+# Reliable HTTP client = the JVM's java.net.http.HttpClient. busybox `nc` is flaky on starry
+# (verified: Netty serves fine — `wget` got KTOR_PONG — but nc intermittently reads empty).
+# The probe hits every route and asserts exact status + body + negotiated content-type
+# (the content-type assertion proves the genuine Ktor ContentNegotiation(json) stack).
+cat > /root/HttpProbe.java <<'JEOF'
+import java.net.http.*; import java.net.URI;
+public class HttpProbe {
+  static HttpClient c = HttpClient.newHttpClient();
+  static int pass=0, total=0;
+  static final String B="http://127.0.0.1:18082";
+  static HttpResponse<String> g(String p) throws Exception { return c.send(HttpRequest.newBuilder(URI.create(B+p)).GET().build(), HttpResponse.BodyHandlers.ofString()); }
+  static HttpResponse<String> po(String p,String b) throws Exception { return c.send(HttpRequest.newBuilder(URI.create(B+p)).header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString(b)).build(), HttpResponse.BodyHandlers.ofString()); }
+  static void chk(String n, HttpResponse<String> r, int st, String body){ total++; if(r.statusCode()==st && r.body().equals(body)){pass++;System.out.println("OK   "+n);} else System.out.println("FAIL "+n+" st="+r.statusCode()+" body=["+r.body()+"]"); }
+  static void chkSt(String n, HttpResponse<String> r, int st){ total++; if(r.statusCode()==st){pass++;System.out.println("OK   "+n);} else System.out.println("FAIL "+n+" st="+r.statusCode()); }
+  static void chkCt(String n, HttpResponse<String> r, int st, String ct){ total++; String h=r.headers().firstValue("content-type").orElse(""); if(r.statusCode()==st && h.toLowerCase().contains(ct)){pass++;System.out.println("OK   "+n+" ["+h+"]");} else System.out.println("FAIL "+n+" st="+r.statusCode()+" ct=["+h+"]"); }
+  public static void main(String[] a) throws Exception {
+    chk("/ping", g("/ping"), 200, "KTOR_PONG");
+    chk("/add/3/4", g("/add/3/4"), 200, "{\"a\":3,\"b\":4,\"sum\":7}");
+    chk("/add/foo/4", g("/add/foo/4"), 400, "BAD_INT");
+    chk("/echo", g("/echo?msg=hello"), 200, "{\"echo\":\"hello\",\"len\":5}");
+    chk("/sum", po("/sum","{\"nums\":[1,2,3,4]}"), 200, "{\"total\":10,\"count\":4}");
+    chkSt("/nope", g("/nope"), 404);
+    chkCt("/add ctype", g("/add/3/4"), 200, "application/json");
+    System.out.println("KTOR_PROBE pass="+pass+" total="+total);
+  }
 }
-chkstatus() { # name resp expect_status  (body not checked, e.g. 404)
-  st=$(printf '%s' "$2" | head -1 | tr -d '\r')
-  if echo "$st" | grep -q "$3"; then PASS=$((PASS+1)); echo "OK   $1 [$st]"; else FAIL=$((FAIL+1)); echo "FAIL $1 [$st] (want '$3')"; fi
-}
-if [ "$ready" = "1" ]; then
-  chk "/ping"        "$(get /ping)"              "200 OK"      "KTOR_PONG"
-  chk "/add/3/4"     "$(get /add/3/4)"           "200 OK"      '{"a":3,"b":4,"sum":7}'
-  chk "/add/foo/4"   "$(get /add/foo/4)"         "400 Bad"     "BAD_INT"
-  chk "/echo"        "$(get '/echo?msg=hello')"  "200 OK"      '{"echo":"hello","len":5}'
-  chk "/sum"         "$(post /sum '{"nums":[1,2,3,4]}')" "200 OK" '{"total":10,"count":4}'
-  chkstatus "/nope"  "$(get /nope)"              "404 Not Found"
+JEOF
+if [ "$SRV_READY" = "1" ]; then
+  $JAVA_HOME/bin/java -Xint -Xmx256m -Xms64m /root/HttpProbe.java > /tmp/probe.out 2>&1
+  cat /tmp/probe.out
 else
-  echo "KTOR_NOT_READY"; grep -aiE "KTOR_ERR|Exception|Error" /tmp/ktor.out | tail -10
+  echo "KTOR_NOT_READY"; grep -aiE "KTOR_ERR|Exception|Error" /tmp/ktor.out | tail -10 > /tmp/probe.out; cat /tmp/probe.out
 fi
 kill $JPID 2>/dev/null
-echo "KTOR_RESULT pass=$PASS fail=$FAIL"
-V=0; [ "$ready" = "1" ] && [ "$FAIL" = "0" ] && [ "$PASS" = "6" ] && V=1
+# Gate: server up AND probe reported all 7 routes passed. KTOR_OK literal ONLY here
+# (anti-false-positive: the probe emits "KTOR_PROBE pass=N", never the success token).
+V=0; [ "$SRV_READY" = "1" ] && grep -q '^KTOR_PROBE pass=7 total=7' /tmp/probe.out && V=1
 printf 'KTOR_OK=%s\n' "$V"
 '''
 success_regex = ["(?m)^KTOR_OK=1"]

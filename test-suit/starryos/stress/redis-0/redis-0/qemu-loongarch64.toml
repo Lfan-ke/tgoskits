@@ -1,0 +1,55 @@
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-redis.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-loongarch64.path
+# --- Redis 8.8 (Alpine musl apk) on StarryOS ----------------------------------
+# In-memory key-value store, loopback :6379. Validates: musl ELF launch +
+# bound TCP loopback + write/read roundtrip + SHUTDOWN. Marker REDIS_OK=1.
+# Config: minimal, no persistence, no protected-mode (so cli connects loopback).
+mkdir -p /var/lib/redis /var/log/redis
+/usr/bin/redis-server --daemonize no --bind 127.0.0.1 --port 6379 \
+  --protected-mode no --save '' --appendonly no \
+  --dir /var/lib/redis --logfile /tmp/redis.log >/tmp/redis.out 2>&1 &
+RPID=$!
+SRV_READY=0
+for i in $(seq 1 30); do
+  grep -aq "Ready to accept connections" /tmp/redis.log 2>/dev/null && { SRV_READY=1; break; }
+  grep -aq "Ready to accept connections" /tmp/redis.out 2>/dev/null && { SRV_READY=1; break; }
+  kill -0 $RPID 2>/dev/null || break
+  sleep 1
+done
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+# 1) server ready (TCP bound + accepting)
+acc "$SRV_READY" "server ready (loopback :6379)"
+if [ "$SRV_READY" = 1 ]; then
+  # 2) PING -> PONG (basic connectivity)
+  R=$(/usr/bin/redis-cli -h 127.0.0.1 -p 6379 PING 2>/dev/null)
+  [ "$R" = "PONG" ] && acc 1 "PING -> PONG" || acc 0 "PING got: $R"
+  # 3) SET/GET roundtrip (data plane)
+  /usr/bin/redis-cli -h 127.0.0.1 -p 6379 SET foo bar >/dev/null 2>&1
+  G=$(/usr/bin/redis-cli -h 127.0.0.1 -p 6379 GET foo 2>/dev/null)
+  [ "$G" = "bar" ] && acc 1 "SET/GET roundtrip = bar" || acc 0 "GET foo got: $G"
+  # 4) INCR (counter atomicity)
+  /usr/bin/redis-cli -h 127.0.0.1 -p 6379 SET counter 41 >/dev/null 2>&1
+  /usr/bin/redis-cli -h 127.0.0.1 -p 6379 INCR counter >/dev/null 2>&1
+  N=$(/usr/bin/redis-cli -h 127.0.0.1 -p 6379 GET counter 2>/dev/null)
+  [ "$N" = "42" ] && acc 1 "INCR counter 41->42" || acc 0 "counter got: $N"
+fi
+# Teardown
+/usr/bin/redis-cli -h 127.0.0.1 -p 6379 SHUTDOWN NOSAVE 2>/dev/null
+sleep 1; kill $RPID 2>/dev/null
+echo "REDIS_RESULT pass=$PASS total=$TOTAL"
+V=0; [ "$SRV_READY" = 1 ] && [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "4" ] && V=1
+printf 'REDIS_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^REDIS_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 600

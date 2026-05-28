@@ -1,0 +1,89 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "cortex-a72",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-wildfly.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-aarch64.path
+# --- WildFly 40.0.0.Final (full Jakarta EE 10 app server) on StarryOS ----------
+# Boot the REAL server: bin/standalone.sh -> jboss-modules.jar -> org.jboss.as.standalone.
+# This exercises the modular classloader, the Undertow web subsystem on :8080, and a
+# multi-minute -Xint boot. JIT is unstable on starry (#206) so we force -Xint.
+#
+# WHY JAVA_TOOL_OPTIONS (not export JAVA_OPTS): WildFly's bin/common.sh decides whether the
+# JDK is modular by running a *bare* `java --add-modules=java.se -version` (no -Xmx). On
+# starry that bare java aborts with "Too small maximum heap" (ergonomic-heap issue #206 —
+# starry under-reports physical RAM to the JVM), so common.sh sets MODULAR_JDK=false and
+# then standalone.sh:290 appends an EMPTY --add-opens set. WildFly's infinispan/protostream
+# marshaller then can't `privateLookupIn` java.util ("module java.base does not open
+# java.util") and 2 cache services fail -> WFLYSRV0026 (started WITH errors), whereas real
+# Linux gets a clean WFLYSRV0025. Setting JAVA_TOOL_OPTIONS gives EVERY java invocation
+# (common.sh's MODULAR_JDK + GC-log probes AND the server itself) a heap, so WildFly detects
+# a modular JDK and adds its OWN correct --add-opens — i.e. starry's launch line becomes
+# byte-for-byte what WildFly produces on Linux. We leave JAVA_OPTS unset so standalone.conf
+# applies its stock sizing (-Xms64m -Xmx512m) + preferIPv4Stack + headless defaults.
+# The harness boots the server backgrounded, waits for the WFLYSRV0025 "started" banner,
+# probes :8080 via the JVM HttpClient (busybox nc is flaky on starry), asserts HTTP 200 +
+# the welcome-content body + the 40.0.0.Final banner, then `kill`s the server PID (NOT
+# jboss-cli — that forks a 2nd JVM whose mgmt SSL handshake times out on the emulated guest).
+export JAVA_TOOL_OPTIONS="-Xint -Xmx512m -Xms64m"
+WF=/opt/wildfly-40.0.0.Final
+rm -f $WF/standalone/log/server.log 2>/dev/null
+# Launch in background; capture the standalone.sh PID (its java child shares the
+# process group so the final `kill` + pkill tear the whole server down).
+sh $WF/bin/standalone.sh -b 127.0.0.1 >/tmp/wf.out 2>&1 &
+PID=$!
+# Wait for the org.jboss WFLYSRV0025 "started in" banner (full EE boot under -Xint +
+# emulated arch is slow; allow up to ~600s). Bail early if the launcher dies.
+SRV_READY=0
+for i in $(seq 1 600); do
+  grep -aq "WFLYSRV0025" /tmp/wf.out && { SRV_READY=1; break; }
+  grep -aqE "WFLYSRV0026|Aborted|FATAL" /tmp/wf.out && break
+  kill -0 $PID 2>/dev/null || break
+  sleep 1
+done
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+# Reliable HTTP client = the JVM's java.net.http.HttpClient (busybox `nc` is flaky on starry
+# — same lesson as ktor-0; Undertow serves fine over loopback). Fetch :8080/ and print
+# status + body so the shell can assert the genuine WildFly welcome page.
+cat > /root/WfProbe.java <<'JEOF'
+import java.net.http.*; import java.net.URI;
+public class WfProbe {
+  public static void main(String[] a) throws Exception {
+    var c = HttpClient.newHttpClient();
+    var r = c.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:8080/")).GET().build(), HttpResponse.BodyHandlers.ofString());
+    System.out.println("WF_STATUS="+r.statusCode());
+    System.out.println(r.body());
+  }
+}
+JEOF
+if [ "$SRV_READY" = "1" ]; then
+  $JAVA_HOME/bin/java -Xint -Xmx256m -Xms64m /root/WfProbe.java > /tmp/wfresp.out 2>&1
+  # 1) HTTP 200 from the Undertow web subsystem
+  grep -q '^WF_STATUS=200' /tmp/wfresp.out && acc 1 "GET / -> 200" || acc 0 "GET / status [$(grep '^WF_STATUS=' /tmp/wfresp.out|head -1)]"
+  # 2) welcome-content body proof — a genuine running WildFly serves this exact page
+  grep -q "Welcome to WildFly" /tmp/wfresp.out && acc 1 "welcome page title" || acc 0 "welcome page title"
+  grep -q "Your WildFly instance is running" /tmp/wfresp.out && acc 1 "welcome page running marker" || acc 0 "welcome page running marker"
+  # 3) version assert (in-gate): the started banner MUST name 40.0.0.Final.
+  grep -aq "40.0.0.Final" /tmp/wf.out && acc 1 "version banner 40.0.0.Final" || acc 0 "version banner 40.0.0.Final"
+else
+  echo "WILDFLY_NOT_READY"; echo "--- full server log tail (diagnostics) ---"; tail -40 /tmp/wf.out
+fi
+# Teardown: kill the server PID (per design — no jboss-cli). pkill the jboss java
+# child as belt-and-suspenders so the emulator frees cleanly.
+kill $PID 2>/dev/null
+pkill -f "org.jboss.as.standalone" 2>/dev/null
+echo "WILDFLY_RESULT pass=$PASS total=$TOTAL"
+# Gate: server started AND all 4 assertions passed (200 + 2 body markers + version).
+V=0; [ "$SRV_READY" = "1" ] && [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "4" ] && V=1
+printf 'WILDFLY_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^WILDFLY_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 4500

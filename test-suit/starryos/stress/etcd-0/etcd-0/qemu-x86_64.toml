@@ -1,0 +1,51 @@
+# etcd v3.6.11 (Go, statically-linked ELF, no libc/interp -> ideal for starry) on StarryOS.
+# Backing KV store under #764 jdk17+ "sub deps". etcd/etcdctl are pure static ELF (verified
+# `file`: x86-64, statically linked) staged into /usr/local/bin. Tests: (1) version probes
+# (pure ELF runs), (2) headless single-node etcd on 127.0.0.1 + etcdctl put/get roundtrip
+# (loopback TCP — proven workable on starry via gateway-nginx-0). DoD = both static-ELF runs
+# AND the KV roundtrip over loopback succeed.
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-etcd.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+# 1) etcd binary runs (pure static ELF) + exact version 3.6.11.
+/usr/local/bin/etcd --version > /tmp/ev.out 2>&1
+grep -q 'etcd Version: 3.6.11' /tmp/ev.out && acc 1 "etcd --version 3.6.11" || { acc 0 "etcd --version"; tail -3 /tmp/ev.out; }
+# 2) etcdctl binary runs + version 3.6.11.
+/usr/local/bin/etcdctl version > /tmp/cv.out 2>&1
+grep -q 'etcdctl version: 3.6.11' /tmp/cv.out && acc 1 "etcdctl version 3.6.11" || { acc 0 "etcdctl version"; tail -3 /tmp/cv.out; }
+# 3) headless single-node etcd on loopback; wait for "ready to serve client requests".
+/usr/local/bin/etcd --data-dir=/tmp/etcd.d --name=s1 \
+  --listen-client-urls=http://127.0.0.1:2379 --advertise-client-urls=http://127.0.0.1:2379 \
+  --listen-peer-urls=http://127.0.0.1:2380 --initial-advertise-peer-urls=http://127.0.0.1:2380 \
+  --initial-cluster=s1=http://127.0.0.1:2380 --initial-cluster-token=t1 --initial-cluster-state=new \
+  > /tmp/etcd.out 2>&1 &
+EPID=$!
+RDY=0; i=0; while [ $i -lt 60 ]; do grep -q 'ready to serve client requests' /tmp/etcd.out 2>/dev/null && { RDY=1; break; }; i=$((i+1)); sleep 2; done
+acc "$RDY" "etcd server ready (loopback)"
+# 4) KV roundtrip over loopback: put foo=bar then get foo -> expect 'bar'.
+if [ "$RDY" = 1 ]; then
+  /usr/local/bin/etcdctl --endpoints=127.0.0.1:2379 put foo bar > /tmp/put.out 2>&1
+  GOT=$(/usr/local/bin/etcdctl --endpoints=127.0.0.1:2379 get foo --print-value-only 2>/tmp/get.err | tr -d '\r\n')
+  if [ "$GOT" = "bar" ]; then acc 1 "etcdctl put/get roundtrip = bar"; else acc 0 "put/get (got: $GOT)"; tail -3 /tmp/get.err; fi
+else
+  echo "  server not ready:"; tail -8 /tmp/etcd.out
+fi
+kill $EPID 2>/dev/null
+# aggregate gate: emit success token ONLY when every assertion passed (no silent pass).
+echo "ETCD_RESULT pass=$PASS total=$TOTAL"
+V=0; [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "4" ] && V=1
+printf 'ETCD_OK=%s\n' "$V"
+echo "ETCD_DONE"
+'''
+success_regex = ["(?m)^ETCD_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200

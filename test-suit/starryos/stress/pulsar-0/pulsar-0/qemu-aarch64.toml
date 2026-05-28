@@ -1,0 +1,57 @@
+args = [
+    "-nographic", "-m", "8192M", "-cpu", "cortex-a72", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-pulsar.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-aarch64.path
+# --- Apache Pulsar 3.3.4 LTS standalone on StarryOS ----------------------
+# bin/pulsar standalone = ZK + BookKeeper + broker in single JVM (heavyweight).
+# Override defaults for starry: PULSAR_MEM 2g/4gDirect -> 1g/256mDirect;
+# PULSAR_GC empty (default ZGC needs JIT); JAVA_TOOL_OPTIONS=-Xint (#206).
+# Wait for "messaging service is ready" banner from broker, verify via
+# pulsar-admin clusters list, then kill.
+export PULSAR_HOME=/opt/apache-pulsar-3.3.4
+export PATH=$PULSAR_HOME/bin:$PATH
+export PULSAR_MEM="-Xms256m -Xmx1024m -XX:MaxDirectMemorySize=256m"
+export PULSAR_GC="-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:-UsePerfData"
+export PULSAR_GC_LOG=""
+export PULSAR_EXTRA_OPTS=""
+export JAVA_TOOL_OPTIONS="-Xint -Xmx1024m -Xms256m"
+mkdir -p /tmp/pulsar-data
+cd /tmp/pulsar-data
+$PULSAR_HOME/bin/pulsar standalone --wipe-data --no-functions-worker > /tmp/pulsar.out 2>&1 &
+PID=$!
+SRV_READY=0
+for i in $(seq 1 1800); do
+  grep -aq "messaging service is ready" /tmp/pulsar.out 2>/dev/null && { SRV_READY=1; break; }
+  grep -aq "PulsarService started" /tmp/pulsar.out 2>/dev/null && { SRV_READY=1; break; }
+  grep -aqE "ERROR|FATAL|Aborted" /tmp/pulsar.out 2>/dev/null && break
+  kill -0 $PID 2>/dev/null || break
+  sleep 1
+done
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+acc "$SRV_READY" "standalone server ready"
+if [ "$SRV_READY" = 1 ]; then
+  grep -q "Current version of pulsar is: 3.3.4" /tmp/pulsar.out && acc 1 "version 3.3.4 banner" || acc 0 "version banner"
+  $PULSAR_HOME/bin/pulsar-admin clusters list > /tmp/cl.out 2>&1
+  grep -q "standalone" /tmp/cl.out && acc 1 "admin clusters -> standalone" || acc 0 "admin clusters"
+  $PULSAR_HOME/bin/pulsar-admin brokers list standalone > /tmp/bl.out 2>&1
+  grep -qE "[a-zA-Z0-9.-]+:[0-9]+" /tmp/bl.out && acc 1 "broker list non-empty" || acc 0 "broker list"
+else
+  echo "PULSAR_NOT_READY"; tail -30 /tmp/pulsar.out
+fi
+kill $PID 2>/dev/null; pkill -f "PulsarStandaloneStarter" 2>/dev/null
+echo "PULSAR_RESULT pass=$PASS total=$TOTAL"
+V=0; [ "$SRV_READY" = 1 ] && [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "4" ] && V=1
+printf 'PULSAR_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^PULSAR_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 7200

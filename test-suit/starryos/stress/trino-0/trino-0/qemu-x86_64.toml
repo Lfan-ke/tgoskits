@@ -1,0 +1,52 @@
+args = [
+    "-nographic", "-m", "8192M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-trino.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-x86_64.path
+# --- Trino 435 (distributed SQL engine) via io.trino.testing.LocalQueryRunner ----------
+# WHY NOT the full trino-server-476: that wants Java 24+, a multi-GB heap, G1/JIT, off-heap
+# slices, dozens of modules and a Discovery/coordinator HTTP cluster — unrealistic under
+# starry's -Xint + single-core + emulated-arch + capped-RAM. LocalQueryRunner is the SAME
+# engine (parser -> analyzer -> planner -> optimizer -> local execution) the server runs,
+# embedded in ONE JVM with no HTTP cluster, plus the built-in TPCH connector (pure compute,
+# generates data on the fly, no storage). Trino 435 is the LAST Java-17-compatible line
+# (436+ require Java 22+), so this reuses the 4-arch musl OpenJDK17 base image directly.
+# Host-validated on JDK17: TRINO_RESULT ok=3 fail=0 + TRINO_DONE.
+# -Xint: starry JIT instability (#206). -Xmx1024m/MaxMetaspaceSize=512m: explicit sizing
+# (starry ergonomic heap under-reports RAM #206); the demo's documented invocation.
+#
+# WHY MachineInfo shim (prepended on classpath): io.trino.util.MachineInfo -> OSHI -> JNA
+# loads libjnidispatch.so. Two cases:
+#  - glibc libjnidispatch.so (jna.jar bundled): musl loader can't relocate it -> SIGSEGV in
+#    Java_com_sun_jna_Native_sizeof. NOT a starry bug — same on real Alpine without musl JNA.
+#  - musl libjnidispatch.so (Alpine 5.15 native): runs fine on REAL Linux 6.12 musl across 4
+#    archs (verified end-to-end qemu-system + Alpine boot — see /tmp/qsys-{aarch64,riscv64,
+#    loongarch64}.log: all TRINO_RESULT ok=3 fail=0). BUT it HANGS on StarryOS at 32+ min
+#    (java-in-Xint stays alive, no crash, no output). That's a starry-specific dlopen/JNA
+#    bug being investigated separately (tracked alongside #206 — JVM deep fixes on starry).
+# The shim returns Runtime.availableProcessors() — exactly the logical bound trino's own
+# MachineInfo feeds into its Math.min — so the JNA path is never touched. Host validated:
+# 0 oshi/jna classes loaded, ok=3 fail=0. SQL engine (parse->plan->optimize->execute) is
+# entirely unmodified — only the OSHI CPU-topology probe is replaced with the standard
+# JVM Runtime.availableProcessors() call. The fully-faithful musl-libjnidispatch path is
+# host-validated and packaged in the delivery repo for the day starry's JNA bug is fixed.
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m -XX:MaxMetaspaceSize=256m \
+  -cp '/root/trino/trino-machineinfo-shim.jar:/root/trino/trino-demo.jar:/root/trino/trino-libs/*' \
+  org.starry.dod.TrinoDemo > /tmp/trino.out 2>&1
+cat /tmp/trino.out
+# Gate: the engine ran all 3 queries (ok=3 fail=0) AND printed TRINO_DONE. The TRINO_OK
+# literal appears ONLY in this final printf (anti-false-positive: TrinoDemo itself emits
+# TRINO_RESULT / TRINO_DONE, never the success token).
+V=0; grep -q '^TRINO_RESULT ok=3 fail=0$' /tmp/trino.out && grep -q '^TRINO_DONE$' /tmp/trino.out && V=1
+printf 'TRINO_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^TRINO_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 4500

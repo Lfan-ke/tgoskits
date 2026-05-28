@@ -1,0 +1,55 @@
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "8192M",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-quarkus.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-loongarch64.path
+# --- Quarkus CLI 3.35.4 (supersonic-subatomic-Java CLI) on StarryOS -----------
+# Official CLI distribution, extracted to /opt/quarkus-cli-3.35.4. bin/quarkus is a
+# `#!/usr/bin/env sh` wrapper that execs $JAVA_HOME/bin/java with io.quarkus.cli.Main
+# from lib/quarkus-cli-3.35.4-runner.jar. JIT is still unstable on starry (#206) so we
+# force the interpreter on every JVM the wrapper spawns via JAVA_TOOL_OPTIONS=-Xint.
+# Project scaffolding (`quarkus create`) / dev mode need Maven Central + the Quarkus
+# registry over the network, which the offline guest cannot reach; the DoD here is the
+# CLI's fully-offline, self-contained surface: version + help. Both were captured on
+# the host (java 17): `--version` -> "3.35.4", `--help` -> "Usage: quarkus ..." banner.
+export JAVA_TOOL_OPTIONS="-Xint -Xmx256m -Xms32m"
+QK=/opt/quarkus-cli-3.35.4/bin/quarkus
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+
+# 1) version: MUST print exactly 3.35.4 (in-gate version assert; wrong/empty = FAIL).
+#    The CLI prints the version on its own line; we grep for the exact token.
+sh "$QK" --version >/tmp/qk-ver.out 2>&1
+VER=$(grep -aoE '^3\.35\.4$' /tmp/qk-ver.out | head -1)
+if [ "$VER" = "3.35.4" ]; then acc 1 "quarkus --version = 3.35.4"; else acc 0 "quarkus --version (got: $(tr -d '\n' </tmp/qk-ver.out | tail -c 120))"; fi
+
+# 2) help: offline op — the picocli usage banner proves the full CLI runtime booted.
+#    Assert both the banner line AND a real subcommand (create) appear; a broken CLI
+#    cannot emit the command table. (Exit-0 alone is NOT trusted — assert real output.)
+sh "$QK" --help >/tmp/qk-help.out 2>&1
+if grep -aq 'Usage: quarkus' /tmp/qk-help.out && grep -aqE '^[[:space:]]*create' /tmp/qk-help.out; then
+  acc 1 "quarkus --help banner+commands"
+else
+  acc 0 "quarkus --help (tail: $(tail -3 /tmp/qk-help.out | tr '\n' '|'))"
+fi
+
+# 3) version subcommand (`quarkus version`) — second independent offline path to the
+#    version string; guards against the help-only path masking a broken runner jar.
+sh "$QK" version >/tmp/qk-ver2.out 2>&1
+if grep -aqE '^3\.35\.4$' /tmp/qk-ver2.out; then acc 1 "quarkus version subcmd = 3.35.4"; else acc 0 "quarkus version subcmd"; fi
+
+echo "QUARKUS_RESULT pass=$PASS total=$TOTAL"
+# Gate: every offline assertion passed (3 = --version + --help + version subcmd).
+V=0; [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "3" ] && V=1
+printf 'QUARKUS_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^QUARKUS_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

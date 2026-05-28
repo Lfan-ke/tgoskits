@@ -1,0 +1,129 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-jupyter.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === JupyterLab PRODUCT smoke on StarryOS riscv64 (#764 jupyter <!-- lab -->) ===
+# Goal (user-stated): JupyterLab must START correctly AND its URL must be reachable.
+# We launch the REAL `jupyter lab` server headless, wait until its REST API answers,
+# then fetch the LAB front-end page and the REST endpoints and assert on the actual
+# RESPONSE (HTTP body markers + JSON), not exit 0. The PASS token is emitted via
+# printf so it never appears as shell command text that success_regex could falsely
+# match (see notes/40 §E gate). JupyterLab 4.5.7 stack (jupyter-server + ipykernel +
+# pyzmq/libzmq + the 257-asset bundled front-end) injected by prep-jupyter-rootfs.sh;
+# see ~/rcore/download/python-apks/SOURCES.md §9.  pyzmq exercises the zmq native
+# socket layer over StarryOS (epoll/eventfd/AF_UNIX); the loopback HTTP fetch exercises
+# the tornado AF_INET listen/accept/recv path.
+printf '/lib\n/usr/lib\n' > /etc/ld-musl-riscv64.path
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+# the loopback fetches must NOT go through any proxy
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+export NO_PROXY='*'; export no_proxy='*'
+# isolate jupyter runtime/config under writable /tmp
+export JUPYTER_CONFIG_DIR=/tmp/jl/cfg
+export JUPYTER_DATA_DIR=/tmp/jl/data
+export JUPYTER_RUNTIME_DIR=/tmp/jl/rt
+export XDG_RUNTIME_DIR=/tmp/jl/xdg
+mkdir -p /tmp/jl/cfg /tmp/jl/data /tmp/jl/rt /tmp/jl/xdg /tmp/jl/nb
+PY=/usr/bin/python3
+PORT=8888
+URL="http://127.0.0.1:$PORT"
+echo "=== python3 --version ==="
+$PY --version 2>&1
+echo "=== jupyterlab import sanity (pyzmq native + front-end present) ==="
+$PY - << 'PYEOF'
+import jupyterlab, jupyter_server, zmq, ipykernel, tornado
+print("  jupyterlab", jupyterlab.__version__)
+print("  jupyter_server", jupyter_server.__version__)
+print("  pyzmq", zmq.__version__, "libzmq", zmq.zmq_version())
+print("  ipykernel", ipykernel.__version__, "tornado", tornado.version)
+PYEOF
+
+# --- launch JupyterLab headless, loopback, no auth, in the background ----------
+echo "=== launching: jupyter lab --no-browser --ip=127.0.0.1 --port=$PORT ==="
+$PY -m jupyterlab --allow-root --no-browser --ip=127.0.0.1 --port=$PORT \
+    --ServerApp.token='' --ServerApp.password='' \
+    --ServerApp.disable_check_xsrf=True --ServerApp.open_browser=False \
+    --notebook-dir=/tmp/jl/nb > /tmp/jl/server.log 2>&1 &
+JLPID=$!
+
+# --- readiness: poll /api until it answers with a body (generous for slow boot) -
+UP=0
+i=0
+while [ "$i" -lt 90 ]; do
+  i=$((i+1))
+  if wget -q -T 3 -O /tmp/jl/api0 "$URL/api" 2>/dev/null && [ -s /tmp/jl/api0 ]; then UP=1; break; fi
+  # fallback probe via python urllib in case busybox wget mis-handles the response
+  $PY -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('$URL/api',timeout=3).read() else 1)" 2>/dev/null && { UP=1; break; }
+  sleep 1
+done
+echo "server up=$UP (after ${i}s); pid=$JLPID"
+
+LAB_OK=0; API_OK=0; STATUS_OK=0
+if [ "$UP" = 1 ]; then
+  # --- /lab : the JupyterLab front-end HTML (HTTP 200 + product markers) --------
+  # use python urllib so we get the body + status cleanly regardless of wget build
+  $PY - << 'PYEOF' > /tmp/jl/lab.out 2>&1
+import urllib.request
+r = urllib.request.urlopen("http://127.0.0.1:8888/lab", timeout=10)
+body = r.read().decode("utf-8", "replace")
+print("LAB_HTTP=%d" % r.status)
+print("LAB_BYTES=%d" % len(body))
+has_lab = "JupyterLab" in body
+has_cfg = "jupyter-config-data" in body
+print("HAS_JUPYTERLAB=%s HAS_CONFIG_DATA=%s" % (has_lab, has_cfg))
+print("LAB_MARKERS_OK" if (r.status == 200 and has_lab and has_cfg) else "LAB_MARKERS_BAD")
+PYEOF
+  cat /tmp/jl/lab.out
+  grep -q '^LAB_MARKERS_OK' /tmp/jl/lab.out && LAB_OK=1
+
+  # --- /api : REST root returns JSON with a "version" field ---------------------
+  $PY - << 'PYEOF' > /tmp/jl/api.out 2>&1
+import urllib.request, json
+r = urllib.request.urlopen("http://127.0.0.1:8888/api", timeout=10)
+d = json.loads(r.read())
+print("API_HTTP=%d API_JSON=%s" % (r.status, d))
+print("API_JSON_OK" if (r.status == 200 and "version" in d) else "API_JSON_BAD")
+PYEOF
+  cat /tmp/jl/api.out
+  grep -q '^API_JSON_OK' /tmp/jl/api.out && API_OK=1
+
+  # --- /api/status : server status JSON (kernels/connections/last_activity) -----
+  $PY - << 'PYEOF' > /tmp/jl/status.out 2>&1
+import urllib.request, json
+r = urllib.request.urlopen("http://127.0.0.1:8888/api/status", timeout=10)
+d = json.loads(r.read())
+print("STATUS_HTTP=%d STATUS_JSON=%s" % (r.status, d))
+ok = r.status == 200 and "last_activity" in d and "kernels" in d
+print("STATUS_JSON_OK" if ok else "STATUS_JSON_BAD")
+PYEOF
+  cat /tmp/jl/status.out
+  grep -q '^STATUS_JSON_OK' /tmp/jl/status.out && STATUS_OK=1
+else
+  echo "server did not come up; --- server.log tail ---"; tail -25 /tmp/jl/server.log
+fi
+
+# stop the server (best effort)
+kill "$JLPID" 2>/dev/null
+
+echo "RESULTS: up=$UP lab=$LAB_OK api=$API_OK status=$STATUS_OK"
+# Gate: JupyterLab launched AND /lab front-end served AND /api + /api/status REST OK.
+if [ "$UP" = 1 ] && [ "$LAB_OK" = 1 ] && [ "$API_OK" = 1 ] && [ "$STATUS_OK" = 1 ]; then
+  printf 'JUPYTER_OK=%s\n' 1
+else
+  printf 'JUPYTER_OK=%s\n' 0
+  echo "--- server.log tail (for diagnosis) ---"; tail -30 /tmp/jl/server.log
+fi
+echo "JUPYTER_LAB_DONE"
+'''
+success_regex = ["(?m)^JUPYTER_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 2400

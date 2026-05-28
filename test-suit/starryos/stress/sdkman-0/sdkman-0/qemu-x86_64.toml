@@ -1,0 +1,57 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-sdkman.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-x86_64.path
+# --- SDKMAN! 5.23.0 (the SDK manager for the JVM) on StarryOS -----------------
+# SDKMAN is a pure-bash CLI: `sdk` is a shell FUNCTION sourced from
+# /root/.sdkman/bin/sdkman-init.sh (which source's every src/sdkman-*.sh module).
+# The prep step injected a real /bin/bash + its closure (busybox ash cannot run the
+# bash arrays / [[ ]] the modules use) and pre-seeded /root/.sdkman/{var/version=
+# 5.23.0, var/platform, var/candidates, etc/config offline_mode=true}. So the
+# fully-OFFLINE surface runs with NO network: `sdk version` reads var/version and
+# `sdk help` prints the usage banner. (`sdk install` needs api.sdkman.io + the
+# candidate download — net-only, documented in CASE-NOTES, NOT part of this gate.)
+export SDKMAN_DIR=/root/.sdkman
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+
+# 0) bash itself must run on starry (the case's distinguishing dependency).
+/bin/bash -c 'echo BASH_$BASH_VERSION' >/tmp/sd-bash.out 2>&1
+grep -aq '^BASH_5' /tmp/sd-bash.out && acc 1 "bash runs ($(cat /tmp/sd-bash.out))" || acc 0 "bash runs ($(cat /tmp/sd-bash.out))"
+
+# 1) `sdk version` (offline) MUST print exactly "SDKMAN 5.23.0" (in-gate version
+#    assert; the framework loads + var/version is read). Source then call the fn.
+/bin/bash -c 'source $SDKMAN_DIR/bin/sdkman-init.sh; sdk version' >/tmp/sd-ver.out 2>&1
+grep -aqE '^SDKMAN 5\.23\.0$' /tmp/sd-ver.out && acc 1 "sdk version = SDKMAN 5.23.0" || acc 0 "sdk version (tail: $(tail -2 /tmp/sd-ver.out | tr '\n' '|'))"
+
+# 2) `sdk help` (offline) self-check: the usage banner proves every src/*.sh module
+#    sourced and the function dispatcher works. Assert the banner + a real subcommand.
+/bin/bash -c 'source $SDKMAN_DIR/bin/sdkman-init.sh; sdk help' >/tmp/sd-help.out 2>&1
+if grep -aq 'Usage: sdk <command>' /tmp/sd-help.out && grep -aqE 'install +or +i' /tmp/sd-help.out; then
+  acc 1 "sdk help banner+commands"
+else
+  acc 0 "sdk help (tail: $(tail -3 /tmp/sd-help.out | tr '\n' '|'))"
+fi
+
+# 3) candidate list loaded into the framework (offline cache): the `sdk` function
+#    parsed var/candidates into the SDKMAN_CANDIDATES array at source time. Probe a
+#    known JVM candidate name to prove the offline candidate cache is wired up.
+/bin/bash -c 'source $SDKMAN_DIR/bin/sdkman-init.sh; echo "CANDS=${#SDKMAN_CANDIDATES[@]}"; case " ${SDKMAN_CANDIDATES[*]} " in *" java "*) echo HAS_JAVA;; esac' >/tmp/sd-cand.out 2>&1
+if grep -aq 'HAS_JAVA' /tmp/sd-cand.out; then acc 1 "candidate cache loaded ($(grep -ao 'CANDS=[0-9]*' /tmp/sd-cand.out))"; else acc 0 "candidate cache (tail: $(tail -2 /tmp/sd-cand.out | tr '\n' '|'))"; fi
+
+echo "SDKMAN_RESULT pass=$PASS total=$TOTAL"
+# Gate: all offline assertions passed (4 = bash + version + help + candidate cache).
+V=0; [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "4" ] && V=1
+printf 'SDKMAN_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^SDKMAN_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

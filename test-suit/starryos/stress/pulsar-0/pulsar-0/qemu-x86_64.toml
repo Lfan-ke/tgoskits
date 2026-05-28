@@ -1,0 +1,77 @@
+args = [
+    "-nographic", "-m", "6144M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-pulsar.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-x86_64.path
+# BookKeeper / Pulsar resolve InetAddress.getLocalHost(); without /etc/hosts the
+# musl resolver returns Try again -> UnknownHostException -> bookie init aborts.
+echo '127.0.0.1 starry localhost localhost.localdomain' > /etc/hosts
+# --- Apache Pulsar 3.3.4 LTS standalone on StarryOS ----------------------
+# bin/pulsar standalone = ZK + BookKeeper + broker in single JVM (heavyweight).
+# Override defaults for starry: PULSAR_MEM 2g/4gDirect -> 1g/256mDirect;
+# PULSAR_GC empty (default ZGC needs JIT); JAVA_TOOL_OPTIONS=-Xint (#206).
+# Wait for "messaging service is ready" banner from broker, verify via
+# pulsar-admin clusters list, then kill.
+export PULSAR_HOME=/opt/apache-pulsar-3.3.4
+export PATH=$PULSAR_HOME/bin:$PATH
+export PULSAR_MEM="-Xms256m -Xmx1536m -XX:MaxDirectMemorySize=256m"
+export PULSAR_GC="-XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:-UsePerfData"
+export PULSAR_GC_LOG=""
+# Per subagent BK bytecode analysis (DbLedgerStorage init offset 99): the death
+# point is the WriteCache constructor calling Unpooled.directBuffer(1GB, 1GB) —
+# a single 1 GiB anonymous mmap that BYPASSES Pulsar's OOM listener (Unpooled
+# uses UnpooledByteBufAllocator.DEFAULT, not PulsarByteBufAllocator). On starry
+# with current Direct Memory headroom that allocation may segfault silently or
+# trigger Runtime.halt(1) which loses the log line to flush race.
+# Mitigations: (1) disable Pulsar's halt-on-OOM so any failure logs a real
+# stack trace; (2) capture JVM exit syscall path for proof.
+export PULSAR_EXTRA_OPTS="-Dpulsar.allocator.exit_on_oom=false"
+# Capture JVM crash details (hs_err_pid<pid>.log) when native code segfaults — DbLedgerStorage init
+# silently kills the JVM with no Java exception, indicative of RocksDB JNI crash.
+# Force log4j to flush each record so the very last bookie/RocksDB line reaches
+# disk before any Runtime.halt(). Minimal JVM diagnostic — verbose class-load
+# produces hundreds of thousands of lines and only adds noise.
+export PULSAR_LOG_IMMEDIATE_FLUSH=true
+export JAVA_TOOL_OPTIONS="-Xint -Xmx1536m -Xms256m -Xss1m -XX:ErrorFile=/tmp/hs_err.log -XX:OnError= -XX:OnOutOfMemoryError= -XX:+ExitOnOutOfMemoryError"
+mkdir -p /tmp/pulsar-data
+cd /tmp/pulsar-data
+$PULSAR_HOME/bin/pulsar standalone --wipe-data --no-functions-worker > /tmp/pulsar.out 2>&1 &
+PULSAR_BG_PID=$!
+echo "JVM_PID=$PULSAR_BG_PID"
+PID=$!
+SRV_READY=0
+for i in $(seq 1 1800); do
+  grep -aq "messaging service is ready" /tmp/pulsar.out 2>/dev/null && { SRV_READY=1; break; }
+  grep -aq "PulsarService started" /tmp/pulsar.out 2>/dev/null && { SRV_READY=1; break; }
+  grep -aqE "ERROR|FATAL|Aborted" /tmp/pulsar.out 2>/dev/null && break
+  kill -0 $PID 2>/dev/null || break
+  sleep 1
+done
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+acc "$SRV_READY" "standalone server ready"
+if [ "$SRV_READY" = 1 ]; then
+  grep -q "Current version of pulsar is: 3.3.4" /tmp/pulsar.out && acc 1 "version 3.3.4 banner" || acc 0 "version banner"
+  $PULSAR_HOME/bin/pulsar-admin clusters list > /tmp/cl.out 2>&1
+  grep -q "standalone" /tmp/cl.out && acc 1 "admin clusters -> standalone" || acc 0 "admin clusters"
+  $PULSAR_HOME/bin/pulsar-admin brokers list standalone > /tmp/bl.out 2>&1
+  grep -qE "[a-zA-Z0-9.-]+:[0-9]+" /tmp/bl.out && acc 1 "broker list non-empty" || acc 0 "broker list"
+else
+  echo "=== PULSAR_NOT_READY full pulsar.out ==="; cat /tmp/pulsar.out; echo "=== END pulsar.out ==="
+  echo "=== hs_err.log (JVM native crash, if any) ==="; cat /tmp/hs_err.log 2>/dev/null || echo "(no hs_err.log)"; echo "=== END hs_err ==="
+  echo "=== /tmp/pulsar-data tree ==="; ls -la /tmp/pulsar-data/data/standalone/bookkeeper/current/ 2>/dev/null || true; echo "=== END tree ==="
+fi
+echo "PULSAR_RESULT pass=$PASS total=$TOTAL"
+V=0; [ "$SRV_READY" = 1 ] && [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "4" ] && V=1
+printf 'PULSAR_OK=%s\n' "$V"
+'''
+success_regex = ["(?m)^PULSAR_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 7200

@@ -1,0 +1,40 @@
+# DIAGNOSTIC case (reuses rootfs-x86_64-jdk-multi.img): pinpoint why JDK23 source
+# launcher fails on starry ("Could not find com.sun.tools.javac.launcher.Main in
+# module jdk.compiler") while JDK17/21 work AND while the same JDK23 + command pass
+# on host-Linux (qemu-x86_64-static). Not a tick case — investigation only.
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-jdk-multi.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+ARCH=x86_64
+printf '/lib\n/usr/lib\n/opt/jdk23/lib\n/opt/jdk23/lib/server\n' > /etc/ld-musl-$ARCH.path
+J=/opt/jdk23/bin/java
+export JAVA_TOOL_OPTIONS="-Xint"
+setp()  { printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$1" "$1" > /etc/ld-musl-x86_64.path; }
+ln -sfn /opt/jdk23 /opt/jdk-current
+echo "=== J1: stat via dir symlink (does /opt/jdk-current/... resolve?) ==="
+ls -la /opt/jdk-current/bin/java /opt/jdk-current/lib/server/libjvm.so 2>&1 | head -4
+echo "=== J2: readlink / realpath ==="
+readlink /opt/jdk-current 2>&1; busybox realpath /opt/jdk-current/bin/java 2>&1
+echo "=== J3: cat release via symlink ==="
+head -1 /opt/jdk-current/release 2>&1
+echo "=== J4: java via SYMLINK, ld-path=symlink+real (FULL output) ==="
+printf '/lib\n/usr/lib\n/opt/jdk-current/lib\n/opt/jdk-current/lib/server\n/opt/jdk23/lib\n/opt/jdk23/lib/server\n' > /etc/ld-musl-x86_64.path
+/opt/jdk-current/bin/java -version 2>&1 | head -8
+echo "=== J5: java via REAL path (control, should print 23) ==="
+setp /opt/jdk23; /opt/jdk23/bin/java -version 2>&1 | head -4
+echo "=== J6: java via SYMLINK, ld-path=REAL jdk23 only (isolate symlink-exec) ==="
+setp /opt/jdk23; /opt/jdk-current/bin/java -version 2>&1 | head -6
+echo "=== J7: java via SYMLINK with -verbose to see where it dies ==="
+/opt/jdk-current/bin/java -Xlog:library=info -version 2>&1 | tail -8
+echo "DIAGMEM_DONE"
+'''
+success_regex = ["(?m)^DIAGMEM_DONE"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 600

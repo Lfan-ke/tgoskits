@@ -1,0 +1,102 @@
+args = [
+    "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "8192M", "-smp", "4",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-jdk-multi.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+ARCH=loongarch64
+# PER-JDK musl loader path (root-cause fix, validated host+starry 2026-05-28):
+# A single shared path listing ALL 4 JDK lib dirs makes JDK23/25 mis-resolve their
+# runtime libs to the FIRST entry (jdk17) -> source launcher class mismatch
+# ("Could not find ...launcher.Main" — jdk.compiler renamed it to SourceLauncher in
+# 22+) and empty `java -version`. Set the path to ONLY the JDK about to run, each time.
+LDP=/etc/ld-musl-$ARCH.path
+setp() { printf '/lib
+/usr/lib
+%s/lib
+%s/lib/server
+%s/lib/zero
+' "$1" "$1" "$1" > "$LDP"; }
+setp2() { printf '/lib
+/usr/lib
+%s/lib
+%s/lib/server
+%s/lib/zero
+%s/lib
+%s/lib/server
+%s/lib/zero
+' "$1" "$1" "$1" "$2" "$2" "$2" > "$LDP"; }
+setp /opt/jdk17
+# loongarch64 JDK21/25 are PRE-BAKED as native Alpine musl by prep-jdk-multi-rootfs.sh
+# (glibc+gcompat segfaults the JVM -> verified on REAL Linux 6.18 too, NOT a starry bug;
+#  runtime apk-extract was too slow on emulated loong, so musl is baked at rootfs-build).
+# JDK23 has NO upstream musl for loongarch64 -> documented N/A below.
+# StarryOS JIT is still unstable (#206) -> force interpreter on every JVM.
+export JAVA_TOOL_OPTIONS="-Xint"
+COMMON="-Xint -Xmx512m -Xms64m"
+# --- aggregate gate: emit success token ONLY when PASS==TOTAL (no silent pass) -----
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); else echo "  SUITE FAIL ($2)"; fi; }
+# run one version test (single-file source mode). $1 = major; $2.. = extra java flags.
+vtest() {
+  ver="$1"; shift
+  setp /opt/jdk$ver
+  tag="JDK${ver}_OK"; src="/root/jdkm/Jdk${ver}Features.java"; J="/opt/jdk$ver/bin/java"
+  "$J" $COMMON "$@" "$src" >/tmp/v.out 2>&1
+  if grep -q "^$tag\$" /tmp/v.out; then echo "$tag printed"; acc 1 "$tag"; else echo "$tag MISSING:"; tail -10 /tmp/v.out; acc 0 "$tag"; fi
+}
+echo "=== JDK17 (records/sealed/instanceof-pattern/text-block/switch-expr/Stream.toList) ==="
+vtest 17
+echo "=== JDK21 (virtual threads/record patterns/guarded switch/sequenced collections/Math.clamp) ==="
+vtest 21
+echo "=== JDK23: NO upstream musl for loongarch64; glibc+gcompat segfaults on REAL Linux too -> N/A (documented) ==="
+echo "=== JDK25 (scoped values/module imports/compact headers + StableValue [preview]) ==="
+vtest 25 --enable-preview --source 25
+# compact object headers: prove the JVM accepts the product flag + layout works
+setp /opt/jdk25
+/opt/jdk25/bin/java $COMMON -XX:+UseCompactObjectHeaders --enable-preview --source 25 /root/jdkm/Jdk25Features.java >/tmp/v25c.out 2>&1
+if grep -q 'compact-object-headers flag present = true' /tmp/v25c.out && grep -q '^JDK25_OK$' /tmp/v25c.out; then
+  echo "JDK25 compact-object-headers run OK"; acc 1 JDK25-COMPACT
+else echo "JDK25-COMPACT FAIL:"; tail -10 /tmp/v25c.out; acc 0 JDK25-COMPACT; fi
+# --- version switch: update-alternatives-style (JAVA_HOME + /opt/jdk-current swap) ---
+mkdir -p /etc/alternatives
+echo "=== version switch: REAL update-alternatives (/usr/bin/java -> /etc/alternatives/java -> /opt/jdkN/bin/java) ==="
+SW=0
+for V in 17 21 25; do
+  ln -sfn /opt/jdk$V/bin/java /etc/alternatives/java   # = update-alternatives --set java /opt/jdk$V/bin/java
+  ln -sfn /etc/alternatives/java /usr/bin/java          # the /usr/bin generic name -> alternatives
+  setp /opt/jdk$V                                       # loader path = the selected JDK
+  # $COMMON (incl -Xmx512m -Xms64m) is required: a bare `java -version` (ergonomic heap)
+  # hits "Too small maximum heap" on starry; the rest of this gate passes -Xmx everywhere
+  # for the same reason. grep the 'openjdk version "<major>' line (JTO prints a banner too).
+  RAW=$(/usr/bin/java $COMMON -version 2>&1 | grep -i 'version "' | head -1)
+  echo "  switch->$V : $RAW"
+  echo "$RAW" | grep -q "version \"$V" && SW=$((SW+1)) || echo "    MISMATCH expected $V"
+done
+[ "$SW" = 3 ] && { echo "SWITCH ok=3/3"; acc 1 SWITCH; } || { echo "SWITCH ok=$SW/3"; acc 0 SWITCH; }
+# --- version switch: sdkman-style candidate-dir switch (offline, pre-seeded) ---
+echo "=== version switch: sdkman-style candidate 'sdk use' (offline) ==="
+SD=0; CAND=/root/.sdkman/candidates/java
+for V in 17 21 25; do
+  ln -sfn $CAND/$V-open $CAND/current        # equivalent of: sdk use java $V-open
+  CH=$CAND/current
+  setp2 "$CH" /opt/jdk$V                      # only the selected candidate on the loader path
+  RAW=$("$CH/bin/java" $COMMON -version 2>&1 | grep -i 'version "' | head -1)
+  echo "  sdk-use $V : $RAW"
+  echo "$RAW" | grep -q "version \"$V" && SD=$((SD+1)) || echo "    MISMATCH expected $V"
+done
+[ "$SD" = 3 ] && { echo "SDK-SWITCH ok=3/3"; acc 1 SDK-SWITCH; } || { echo "SDK-SWITCH ok=$SD/3"; acc 0 SDK-SWITCH; }
+# --- aggregate gate ---
+echo "AGGREGATE: PASS=$PASS TOTAL=$TOTAL"
+if [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then V=1; else V=0; fi
+printf 'JDK_MULTI_OK=%s
+' "$V"
+echo "JDK_MULTI_DONE"
+'''
+success_regex = ["(?m)^JDK_MULTI_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 9000
