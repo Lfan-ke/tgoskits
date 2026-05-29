@@ -1,0 +1,52 @@
+# Apache Paimon 1.4.1 (lake-format LIBRARY, flink-1.20 bundle jar) on StarryOS.
+# Item under #764 jdk17+ "java sub deps". paimon-flink-1.20-1.4.1.jar is PURE Java
+# bytecode (arch-independent — one jar runs on all 4 archs' musl OpenJDK17 JRE); sha256
+# c70a60ae...56ea1 (= SOURCES.md, maven-central provenance). It is a LIBRARY, not a
+# daemon — so the single-core smoke is a tiny host-precompiled driver (PaimonSmoke,
+# class file v61 == Java 17) that loads core Paimon classes and builds a trivial table
+# schema. Each assertion proves a distinct slice of paimon-core:
+#   1) DataTypes.INT()/STRING()                       -> paimon-core type module loads + builds primitive types
+#   2) RowType.of(id INT, name STRING) fieldCount==2  -> the columnar RowType assembly (core type system)
+#   3) Schema.newBuilder().column(..).primaryKey("id").build() cols==2 pk==[id] -> the public table-schema API
+# Host-validated on OpenJDK17 (-Xint -Xmx512m): PAIMON_RESULT pass=3 total=3; a
+# -verbose:class trace showed NO jna/oshi/custom-native .so dlopen (only JVM CDS
+# bootstrap natives), 1022 classes total — none of the musl-libjnidispatch hazard the
+# trino case had. -Xint: starry JIT instability (#206). -Xmx512m: explicit sizing
+# (starry under-reports RAM to the JVM ergonomic heap #206); -m 2048M for the guest.
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-paimon.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-loongarch64.path
+# Run the host-precompiled Paimon class-load + schema-build smoke. The driver itself
+# emits "OK/FAIL ..." per assertion and a final "PAIMON_RESULT pass=.. total=..", but
+# NEVER the success token (anti-false-positive: PAIMON_OK is printed ONLY by the gate
+# printf below, and only when every assertion passed).
+PMN=/root/paimon
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx512m \
+  -cp "$PMN/paimon-flink-1.20-1.4.1.jar:$PMN/paimon-smoke.jar" \
+  PaimonSmoke > /tmp/paimon.out 2>&1
+cat /tmp/paimon.out
+# Aggregate gate: re-derive PASS/TOTAL from the driver's own per-assertion lines with the
+# etcd-0 acc() pattern, so the shell independently confirms 3/3 (no trust in a single line).
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+grep -q '^OK   DataTypes' /tmp/paimon.out && acc 1 "DataTypes.INT()/STRING()" || acc 0 "DataTypes.INT()/STRING()"
+grep -q '^OK   RowType'   /tmp/paimon.out && acc 1 "RowType.of(id,name)"      || acc 0 "RowType.of(id,name)"
+grep -q '^OK   Schema'    /tmp/paimon.out && acc 1 "Schema.newBuilder()"      || acc 0 "Schema.newBuilder()"
+echo "PAIMON_RESULT pass=$PASS total=$TOTAL"
+# Emit success token ONLY when all 3 assertions passed AND the driver agreed (pass=3).
+V=0; [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "3" ] && grep -q '^PAIMON_RESULT pass=3 total=3$' /tmp/paimon.out && V=1
+printf 'PAIMON_OK=%s\n' "$V"
+echo "PAIMON_DONE"
+'''
+success_regex = ["(?m)^PAIMON_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

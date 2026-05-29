@@ -1,0 +1,71 @@
+# Consul v1.22.7 (HashiCorp, Go, statically-linked ELF, no libc/interp -> ideal for starry) on StarryOS.
+# Service-mesh / service-discovery daemon under #764 jdk17+ "sub deps" (java sub-dep "consul" #259).
+# The single `consul` binary is a FULLY STATIC, CGO-disabled Go ELF (verified `file`:
+# ARM aarch64, statically linked, no interpreter) staged into /usr/local/bin by
+# prep-consul-rootfs.sh. NO libc/ld-musl wiring needed; Go runtime gets entropy via
+# getrandom(2) and parks goroutines via futex (both provided by starry).
+#
+# Provenance: official HashiCorp release consul_1.22.7_linux_arm64.zip
+#   sha256 db54c5fb7c5ceaef97a38ca45dcc0f649ff592a48c73ab320e2d535c78e136cc
+# Host-validated on the AMD64 sibling binary (same release, same version string):
+# `consul version` -> "Consul v1.22.7"; `consul agent -dev -bind=127.0.0.1
+# -node=starrynode` reaches "Consul agent running!"; `consul members` lists node
+# "starrynode" as "alive  server  1.22.7". The aarch64 binary is byte-for-byte the
+# same Go program cross-compiled for arm64 (only first-arch qemu run can confirm).
+#
+# WHAT EACH ASSERTION PROVES:
+#   1) version probe  -> the static Go ELF loads + runs + reports the EXACT version 1.22.7
+#      (drives the Go runtime: ELF load, TLS setup, getrandom entropy). A wrong version
+#      FAILS the gate (a mismatched binary is an invalid test).
+#   2) agent ready     -> a full in-memory single-node dev agent comes up: embedded raft
+#      (BoltDB-backed state store), serf LAN gossip, gRPC + HTTP + DNS listeners on
+#      loopback. Exercises goroutine scheduling, futex, mmap, loopback TCP/UDP bind.
+#   3) members shows node -> the consul HTTP/RPC client path round-trips to the running
+#      agent over loopback and the node "starrynode" is reported "alive" -- proves the
+#      agent is not merely started but actually serving the catalog API.
+args = [
+    "-nographic", "-m", "3072M", "-cpu", "cortex-a72", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-consul.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+CONSUL=/usr/local/bin/consul
+# 1) consul binary runs (pure static ELF) + EXACT version v1.22.7.
+$CONSUL version > /tmp/cv.out 2>&1
+grep -q 'Consul v1.22.7' /tmp/cv.out && acc 1 "consul version v1.22.7" || { acc 0 "consul version"; tail -3 /tmp/cv.out; }
+# 2) single-node in-memory dev agent on loopback; wait for "Consul agent running!".
+$CONSUL agent -dev -bind=127.0.0.1 -client=127.0.0.1 -node=starrynode \
+  -data-dir=/tmp/consul.d > /tmp/agent.out 2>&1 &
+APID=$!
+RDY=0; i=0; while [ $i -lt 90 ]; do grep -q 'Consul agent running!' /tmp/agent.out 2>/dev/null && { RDY=1; break; }; kill -0 "$APID" 2>/dev/null || break; i=$((i+1)); sleep 2; done
+acc "$RDY" "consul dev agent running (loopback)"
+# 3) members lists node "starrynode" alive (client RPC round-trip over loopback).
+if [ "$RDY" = 1 ]; then
+  sleep 3
+  $CONSUL members > /tmp/members.out 2>&1
+  if grep -q 'starrynode' /tmp/members.out && grep -q 'alive' /tmp/members.out; then
+    acc 1 "consul members shows starrynode alive"; grep 'starrynode' /tmp/members.out
+  else
+    acc 0 "consul members"; tail -5 /tmp/members.out
+  fi
+else
+  echo "  agent not ready:"; tail -12 /tmp/agent.out
+fi
+kill $APID 2>/dev/null; kill -9 $APID 2>/dev/null
+# aggregate gate: emit success token ONLY when every assertion passed (no silent pass).
+echo "CONSUL_RESULT pass=$PASS total=$TOTAL"
+V=0; [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "3" ] && V=1
+printf 'CONSUL_OK=%s\n' "$V"
+echo "CONSUL_DONE"
+'''
+success_regex = ["(?m)^CONSUL_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

@@ -1,0 +1,97 @@
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-juicefs.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === juicefs 1.3.1 format + meta round-trip on StarryOS x86_64 (#764 "juicefs" / #259) ===
+# `juicefs` is a SINGLE, FULLY-STATIC Go/CGO-musl binary injected at /usr/local/bin by
+# prep-juicefs-rootfs.sh -- no libc/ld-musl/gcompat wiring needed (readelf: no INTERP,
+# no NEEDED; `file`: statically linked). x86_64 is the OFFICIAL juicedata release.
+# Provenance + sha256: golang-bins/SOURCES.md §1.3/§2 (amd64 sha256
+# eb67a7be5d174b420cb3734d441971b3a462ab522b78ad2a6ed993e7deddcd44).
+#
+# WHY format/status (NOT mount): juicefs is a FUSE filesystem; a real `mount` needs a
+# working /dev/fuse node + kernel FUSE support, which StarryOS does not provide. The
+# DoD smoke therefore exercises the non-FUSE control path that still drives the full
+# meta engine + object-store layout + Go runtime (M:N scheduler, GC, futex) + the
+# mattn/go-sqlite3 CGO path. Four assertions (all must pass; NO silent pass):
+#   VER_OK    : `juicefs version` reports EXACTLY 1.3.1 (red-line; wrong version = invalid test).
+#   FMT_OK    : `juicefs format` with a sqlite3 meta + local "file" object store succeeds,
+#               printing the "Volume is formatted as {...}" block with our volume NAME + a UUID.
+#   RT_OK     : `juicefs status <sqlite3-meta>` reads the volume back and reports the SAME
+#               UUID + NAME -> a genuine meta WRITE->READ round-trip (the juicefs analogue of
+#               etcd put/get). Proves the sqlite3 cgo store persisted + reloaded correctly.
+#   BADGER_OK : a SECOND, independent embedded-KV meta engine (badger -- pure file-backed,
+#               no network, no sqlite) formats + round-trips its own UUID/NAME. Proves the
+#               non-sqlite meta path + badger's own mmap/WAL on StarryOS.
+# Entropy via getrandom(2); meta + object store live under /tmp (writable scratch fs).
+export PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+JFS=/usr/local/bin/juicefs
+WORK=/tmp/jfs
+rm -rf "$WORK"; mkdir -p "$WORK/store" "$WORK/bstore"
+VER_OK=0; FMT_OK=0; RT_OK=0; BADGER_OK=0
+
+# --- VER_OK: assert the EXACT version 1.3.1 (red-line) ---
+echo "=== juicefs version ==="
+$JFS version > "$WORK/jfs.ver" 2>&1
+cat "$WORK/jfs.ver"
+if grep -qE '^juicefs version 1\.3\.1\b' "$WORK/jfs.ver"; then VER_OK=1; else echo "  VERSION MISMATCH (want 1.3.1)"; fi
+
+# --- FMT_OK: format a volume with sqlite3 meta + local file object store ---
+SQ_META="sqlite3://$WORK/sq.db"
+echo "=== juicefs format (sqlite3 meta + file storage) ==="
+$JFS format --storage file --bucket "$WORK/store" "$SQ_META" starryvol > "$WORK/fmt.out" 2>&1
+FMT_RC=$?
+tail -6 "$WORK/fmt.out"
+UUID=$(grep -oE '"UUID": "[0-9a-f-]{36}"' "$WORK/fmt.out" | head -1 | grep -oE '[0-9a-f-]{36}')
+if [ "$FMT_RC" = 0 ] && grep -q 'Volume is formatted as' "$WORK/fmt.out" \
+   && grep -q '"Name": "starryvol"' "$WORK/fmt.out" && [ -n "$UUID" ]; then
+  FMT_OK=1; echo "  FMT_OK uuid=$UUID"
+else
+  echo "  FORMAT FAILED rc=$FMT_RC (look for sqlite/cgo/mmap/getrandom errors above)"
+fi
+
+# --- RT_OK: status reads the volume back from meta -> same UUID + NAME ---
+echo "=== juicefs status (sqlite3 meta read-back == round-trip) ==="
+$JFS status "$SQ_META" > "$WORK/st.out" 2>&1
+ST_RC=$?
+grep -E '"Name"|"UUID"' "$WORK/st.out" | head -2
+SUUID=$(grep -oE '"UUID": "[0-9a-f-]{36}"' "$WORK/st.out" | head -1 | grep -oE '[0-9a-f-]{36}')
+if [ "$ST_RC" = 0 ] && [ -n "$UUID" ] && [ "$UUID" = "$SUUID" ] && grep -q '"Name": "starryvol"' "$WORK/st.out"; then
+  RT_OK=1; echo "  RT_OK (uuid round-tripped: $UUID)"
+else
+  echo "  ROUND-TRIP MISMATCH rc=$ST_RC fmt_uuid=$UUID status_uuid=$SUUID"
+fi
+
+# --- BADGER_OK: second independent meta engine (embedded KV, no network, no sqlite) ---
+BG_META="badger://$WORK/bdb"
+echo "=== juicefs format + status (badger embedded meta) ==="
+$JFS format --storage file --bucket "$WORK/bstore" "$BG_META" badgervol > "$WORK/bfmt.out" 2>&1
+BG_RC=$?
+BUUID=$(grep -oE '"UUID": "[0-9a-f-]{36}"' "$WORK/bfmt.out" | head -1 | grep -oE '[0-9a-f-]{36}')
+$JFS status "$BG_META" > "$WORK/bst.out" 2>&1
+BST_RC=$?
+BSUUID=$(grep -oE '"UUID": "[0-9a-f-]{36}"' "$WORK/bst.out" | head -1 | grep -oE '[0-9a-f-]{36}')
+echo "  badger fmt_rc=$BG_RC status_rc=$BST_RC uuid=$BUUID"
+if [ "$BG_RC" = 0 ] && [ "$BST_RC" = 0 ] && [ -n "$BUUID" ] && [ "$BUUID" = "$BSUUID" ] \
+   && grep -q '"Name": "badgervol"' "$WORK/bst.out"; then
+  BADGER_OK=1; echo "  BADGER_OK (uuid round-tripped: $BUUID)"
+else
+  echo "  BADGER engine FAILED rc=$BG_RC/$BST_RC"; tail -8 "$WORK/bfmt.out"
+fi
+
+PASS=0; TOTAL=4
+for v in $VER_OK $FMT_OK $RT_OK $BADGER_OK; do PASS=$((PASS+v)); done
+echo "JUICEFS_RESULT pass=$PASS total=$TOTAL (VER=$VER_OK FMT=$FMT_OK RT=$RT_OK BADGER=$BADGER_OK)"
+if [ "$PASS" = "$TOTAL" ]; then V=1; else V=0; fi; printf 'JUICEFS_OK=%s\n' "$V"
+echo "JUICEFS_DONE"
+'''
+success_regex = ["(?m)^JUICEFS_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200

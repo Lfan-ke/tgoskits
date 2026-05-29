@@ -1,0 +1,80 @@
+# minio object-storage server (Go, statically-linked ELF, embedded Console UI baked in,
+# no libc/interp -> ideal for starry) on StarryOS aarch64. #764 大应用 "minio".
+# Binary: OFFICIAL dl.min.io linux-arm64 (sha256 5c83cd..f03d), `file`: ARM aarch64,
+# statically linked, stripped; injected at /usr/bin/minio by prep-minio-rootfs.sh.
+# Test logic is byte-identical to qemu-x86_64.toml (host-validated on native x86_64);
+# the binary is cross-arch so it can't be executed on the x86_64 host -- this arch
+# is confirmed only by `file`/`strings` (static ARM aarch64, embeds RELEASE.2025-09-07)
+# and runs for real only under qemu-aarch64 starry.
+# Assertions (3): (1) VER red-line `minio --version` carries the EXACT release date
+# THIS arch ships (official arm64 = 2025-09-07; NOT fake-uniform vs the self-built
+# rv/loong 2025-10-15 -- see CASE-NOTES §"minio version red-line"); (2) the server
+# reaches its "MinIO Object Storage Server" startup banner (backend init over the
+# local data dir + bind on loopback succeeded -- Go M:N sched / concurrent GC /
+# futex park / getrandom(2) all exercised); (3) the built-in health endpoint
+# GET http://127.0.0.1:9000/minio/health/live returns HTTP 200 over loopback
+# net/http. DoD = all three pass (no silent pass; gate anchors ^MINIO_OK=1).
+args = [
+    "-nographic", "-m", "4096M", "-cpu", "cortex-a72", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-minio.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+# Per-arch release date THIS binary actually carries (official arm64 = 2025-09-07).
+MINIO_VER=2025-09-07
+export PATH=/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+export MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin MINIO_BROWSER=off
+MINIO=/usr/bin/minio
+ADDR=127.0.0.1:9000
+DATA=/tmp/minio-data
+rm -rf "$DATA"; mkdir -p "$DATA" /root/.minio
+# 1) VERSION RED-LINE: minio runs as a pure static ELF AND carries the exact release.
+echo "=== minio --version ==="
+$MINIO --version > /tmp/minio.ver 2>&1
+cat /tmp/minio.ver
+grep -q "RELEASE\\.$MINIO_VER" /tmp/minio.ver && acc 1 "minio --version RELEASE.$MINIO_VER" || { acc 0 "minio --version (want RELEASE.$MINIO_VER)"; tail -3 /tmp/minio.ver; }
+# 2) headless single-node server on loopback; wait for the startup banner.
+$MINIO server "$DATA" --address "$ADDR" --console-address 127.0.0.1:9001 > /tmp/minio.log 2>&1 &
+MPID=$!
+echo "  minio launched pid=$MPID"
+RDY=0; i=0; while [ $i -lt 90 ]; do
+  grep -q 'MinIO Object Storage Server' /tmp/minio.log 2>/dev/null && { RDY=1; break; }
+  kill -0 "$MPID" 2>/dev/null || { echo "  minio exited before banner"; break; }
+  i=$((i+1)); sleep 1
+done
+acc "$RDY" "minio server startup banner (backend init + loopback bind)"
+# 3) health/live probe over loopback net/http -> HTTP 200.
+# busybox wget exits 0 ONLY on a 2xx (non-zero on 4xx/5xx), so a clean exit IS the
+# 200 (endpoint has no body); we also grep the -S header dump as a backup.
+LIVE=0
+if [ "$RDY" = 1 ]; then
+  j=0; while [ $j -lt 30 ]; do
+    if wget -q -S -O /dev/null "http://$ADDR/minio/health/live" 2>/tmp/live.hdr; then LIVE=1; break; fi
+    grep -qE 'HTTP/1\.[01] 200' /tmp/live.hdr 2>/dev/null && { LIVE=1; break; }
+    kill -0 "$MPID" 2>/dev/null || break
+    j=$((j+1)); sleep 1
+  done
+fi
+if [ "$LIVE" = 1 ]; then acc 1 "health/live -> HTTP 200 (loopback)"; grep -E 'HTTP/1\.[01]' /tmp/live.hdr | head -1; else
+  acc 0 "health/live (no 200 on http://$ADDR/minio/health/live)"
+  echo "  last health headers:"; cat /tmp/live.hdr 2>/dev/null | head -5
+  echo "=== minio.log (look for socket/bind/listen/futex/getrandom/mmap/fsync errors) ==="
+  tail -30 /tmp/minio.log 2>/dev/null
+fi
+kill "$MPID" 2>/dev/null; kill -9 "$MPID" 2>/dev/null
+# aggregate gate: emit success token ONLY when every assertion passed (no silent pass).
+echo "MINIO_RESULT pass=$PASS total=$TOTAL"
+V=0; [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "3" ] && V=1
+printf 'MINIO_OK=%s\n' "$V"
+echo "MINIO_DONE"
+'''
+success_regex = ["(?m)^MINIO_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200

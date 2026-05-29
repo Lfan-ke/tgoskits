@@ -1,0 +1,65 @@
+# Apache Iceberg 1.11.0 (Spark 3.5 runtime jar) — table-format LIBRARY on StarryOS.
+# Sub-dep under #764 jdk17+ "大应用". Iceberg ships ONLY as a library jar
+# (iceberg-spark-runtime-3.5_2.12-1.11.0.jar, sha256 94b8e36f..., 16844 org.apache.iceberg
+# classes); there is no standalone iceberg daemon. The single-core smoke therefore drives the
+# core library directly on the musl OpenJDK17 JVM: load org.apache.iceberg.Schema +
+# org.apache.iceberg.types.Types, build an in-memory Iceberg Schema (3 typed NestedFields),
+# and introspect it. Pure in-JVM compute — NO catalog / filesystem / network is touched.
+#
+# The driver /root/iceberg/IcebergSmoke.java runs in Java 17 single-file source-code mode
+# (`java -cp <jar> IcebergSmoke.java`): the guest JVM compiles it to its own bytecode level,
+# so there is no precompiled .class and no class-file-version skew. -Xint because starry JIT
+# is unstable (#206); -Xmx2048m for explicit sizing (starry ergonomic heap under-reports RAM
+# #206); arch-independent jar -> same jar on all 4 archs, only ld-musl path differs per arch.
+#
+# Host-validated on OpenJDK 17.0.18 (-Xint, jar on cp): the driver prints exactly
+#   OK   load org.apache.iceberg.Schema
+#   OK   load org.apache.iceberg.types.Types
+#   OK   build in-memory Schema (3 fields)
+#   OK   schema introspection (3 cols, findField id/name)
+#   ICEBERG_RESULT pass=4 total=4 / ICEBERG_OK=1 / ICEBERG_DONE
+#
+# What each assertion proves:
+#   1. Schema class loads               -> the 46M shaded runtime jar is on classpath & readable
+#   2. Types factory class loads        -> the type system (LongType/StringType/TimestampType) is wired
+#   3. build in-memory Schema           -> the public Iceberg constructor + NestedField API actually run
+#   4. schema introspection             -> the built object is real (3 columns, findField by name & id)
+# DoD = all 4 pass (ICEBERG_RESULT pass=4 total=4) AND the driver reaches ICEBERG_DONE.
+args = [
+    "-nographic", "-m", "2048M", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-iceberg.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+printf '/lib\n/usr/lib\n%s/lib\n%s/lib/server\n' "$JAVA_HOME" "$JAVA_HOME" > /etc/ld-musl-x86_64.path
+JAR=/root/iceberg/iceberg-spark-runtime-3.5_2.12-1.11.0.jar
+SRC=/root/iceberg/IcebergSmoke.java
+# Run the Iceberg smoke driver (single-file source mode -> guest JVM compiles + runs it).
+$JAVA_HOME/bin/java -Xint -Xms64m -Xmx2048m -cp "$JAR" "$SRC" > /tmp/iceberg.out 2>&1
+cat /tmp/iceberg.out
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "OK   $2"; else echo "FAIL $2"; fi; }
+# Re-derive the gate in shell from the driver's own per-assertion OK lines (defence in depth):
+grep -q '^OK   load org.apache.iceberg.Schema$'                  /tmp/iceberg.out && acc 1 "Schema class loaded"        || acc 0 "Schema class loaded"
+grep -q '^OK   load org.apache.iceberg.types.Types$'             /tmp/iceberg.out && acc 1 "Types class loaded"         || acc 0 "Types class loaded"
+grep -q '^OK   build in-memory Schema (3 fields)$'               /tmp/iceberg.out && acc 1 "in-memory Schema built"     || acc 0 "in-memory Schema built"
+grep -q '^OK   schema introspection (3 cols, findField id/name)$' /tmp/iceberg.out && acc 1 "schema introspection"      || acc 0 "schema introspection"
+echo "ICEBERG_RESULT pass=$PASS total=$TOTAL"
+# Gate: all 4 shell assertions passed AND the driver itself reported pass=4 total=4 AND reached
+# ICEBERG_DONE. The ICEBERG_OK=1 success token is emitted ONLY here (no silent pass): the driver
+# prints ICEBERG_OK=<0|1> internally, but the success_regex anchors on THIS final printf.
+V=0
+[ "$PASS" = "$TOTAL" ] && [ "$TOTAL" = "4" ] \
+  && grep -q '^ICEBERG_RESULT pass=4 total=4$' /tmp/iceberg.out \
+  && grep -q '^ICEBERG_DONE$' /tmp/iceberg.out && V=1
+printf 'ICEBERG_OK=%s\n' "$V"
+echo "ICEBERG_FINISHED"
+'''
+success_regex = ["(?m)^ICEBERG_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1800

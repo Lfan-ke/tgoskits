@@ -1,0 +1,97 @@
+args = [
+    "-nographic", "-m", "2048M", "-cpu", "cortex-a72", "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-prometheus.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+# === prometheus 3.11.3 headless server + PromQL/API correctness on StarryOS aarch64 ===
+# (#764 monitor sub-课题 "p8s" (#246))
+# `prometheus` is a FULLY STATIC, CGO-disabled Go binary (file: "statically linked",
+# tags=netgo,builtinassets => web UI embedded) injected at /usr/local/bin by
+# prep-prometheus-rootfs.sh -- no libc/ld-musl wiring needed. We launch the server
+# headless on loopback :9090 with a writable TSDB under /tmp, then exercise the REAL
+# web/API path with busybox wget:
+#   /-/ready    -> "Prometheus Server is Ready."        (HTTP serving + TSDB up)
+#   /api/v1/query?query=vector(42) -> {"status":"success",...,"42"]}  (PromQL engine)
+# This drives the Go runtime (M:N scheduler, concurrent GC, futex parking, getrandom),
+# the TSDB head/WAL on the ext4 image, and the net stack (socket/bind/listen/accept on
+# loopback). The version token + the two API round-trips are all that gate the case.
+#
+# Three assertions, PASS/TOTAL acc() gate (NO silent pass):
+#   VER_OK   -- prometheus --version reports EXACTLY 3.11.3 (red-line; wrong version = invalid test).
+#   READY_OK -- log emits "Server is ready to receive web requests." AND /-/ready answers "Ready".
+#   QUERY_OK -- /api/v1/query evaluates vector(42) and returns the value "42" (PromQL round-trip).
+# VERSION RED-LINE: all 4 arches ship 3.11.3 (official amd64/arm64/riscv64 + self-cross-
+# compiled loong64 per monitor-bins/SOURCES.md §1). A mismatch FAILS the gate.
+export PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+export HOME=/root
+PROM=/usr/local/bin/prometheus
+CFG=/etc/prometheus.yml
+TSDB=/tmp/prom
+EP=127.0.0.1:9090
+rm -rf "$TSDB"; mkdir -p "$TSDB"
+
+PASS=0; TOTAL=0
+acc() { TOTAL=$((TOTAL+1)); if [ "$1" = 1 ]; then PASS=$((PASS+1)); echo "  [PASS] $2"; else echo "  [FAIL] $2"; fi; }
+
+# --- VER_OK: assert the EXACT version 3.11.3 (red-line) ---
+echo "=== prometheus --version ==="
+$PROM --version > /tmp/prom.ver 2>&1
+cat /tmp/prom.ver
+VER_OK=0
+if grep -qE '^prometheus, version 3\.11\.3 ' /tmp/prom.ver; then VER_OK=1; else echo "  VERSION MISMATCH (want 3.11.3)"; fi
+acc "$VER_OK" "prometheus --version == 3.11.3"
+
+# --- launch the server headless on loopback :9090 ---
+$PROM --config.file="$CFG" \
+      --web.listen-address="$EP" \
+      --storage.tsdb.path="$TSDB" \
+      --web.enable-lifecycle > /tmp/prom.log 2>&1 &
+PPID_=$!
+echo "  prometheus launched pid=$PPID_"
+
+# --- wait for readiness: log token first, then poll /-/ready over HTTP ---
+READY_OK=0; i=0
+while [ "$i" -lt 90 ]; do
+  if grep -q 'Server is ready to receive web requests' /tmp/prom.log 2>/dev/null; then
+    if wget -q -T 3 -O /tmp/ready.out "http://$EP/-/ready" 2>/dev/null; then
+      grep -qi 'Ready' /tmp/ready.out && { READY_OK=1; break; }
+    fi
+  fi
+  kill -0 "$PPID_" 2>/dev/null || { echo "  prometheus exited before serving"; break; }
+  i=$((i+1)); sleep 1
+done
+echo "  /-/ready: [$(cat /tmp/ready.out 2>/dev/null)]"
+acc "$READY_OK" "log 'Server is ready' + /-/ready answers Ready"
+
+# --- QUERY_OK: PromQL engine round-trips a known scalar through /api/v1/query ---
+QUERY_OK=0
+if [ "$READY_OK" = 1 ]; then
+  wget -q -T 5 -O /tmp/q.out "http://$EP/api/v1/query?query=vector(42)" 2>/dev/null
+  echo "  query: [$(cat /tmp/q.out 2>/dev/null)]"
+  if grep -q '"status":"success"' /tmp/q.out 2>/dev/null && grep -q '"42"' /tmp/q.out 2>/dev/null; then
+    QUERY_OK=1
+  else
+    echo "  QUERY MISMATCH (want status=success + value 42)"
+  fi
+else
+  echo "=== prom.log tail (look for socket/bind/futex/getrandom/mmap errors) ==="
+  tail -30 /tmp/prom.log 2>/dev/null
+fi
+acc "$QUERY_OK" "/api/v1/query vector(42) -> 42"
+
+# --- stop the server ---
+kill "$PPID_" 2>/dev/null
+kill -9 "$PPID_" 2>/dev/null
+
+echo "PROM_RESULT pass=$PASS total=$TOTAL"
+if [ "$PASS" = "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then V=1; else V=0; fi; printf 'PROM_OK=%s\n' "$V"
+echo "PROM_DONE"
+'''
+success_regex = ["(?m)^PROM_OK=1"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 1200
