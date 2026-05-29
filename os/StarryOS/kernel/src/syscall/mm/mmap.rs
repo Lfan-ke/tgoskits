@@ -765,17 +765,37 @@ pub fn sys_madvise(addr: usize, length: usize, advice: i32) -> AxResult<isize> {
         _ => return Err(AxError::InvalidInput),
     }
 
+    // man 2 madvise: addr must be page-aligned.
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
     }
 
-    if length > 0 {
-        let curr = current();
-        let aspace_arc = curr.as_thread().proc_data.aspace();
-        let aspace = aspace_arc.lock();
-        if aspace.find_area(VirtAddr::from(addr)).is_none() {
-            return Err(AxError::NoMemory);
+    if length == 0 {
+        return Ok(0);
+    }
+
+    let curr = current();
+    let aspace_arc = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_arc.lock();
+
+    // man 2 madvise EINVAL/ENOMEM: the range must lie in a mapping.
+    if aspace.find_area(VirtAddr::from(addr)).is_none() {
+        return Err(AxError::NoMemory);
+    }
+
+    // MADV_DONTNEED: drop the pages now; next access re-faults to a fresh zero
+    // page (anon) / re-read (file CoW). MADV_FREE is lazy in Linux but a
+    // synchronous drop is a correct, conservative implementation (per man 2
+    // madvise the app must not rely on stale contents after MADV_FREE).
+    // Go's runtime relies on this to return idle heap spans — without it the
+    // committed working set grows until OOM. DONTNEED_LOCKED behaves like
+    // DONTNEED here (we do not honor mlock).
+    match advice as u32 {
+        MADV_DONTNEED | MADV_FREE | MADV_DONTNEED_LOCKED => {
+            let length = align_up_4k(length);
+            aspace.discard_range(VirtAddr::from(addr), length)?;
         }
+        _ => {}
     }
 
     Ok(0)
