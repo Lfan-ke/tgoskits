@@ -225,11 +225,28 @@ pub fn sys_setsockopt(
         // broke the Tomcat acceptor with "Error setting socket options: Protocol
         // not available". Accept + ignore: SO_LINGER (struct linger; default close),
         // SO_OOBINLINE (urgent-data inline), IP_TOS (QoS hint).
-        use linux_raw_sys::net::{IP_TOS, SOL_SOCKET, SO_LINGER, SO_OOBINLINE};
+        use linux_raw_sys::net::{
+            IP_MTU_DISCOVER, IP_PKTINFO, IP_RECVTOS, IP_TOS, SOL_SOCKET, SO_LINGER, SO_OOBINLINE,
+            SO_REUSEPORT,
+        };
 
+        // Advisory options a minimal (smoltcp) stack cannot act on but that Linux
+        // accepts; returning ENOPROTOOPT aborts servers that set them and treat
+        // failure as fatal. SO_LINGER/SO_OOBINLINE/IP_TOS were for Tomcat. Added
+        // for Go servers: IP_PKTINFO (consul's DNS via miekg/dns asks for the
+        // packet dest-IP control message — on single-homed loopback ignoring is
+        // correct, the app falls back to the bound address), IP_RECVTOS, the
+        // path-MTU-discovery hint IP_MTU_DISCOVER, and SO_REUSEPORT (single
+        // process → one socket gets all traffic, which is the intended effect).
         if matches!(
             (level, optname),
-            (SOL_SOCKET, SO_LINGER) | (SOL_SOCKET, SO_OOBINLINE) | (PROTO_IP, IP_TOS)
+            (SOL_SOCKET, SO_LINGER)
+                | (SOL_SOCKET, SO_OOBINLINE)
+                | (SOL_SOCKET, SO_REUSEPORT)
+                | (PROTO_IP, IP_TOS)
+                | (PROTO_IP, IP_PKTINFO)
+                | (PROTO_IP, IP_RECVTOS)
+                | (PROTO_IP, IP_MTU_DISCOVER)
         ) {
             return Ok(0);
         }

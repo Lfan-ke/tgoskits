@@ -458,6 +458,26 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
+        // Legacy getrlimit/setrlimit (x86_64 #97/#160; the generic ABI used by
+        // riscv64/loongarch64 has prlimit64 only). On x86_64/aarch64 `struct
+        // rlimit` is layout-identical to `rlimit64` (two u64 fields), so route
+        // them through prlimit64 with pid=0 (== current process). Go's syscall
+        // package invokes the legacy getrlimit directly (consul/minio/etc.),
+        // which previously fell to the ENOSYS catch-all and aborted the agent.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::getrlimit => sys_prlimit64(
+            0,
+            uctx.arg0() as _,
+            core::ptr::null(),
+            uctx.arg1() as _,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        Sysno::setrlimit => sys_prlimit64(
+            0,
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            core::ptr::null_mut(),
+        ),
         Sysno::capget => sys_capget(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::capset => sys_capset(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::umask => sys_umask(uctx.arg0() as _),
