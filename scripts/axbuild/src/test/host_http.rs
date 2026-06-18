@@ -24,7 +24,6 @@ const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// guest). The timeout must therefore be generous enough not to abort a
 /// legitimately progressing transfer, yet finite so a wedged guest cannot block
 /// the server thread (and thus `Drop`/`join`) forever.
-const BODY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 const MIN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
