@@ -25,6 +25,10 @@ const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// legitimately progressing transfer, yet finite so a wedged guest cannot block
 /// the server thread (and thus `Drop`/`join`) forever.
 const BODY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(1);
+const MIN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
+const MIN_WRITE_BYTES_PER_SEC: usize = 128 * 1024;
 
 pub(crate) struct HostHttpServerGuard {
     stop: Arc<AtomicBool>,
@@ -134,6 +138,13 @@ impl HostHttpBody {
             },
             None => Self::Static(config.body.as_bytes().to_vec()),
         })
+    }
+
+    fn write_timeout(&self) -> Duration {
+        let transfer_secs = self.len().div_ceil(MIN_WRITE_BYTES_PER_SEC) as u64;
+        Duration::from_secs(
+            transfer_secs.clamp(MIN_WRITE_TIMEOUT.as_secs(), MAX_WRITE_TIMEOUT.as_secs()),
+        )
     }
 
     fn len(&self) -> usize {
