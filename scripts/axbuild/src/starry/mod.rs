@@ -569,7 +569,20 @@ impl Starry {
                 qemu::qemu_timeout_summary(&qemu)
             );
             println!("  rootfs: {}", rootfs_path.display());
-            return self.run_qemu_artifact(&request, cargo, qemu).await;
+            // Start a [host_http_server] (if configured) before booting; keep the
+            // guard alive across the run so e.g. an online pip/uv install can hit
+            // a local wheel index at 10.0.2.2:PORT over real TCP.
+            let _host_http_server = test_case
+                .host_http_server
+                .as_ref()
+                .map(|config| {
+                    crate::test::host_http::HostHttpServerGuard::start(config, &test_case.name)
+                })
+                .transpose()?;
+            return self
+                .app
+                .qemu(cargo, request.build_info_path, Some(qemu))
+                .await;
         }
         let rootfs_path = crate::image::storage::resolve_explicit_rootfs(
             self.app.workspace_root(),
