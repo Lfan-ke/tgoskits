@@ -1,0 +1,26 @@
+# dnsmasq x86_64: the DNS/DHCP/TFTP carpet over loopback. prebuild.sh stages the
+# dnsmasq and tftp-hpa files pinned in apk.lock and grows the rootfs to 1.5G.
+args = [
+    "-nographic",
+    "-m",
+    "1024M",
+    "-smp",
+    "1",
+    "-device",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/target/axbuild/rootfs/rootfs-x86_64-alpine.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0",
+]
+uefi = true
+to_bin = true
+fail_regex = ["(?i)\\bpanic(?:ked)?\\b", "(?m)^TEST FAILED\\s*$"]
+timeout = 1800
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = "/usr/bin/run-dnsmasq.sh"
+success_regex = ["(?m)^TEST PASSED\\s*$"]

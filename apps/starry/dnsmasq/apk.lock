@@ -1,0 +1,12 @@
+# Alpine packages staged by prebuild.sh, which fetches exactly these files and checks
+# each sha256. Written by update-apk-lock.sh; regenerate rather than edit.
+branch v3.23
+# arch       repo      package   version   sha256
+x86_64       main      dnsmasq   2.91-r1   905ba0cdf2d6c30beed3c3e597765206f52f11a70d2dcae843d2572ec6e89768
+x86_64       main      tftp-hpa  5.2-r7    e1e3cc869578c0853405ccfd009880fc969eedbb4dbca4a5db0897d5cea4a908
+aarch64      main      dnsmasq   2.91-r1   ee0643977bc4db3ca618d3bca6ec31d1cecd28b3fc911f5cc9f2f434c299d83a
+aarch64      main      tftp-hpa  5.2-r7    48cd4882f848525040e2b19761ae0e6b6608ab1f332097e85a2e5acd54cb8435
+riscv64      main      dnsmasq   2.91-r1   49a30c7354da18f80c2ae689027a6f535d6ee8e9540ea3c58966884fcad7ae9e
+riscv64      main      tftp-hpa  5.2-r7    b672da634d89f42a6134f342b982641397769fe621e9d5f52a117051cab9a9ed
+loongarch64  main      dnsmasq   2.91-r1   365c73cc692f8b9deb9f07bf5cdaee9cf429083f97ed1fda31722cabe6b8acac
+loongarch64  main      tftp-hpa  5.2-r7    0a65f3ee454893e9146d7923436449f940be91f7c38179f07cbac977e1418adf
