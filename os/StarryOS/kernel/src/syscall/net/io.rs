@@ -10,7 +10,7 @@ use ax_runtime::hal::time::wall_time;
 use linux_raw_sys::{
     general::timespec,
     net::{
-        IP_TOS, IPPROTO_IPV6, IPV6_TCLASS, MSG_DONTWAIT, MSG_PEEK, MSG_TRUNC, SCM_RIGHTS,
+        IP_TOS, IPPROTO_IPV6, IPV6_TCLASS, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SCM_RIGHTS,
         SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
     },
 };
@@ -213,6 +213,9 @@ fn recv_impl(
     }
     if flags & MSG_DONTWAIT != 0 {
         recv_flags |= RecvFlags::DONTWAIT;
+    }
+    if flags & MSG_OOB != 0 {
+        recv_flags |= RecvFlags::OOB;
     }
 
     let mut cmsg = Vec::new();

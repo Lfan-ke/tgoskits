@@ -127,6 +127,9 @@ bitflags! {
         /// the real size of the datagram, even when it is larger than the
         /// buffer.
         const TRUNCATE = 0x02;
+        /// Requests out-of-band data (`MSG_OOB`). Only stream sockets that
+        /// support urgent data honor it; others reject it with `EOPNOTSUPP`.
+        const OOB = 0x04;
         /// Per-call non-blocking override (`MSG_DONTWAIT`). Does NOT
         /// change the socket's own `O_NONBLOCK` state.
         const DONTWAIT = 0x40;
