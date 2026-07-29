@@ -1,0 +1,24 @@
+args = [
+    "-machine", "virt",
+    "-cpu", "cortex-a72",
+    "-nographic",
+    "-m", "2G",
+    "-smp", "1",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-mongo.img",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = "/usr/bin/mongo-tests.sh"
+success_regex = ["(?m)^MONGO_TEST_PASSED\\s*$"]
+fail_regex = [
+    "(?m)^MONGO_TEST_FAILED\\s*$",
+    "(?i)\\bpanic(?:ked)?\\b",
+    "(?i)kernel panic",
+    "(?i)unimplemented syscall",
+    "(?i)unsupported elf",
+]
+timeout = 600
