@@ -694,14 +694,23 @@ impl SendFile {
     }
 }
 
-fn do_send(mut src: SendFile, mut dst: SendFile, len: usize) -> AxResult<usize> {
+fn do_send(mut src: SendFile, mut dst: SendFile, len: usize, nonblock: bool) -> AxResult<usize> {
     let mut buf = vec![0; 0x1000];
     let mut total_written = 0;
     let mut remaining = len;
 
     while remaining > 0 {
-        if total_written > 0 && !src.has_data() {
-            break;
+        if !src.has_data() {
+            if total_written > 0 {
+                break;
+            }
+            // splice(2) SPLICE_F_NONBLOCK: if the operation would block on the
+            // source (e.g. an empty pipe) and nothing has been transferred yet,
+            // fail with EAGAIN instead of blocking on the read below. Without
+            // this flag the read blocks, matching Linux's default splice.
+            if nonblock {
+                return Err(AxError::WouldBlock);
+            }
         }
         let to_read = buf.len().min(remaining);
         let bytes_read = match src.read(&mut buf[..to_read]) {
@@ -768,7 +777,7 @@ pub fn sys_sendfile(out_fd: c_int, in_fd: c_int, offset: *mut u64, len: usize) -
 
     let dst: SendFile = SendFile::Direct(out_file);
 
-    do_send(src, dst, len).map(|n: usize| n as _)
+    do_send(src, dst, len, false).map(|n: usize| n as _)
 }
 
 pub fn sys_copy_file_range(
@@ -858,7 +867,7 @@ pub fn sys_copy_file_range(
         SendFile::Direct(get_file_like(fd_out)?)
     };
 
-    do_send(src, dst, len).map(|n: usize| n as isize)
+    do_send(src, dst, len, false).map(|n: usize| n as isize)
 }
 
 pub fn sys_splice(
@@ -1006,7 +1015,7 @@ pub fn sys_splice(
         SendFile::Direct(f)
     };
 
-    let n = do_send(src, dst, len)?;
+    let n = do_send(src, dst, len, flags & SPLICE_F_NONBLOCK != 0)?;
 
     isize::try_from(n).map_err(|_| AxError::InvalidInput)
 }
