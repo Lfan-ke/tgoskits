@@ -39,6 +39,11 @@ impl CMsg {
                 if data.len() % size_of::<i32>() != 0 {
                     return Err(AxError::InvalidInput);
                 }
+                // Linux caps a single SCM_RIGHTS at SCM_MAX_FD (253) fds;
+                // more fails with EINVAL (net/core/scm.c scm_fp_copy).
+                if data.len() / size_of::<i32>() > 253 {
+                    return Err(AxError::InvalidInput);
+                }
                 let mut fds = Vec::new();
                 for fd in data.as_chunks::<{ size_of::<i32>() }>().0 {
                     let fd = i32::from_ne_bytes(*fd);
@@ -76,6 +81,16 @@ impl<'a> CMsgBuilder<'a> {
 
     pub fn finish(self) {
         *self.len = self.written;
+    }
+
+    /// Number of SCM_RIGHTS fds that still fit in the remaining control space.
+    /// Used to deliver as many fds as fit and flag MSG_CTRUNC for the rest,
+    /// matching Linux net/core/scm.c scm_detach_fds.
+    pub fn rights_capacity(&self) -> usize {
+        self.capacity
+            .checked_sub(self.written)
+            .and_then(|remaining| cmsg_align_down(remaining).checked_sub(size_of::<cmsghdr>()))
+            .map_or(0, |body_cap| body_cap / size_of::<i32>())
     }
 
     pub fn push_sized(

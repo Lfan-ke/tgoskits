@@ -10,8 +10,8 @@ use ax_runtime::hal::time::wall_time;
 use linux_raw_sys::{
     general::timespec,
     net::{
-        IP_TOS, IPPROTO_IPV6, IPV6_TCLASS, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SCM_RIGHTS,
-        SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
+        IP_TOS, IPPROTO_IPV6, IPV6_TCLASS, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_OOB,
+        MSG_PEEK, MSG_TRUNC, SCM_RIGHTS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t,
     },
 };
 
@@ -155,6 +155,7 @@ fn recv_impl(
     addrlen: UserPtr<socklen_t>,
     mut cmsg_builder: Option<CMsgBuilder>,
     truncated_out: &mut bool,
+    control_truncated_out: &mut bool,
 ) -> AxResult<isize> {
     debug!("sys_recv <= fd: {fd}, flags: {flags}");
 
@@ -217,6 +218,9 @@ fn recv_impl(
     if flags & MSG_OOB != 0 {
         recv_flags |= RecvFlags::OOB;
     }
+    // Received SCM_RIGHTS fds get O_CLOEXEC when the caller passes
+    // MSG_CMSG_CLOEXEC (recvmsg(2)); Linux net/core/scm.c scm_detach_fds.
+    let cmsg_cloexec = flags & MSG_CMSG_CLOEXEC != 0;
 
     let mut cmsg = Vec::new();
 
@@ -242,19 +246,31 @@ fn recv_impl(
             let pushed = match cmsg.downcast::<CMsg>() {
                 Ok(cmsg) => match *cmsg {
                     CMsg::Rights { fds } => {
-                        let body_len = fds.len() * size_of::<i32>();
-                        builder.push_sized(SOL_SOCKET, SCM_RIGHTS, body_len, |data| {
-                            let mut written = 0;
-                            for (f, chunk) in fds
-                                .into_iter()
-                                .zip(data.as_chunks_mut::<{ size_of::<i32>() }>().0)
-                            {
-                                let fd = add_file_like(f, false)?;
-                                chunk.copy_from_slice(&fd.to_ne_bytes());
-                                written += size_of::<i32>();
-                            }
-                            Ok(written)
-                        })?
+                        // Deliver as many fds as fit; excess are dropped (closed)
+                        // and MSG_CTRUNC is flagged, matching Linux scm_detach_fds.
+                        let total = fds.len();
+                        let install = total.min(builder.rights_capacity());
+                        if install < total {
+                            *control_truncated_out = true;
+                        }
+                        if install == 0 {
+                            false
+                        } else {
+                            let body_len = install * size_of::<i32>();
+                            builder.push_sized(SOL_SOCKET, SCM_RIGHTS, body_len, |data| {
+                                let mut written = 0;
+                                for (f, chunk) in fds
+                                    .into_iter()
+                                    .take(install)
+                                    .zip(data.as_chunks_mut::<{ size_of::<i32>() }>().0)
+                                {
+                                    let fd = add_file_like(f, cmsg_cloexec)?;
+                                    chunk.copy_from_slice(&fd.to_ne_bytes());
+                                    written += size_of::<i32>();
+                                }
+                                Ok(written)
+                            })?
+                        }
                     }
                 },
                 Err(cmsg) => match cmsg.downcast::<IpCmsg>() {
@@ -308,12 +324,14 @@ pub fn sys_recvfrom(
         addrlen,
         None,
         &mut false,
+        &mut false,
     )
 }
 
 pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize> {
     let msg = msg.get_as_mut()?;
     let mut truncated = false;
+    let mut control_truncated = false;
     let recv = recv_impl(
         fd,
         IoVectorBuf::new(msg.msg_iov as *mut IoVec, msg.msg_iovlen)?.into_io(),
@@ -327,10 +345,18 @@ pub fn sys_recvmsg(fd: i32, msg: UserPtr<msghdr>, flags: u32) -> AxResult<isize>
             )
         }),
         &mut truncated,
+        &mut control_truncated,
     );
     // Linux: on success, set msg.msg_flags to indicate truncation etc.
     if recv.is_ok() {
-        msg.msg_flags = if truncated { MSG_TRUNC } else { 0 };
+        let mut mf = 0;
+        if truncated {
+            mf |= MSG_TRUNC;
+        }
+        if control_truncated {
+            mf |= MSG_CTRUNC;
+        }
+        msg.msg_flags = mf;
     }
     recv
 }
@@ -418,6 +444,7 @@ pub fn sys_recvmmsg(
                     &mut msg.msg_hdr.msg_controllen,
                 )
             }),
+            &mut false,
             &mut false,
         );
 
