@@ -287,6 +287,40 @@ pub fn check_write_seal_for_shared_file_backend(backend: &Backend) -> AxResult {
     memfd.check_write_seal()
 }
 
+/// Punch a hole in a shared file-backed (memfd) mapping's backing store by
+/// zeroing `[file_offset, file_offset+len)` so a `MAP_SHARED` mapping reads
+/// zero afterwards. Backs `madvise(MADV_REMOVE)` (Linux `vfs_fallocate`
+/// `FALLOC_FL_PUNCH_HOLE` on shmem, mm/madvise.c `madvise_remove`). Returns
+/// `Ok(false)` when the backend is not a shared file map, so the caller can
+/// report `EINVAL` for anonymous ranges (Linux requires file backing).
+/// Honors `F_SEAL_WRITE` via `write_at` (a sealed memfd punch yields `EPERM`,
+/// matching `shmem_fallocate`).
+pub(crate) fn punch_shared_file_backend(
+    backend: &Backend,
+    file_offset: u64,
+    len: usize,
+) -> AxResult<bool> {
+    let Some(memfd) = memfd_from_file_backend(backend) else {
+        return Ok(false);
+    };
+    if len == 0 {
+        return Ok(true);
+    }
+    let zeros = alloc::vec![0u8; len.min(64 * 1024)];
+    let mut off = file_offset;
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(zeros.len());
+        let n = memfd.write_at(&zeros[..chunk], off)?;
+        if n == 0 {
+            break;
+        }
+        off += n as u64;
+        remaining -= n;
+    }
+    Ok(true)
+}
+
 pub(crate) fn apply_shared_writable_delta_for_backend(
     backend: &Backend,
     old_flags: MappingFlags,
