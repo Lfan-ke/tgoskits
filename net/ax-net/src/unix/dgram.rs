@@ -357,7 +357,9 @@ impl TransportOps for DgramTransport {
 
     async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
         if !self.is_seqpacket {
-            return Err(AxError::InvalidInput);
+            // Connectionless SOCK_DGRAM has no accept: Linux net/unix/af_unix.c
+            // `unix_dgram_ops.accept = sock_no_accept` returns -EOPNOTSUPP.
+            return Err(AxError::OperationNotSupported);
         }
         let Some((rx, _)) = self.conn_rx.lock().clone() else {
             // Not a listening seqpacket socket: accept requires listen(). Linux
@@ -371,7 +373,10 @@ impl TransportOps for DgramTransport {
 
     fn try_accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
         if !self.is_seqpacket {
-            return Err(AxError::WouldBlock);
+            // Connectionless SOCK_DGRAM has no accept: Linux net/unix/af_unix.c
+            // `unix_dgram_ops.accept = sock_no_accept` returns -EOPNOTSUPP.
+            // Must not return WouldBlock, or the accept poll loop hangs forever.
+            return Err(AxError::OperationNotSupported);
         }
         let Some((rx, _)) = self.conn_rx.lock().clone() else {
             // Not a listening seqpacket socket: accept requires listen(). Linux

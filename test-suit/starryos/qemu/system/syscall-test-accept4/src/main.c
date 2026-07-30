@@ -106,6 +106,40 @@ static int test_flags(void)
         close(cs);
         close(ls);
     }
+
+    /* SOCK_NONBLOCK 单独: 新 fd 有 O_NONBLOCK 但无 FD_CLOEXEC(flag 独立不耦合) */
+    ls = make_listener_with_pending(SOCK_STREAM, "\0accept4-nbonly", 14, &cs);
+    if (ls >= 0) {
+        int an = accept4(ls, NULL, NULL, SOCK_NONBLOCK);
+        CHECK(an >= 0, "accept4(SOCK_NONBLOCK) 成功");
+        if (an >= 0) {
+            int fd_fl = fcntl(an, F_GETFD);
+            int st_fl = fcntl(an, F_GETFL);
+            CHECK(st_fl != -1 && (st_fl & O_NONBLOCK), "SOCK_NONBLOCK 单独 -> O_NONBLOCK");
+            CHECK(fd_fl != -1 && !(fd_fl & FD_CLOEXEC),
+                  "SOCK_NONBLOCK 单独 -> 无 FD_CLOEXEC(flag 独立)");
+            close(an);
+        }
+        close(cs);
+        close(ls);
+    }
+
+    /* SOCK_CLOEXEC 单独(STREAM): 新 fd 有 FD_CLOEXEC 但无 O_NONBLOCK */
+    ls = make_listener_with_pending(SOCK_STREAM, "\0accept4-cloonly", 15, &cs);
+    if (ls >= 0) {
+        int ac = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
+        CHECK(ac >= 0, "accept4(SOCK_CLOEXEC) 成功");
+        if (ac >= 0) {
+            int fd_fl = fcntl(ac, F_GETFD);
+            int st_fl = fcntl(ac, F_GETFL);
+            CHECK(fd_fl != -1 && (fd_fl & FD_CLOEXEC), "SOCK_CLOEXEC 单独 -> FD_CLOEXEC");
+            CHECK(st_fl != -1 && !(st_fl & O_NONBLOCK),
+                  "SOCK_CLOEXEC 单独 -> 无 O_NONBLOCK(flag 独立)");
+            close(ac);
+        }
+        close(cs);
+        close(ls);
+    }
     TEST_DONE();
 }
 
@@ -124,9 +158,62 @@ static int test_peer_addr(void)
     CHECK(a >= 0, "accept4 带 addr 成功");
     if (a >= 0) {
         CHECK(peer.sun_family == AF_UNIX, "回填 peer family == AF_UNIX");
+        /* value-result: client 未 bind 匿名 AF_UNIX peer, Linux 回写 plen==sizeof(sa_family_t)
+         * (仅 family, 无 path)。man: '*addrlen ... will contain the actual size of the peer'。 */
+        CHECK(plen == (socklen_t)sizeof(sa_family_t),
+              "value-result: 匿名 peer 回写 plen==sizeof(sa_family_t)");
         close(a);
     }
     close(cs);
+
+    /* addrlen 截断语义: 传入过小缓冲, accept 仍成功, 但 *addrlen 回写实际(完整)
+     * 地址长度, 大于供给值。man accept: 'The returned address is truncated if the
+     * buffer provided is too small; in this case, addrlen will return a value
+     * greater than was supplied'. client 先 bind 命名抽象地址(令 peer 名长度>2),
+     * 再 connect; server accept 供给过小缓冲验证截断回写。 */
+    {
+        char lname[24], cname[24];
+        int lnlen = snprintf(lname, sizeof(lname), "%cacc4tl-%d", 0, (int)getpid());
+        int cnlen = snprintf(cname, sizeof(cname), "%cacc4tc-%d", 0, (int)getpid());
+        int tls = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (tls >= 0 && lnlen > 0 && cnlen > 0) {
+            struct sockaddr_un la;
+            memset(&la, 0, sizeof(la));
+            la.sun_family = AF_UNIX;
+            memcpy(la.sun_path, lname, (size_t)lnlen);
+            socklen_t lal = offsetof(struct sockaddr_un, sun_path) + (socklen_t)lnlen;
+            int tcs = -1;
+            if (bind(tls, (struct sockaddr *)&la, lal) == 0 && listen(tls, 4) == 0) {
+                tcs = socket(AF_UNIX, SOCK_STREAM, 0);
+                if (tcs >= 0) {
+                    struct sockaddr_un ca;
+                    memset(&ca, 0, sizeof(ca));
+                    ca.sun_family = AF_UNIX;
+                    memcpy(ca.sun_path, cname, (size_t)cnlen);
+                    socklen_t cal = offsetof(struct sockaddr_un, sun_path) + (socklen_t)cnlen;
+                    if (bind(tcs, (struct sockaddr *)&ca, cal) != 0 ||
+                        connect(tcs, (struct sockaddr *)&la, lal) != 0) {
+                        close(tcs);
+                        tcs = -1;
+                    }
+                }
+            }
+            if (tcs >= 0) {
+                char smallbuf[2];
+                memset(smallbuf, 0, sizeof(smallbuf));
+                socklen_t tlen = (socklen_t)sizeof(smallbuf); /* 故意过小 */
+                int at = accept4(tls, (struct sockaddr *)smallbuf, &tlen, 0);
+                CHECK(at >= 0, "小缓冲 accept4 仍成功(截断而非失败)");
+                if (at >= 0) {
+                    CHECK(tlen > (socklen_t)sizeof(smallbuf),
+                          "截断: 回写 addrlen > 供给值(实际 peer 长度)");
+                    close(at);
+                }
+                close(tcs);
+            }
+            close(tls);
+        }
+    }
 
     /* addr NULL: 不回填, 成功 */
     ls = make_listener_with_pending(SOCK_STREAM, "\0accept4-null", 12, &cs);
@@ -174,6 +261,17 @@ static int test_errno(void)
         errno = 0;
         CHECK(accept4(s, NULL, NULL, 0) == -1 && errno == EINVAL, "未 listen -> EINVAL");
         close(s);
+    }
+
+    /* 非流式 DGRAM socket -> EOPNOTSUPP。man accept ERRORS: EOPNOTSUPP 'The referenced
+     * socket is not of type SOCK_STREAM.'; Linux net/unix/af_unix.c unix_dgram_ops.accept
+     * = sock_no_accept -> -EOPNOTSUPP。DGRAM 的 ops->accept 直接拒绝, 与 listen 无关。 */
+    int ds = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (ds >= 0) {
+        errno = 0;
+        CHECK(accept4(ds, NULL, NULL, 0) == -1 && errno == EOPNOTSUPP,
+              "DGRAM accept4 -> EOPNOTSUPP");
+        close(ds);
     }
 
     /* 非阻塞 listener 无连接 -> EAGAIN。注意: SOCK_NONBLOCK flag 设的是被接受
