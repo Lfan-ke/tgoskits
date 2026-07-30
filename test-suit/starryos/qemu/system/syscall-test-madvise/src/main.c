@@ -42,6 +42,30 @@
 #ifndef MADV_REMOVE
 #define MADV_REMOVE 9
 #endif
+#ifndef MADV_DONTFORK
+#define MADV_DONTFORK 10
+#endif
+#ifndef MADV_DOFORK
+#define MADV_DOFORK 11
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
+#ifndef MADV_NOHUGEPAGE
+#define MADV_NOHUGEPAGE 15
+#endif
+#ifndef MADV_DONTDUMP
+#define MADV_DONTDUMP 16
+#endif
+#ifndef MADV_DODUMP
+#define MADV_DODUMP 17
+#endif
+#ifndef MADV_COLD
+#define MADV_COLD 20
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
 
 static long PS;
 
@@ -151,6 +175,10 @@ static int test_dontneed_and_errno(void)
     /* 非法 advice -> EINVAL */
     errno = 0;
     CHECK(madvise(p, (size_t)PS, 0x7fff) == -1 && errno == EINVAL, "非法 advice -> EINVAL");
+    /* addr 未页对齐 -> EINVAL (man: addr is not page-aligned) */
+    errno = 0;
+    CHECK(madvise((char *)p + 1, (size_t)PS, MADV_DONTNEED) == -1 && errno == EINVAL,
+          "addr 未页对齐 -> EINVAL");
     /* len=0 -> 0 no-op */
     CHECK(madvise(p, 0, MADV_DONTNEED) == 0, "len=0 -> 0(no-op)");
     munmap(p, (size_t)PS);
@@ -167,6 +195,56 @@ static int test_dontneed_and_errno(void)
     TEST_DONE();
 }
 
+/* ===== F. MADV_DONTNEED shared 文件后备 -> 从后备重读(非零), 区别于匿名得零页 ===== */
+static int test_dontneed_file_backed(void)
+{
+    TEST_START("F. MADV_DONTNEED shared 文件后备 -> 重访问从后备重读");
+    int fd = -1;
+    void *p = memfd_shared_map(&fd, 0x3C);
+    if (!p) { CHECK(0, "memfd 前置"); TEST_DONE(); }
+    CHECK(((volatile unsigned char *)p)[0] == 0x3C, "DONTNEED 前有数据 0x3C");
+    CHECK(madvise(p, (size_t)PS, MADV_DONTNEED) == 0,
+          "MADV_DONTNEED shared 文件后备 -> 成功");
+    /* man: shared 文件后备下 DONTNEED 后重访问从后备重填(非零), 匿名才得零页 */
+    int same = 1;
+    for (long i = 0; i < PS; i++) {
+        if (((volatile unsigned char *)p)[i] != 0x3C) { same = 0; break; }
+    }
+    CHECK(same, "MADV_DONTNEED 后 shared 映射从后备重读原值 0x3C(非零页)");
+    munmap(p, (size_t)PS);
+    close(fd);
+    TEST_DONE();
+}
+
+/* ===== G. 合法但 no-op 的 advice hint 逐一返回 0 ===== */
+static int test_noop_advice(void)
+{
+    TEST_START("G. 合法 no-op advice hint -> 0");
+    void *p = mmap(NULL, (size_t)PS, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { CHECK(0, "mmap"); TEST_DONE(); }
+    memset(p, 0x77, (size_t)PS);
+
+    /* man: 这些 hint 不改变语义, 合法映射上一律返回 0。与"非法 advice -> EINVAL"
+     * 形成对照, 防白名单误删回归无法捕获。 */
+    CHECK(madvise(p, (size_t)PS, MADV_NORMAL) == 0, "MADV_NORMAL -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_RANDOM) == 0, "MADV_RANDOM -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_SEQUENTIAL) == 0, "MADV_SEQUENTIAL -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_WILLNEED) == 0, "MADV_WILLNEED -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_DONTFORK) == 0, "MADV_DONTFORK -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_DOFORK) == 0, "MADV_DOFORK -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_HUGEPAGE) == 0, "MADV_HUGEPAGE -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_NOHUGEPAGE) == 0, "MADV_NOHUGEPAGE -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_DONTDUMP) == 0, "MADV_DONTDUMP -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_DODUMP) == 0, "MADV_DODUMP -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_COLD) == 0, "MADV_COLD -> 0");
+    CHECK(madvise(p, (size_t)PS, MADV_PAGEOUT) == 0, "MADV_PAGEOUT -> 0");
+
+    CHECK(*(volatile unsigned char *)p == 0x77, "no-op hint 后内容不变(0x77 持久)");
+    munmap(p, (size_t)PS);
+    TEST_DONE();
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -179,6 +257,8 @@ int main(void)
     fail |= test_madv_remove_anon();
     fail |= test_madv_remove_shmem();
     fail |= test_dontneed_and_errno();
+    fail |= test_dontneed_file_backed();
+    fail |= test_noop_advice();
     printf("\n==== test-madvise 汇总: %s ====\n", fail ? "FAIL" : "PASS");
     return fail;
 }
