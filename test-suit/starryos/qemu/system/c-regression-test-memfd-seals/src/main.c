@@ -7,6 +7,8 @@
  *   - F_SEAL_SHRINK rejects ftruncate to a smaller size with EPERM
  *   - F_SEAL_GROW rejects ftruncate to a larger size with EPERM
  *   - F_SEAL_WRITE rejects mmap(PROT_WRITE | MAP_SHARED) with EPERM
+ *   - F_SEAL_FUTURE_WRITE seals an already-populated memfd and rejects
+ *     writes issued after sealing with EPERM
  *   - F_SEAL_SEAL blocks all subsequent F_ADD_SEALS with EPERM
  *   - Without MFD_ALLOW_SEALING, F_ADD_SEALS is rejected with EPERM
  *
@@ -38,6 +40,9 @@
 #define F_SEAL_SHRINK  0x0002
 #define F_SEAL_GROW    0x0004
 #define F_SEAL_WRITE   0x0008
+#endif
+#ifndef F_SEAL_FUTURE_WRITE
+#define F_SEAL_FUTURE_WRITE 0x0010
 #endif
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001
@@ -183,6 +188,35 @@ int main(void) {
               "zero-length write returns 0 under F_SEAL_WRITE");
 
         close(wfd);
+    }
+
+    /* --- F_SEAL_FUTURE_WRITE blocks writes issued after sealing ------- */
+    /* Unlike F_SEAL_WRITE, F_SEAL_FUTURE_WRITE can seal an already-populated
+     * memfd and only rejects future writes; Chromium/Firefox seal a
+     * read-only snapshot for sandboxed children this way. */
+    int ffd = memfd_create_sys("fwseal", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    CHECK(ffd >= 0, "memfd_create future-write-seal fd");
+    if (ffd >= 0) {
+        CHECK_RET(ftruncate(ffd, 4096), 0, "future-write-seal fd ftruncate");
+        CHECK(write(ffd, "AB", 2) == 2, "write allowed before F_SEAL_FUTURE_WRITE");
+        CHECK_RET(fcntl(ffd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE), 0,
+                  "F_ADD_SEALS F_SEAL_FUTURE_WRITE");
+        seals = fcntl(ffd, F_GET_SEALS, 0);
+        CHECK((seals & F_SEAL_FUTURE_WRITE) != 0,
+              "F_GET_SEALS reports F_SEAL_FUTURE_WRITE");
+
+        errno = 0;
+        CHECK(pwrite(ffd, "z", 1, 0) == -1 && errno == EPERM,
+              "pwrite rejected with EPERM after F_SEAL_FUTURE_WRITE");
+
+        /* Zero-length write still returns 0 under FUTURE_WRITE, matching
+         * Linux, which never synthesizes EPERM for a count==0 write. */
+        char zb[1];
+        errno = 0;
+        CHECK(pwrite(ffd, zb, 0, 0) == 0 && errno == 0,
+              "zero-length pwrite returns 0 under F_SEAL_FUTURE_WRITE");
+
+        close(ffd);
     }
 
     /* --- F_SEAL_SEAL blocks further F_ADD_SEALS ---------------------- */
