@@ -290,7 +290,9 @@ impl TransportOps for StreamTransport {
 
     async fn accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
         let Some((rx, _)) = self.conn_rx.lock().clone() else {
-            return Err(AxError::NotConnected);
+            // Not a listening socket: accept requires a prior listen(). Linux
+            // returns EINVAL for accept on a non-listening socket.
+            return Err(AxError::InvalidInput);
         };
         let ConnRequest {
             channel,
@@ -305,7 +307,9 @@ impl TransportOps for StreamTransport {
 
     fn try_accept(&self) -> AxResult<(Transport, UnixSocketAddr)> {
         let Some((rx, _)) = self.conn_rx.lock().clone() else {
-            return Err(AxError::NotConnected);
+            // Not a listening socket: accept requires a prior listen(). Linux
+            // returns EINVAL for accept on a non-listening socket.
+            return Err(AxError::InvalidInput);
         };
         match rx.try_recv() {
             Ok(ConnRequest {

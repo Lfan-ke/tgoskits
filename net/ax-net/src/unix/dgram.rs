@@ -361,7 +361,9 @@ impl TransportOps for DgramTransport {
             return Err(AxError::InvalidInput);
         }
         let Some((rx, _)) = self.conn_rx.lock().clone() else {
-            return Err(AxError::NotConnected);
+            // Not a listening seqpacket socket: accept requires listen(). Linux
+            // returns EINVAL for accept on a non-listening socket.
+            return Err(AxError::InvalidInput);
         };
         let req = rx.recv().await.map_err(|_| AxError::ConnectionReset)?;
         let transport = DgramTransport::new_connected(req.data_rx, req.connected, req.pid, 5);
@@ -373,7 +375,9 @@ impl TransportOps for DgramTransport {
             return Err(AxError::WouldBlock);
         }
         let Some((rx, _)) = self.conn_rx.lock().clone() else {
-            return Err(AxError::NotConnected);
+            // Not a listening seqpacket socket: accept requires listen(). Linux
+            // returns EINVAL for accept on a non-listening socket.
+            return Err(AxError::InvalidInput);
         };
         match rx.try_recv() {
             Ok(req) => {
