@@ -38,6 +38,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/mman.h>
 
 static volatile sig_atomic_t g_sigpipe = 0;
 static void sigpipe_handler(int s) { (void)s; g_sigpipe = 1; }
@@ -333,6 +334,134 @@ static int test_connected(void)
     TEST_DONE();
 }
 
+/* ===== I. SCM_RIGHTS 文件描述符跨端传递(SEQPACKET) + MSG_CMSG_CLOEXEC ===== */
+static int test_scm_rights(void)
+{
+    TEST_START("I. SEQPACKET SCM_RIGHTS fd 传递 + MSG_CMSG_CLOEXEC");
+    int sv[2];
+    if (sp_seqpacket(sv) != 0) { CHECK(0, "前置 socketpair 失败"); TEST_DONE(); }
+
+    int tmp = memfd_create("scm-seqpacket", MFD_CLOEXEC);
+    if (tmp < 0) tmp = open("/tmp", O_TMPFILE | O_RDWR, 0600);
+    CHECK(tmp >= 0, "创建待传递 fd(memfd/tmpfile)");
+    if (tmp >= 0) {
+        CHECK_RET(write(tmp, "SCMPAYLOAD", 10), 10, "写 10B 到待传 fd");
+    }
+
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    memset(cbuf, 0, sizeof(cbuf));
+    char pay = 'F';
+    struct iovec siov = { &pay, 1 };
+    struct msghdr smh;
+    memset(&smh, 0, sizeof(smh));
+    smh.msg_iov = &siov; smh.msg_iovlen = 1;
+    smh.msg_control = cbuf; smh.msg_controllen = sizeof(cbuf);
+    struct cmsghdr *scm = CMSG_FIRSTHDR(&smh);
+    scm->cmsg_level = SOL_SOCKET;
+    scm->cmsg_type = SCM_RIGHTS;
+    scm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(scm), &tmp, sizeof(int));
+    CHECK_RET(sendmsg(sv[0], &smh, 0), 1, "sendmsg 携 SCM_RIGHTS 单 fd(payload 1B)");
+
+    char rcbuf[CMSG_SPACE(sizeof(int))];
+    memset(rcbuf, 0, sizeof(rcbuf));
+    char rpay = 0;
+    struct iovec riov = { &rpay, 1 };
+    struct msghdr rmh;
+    memset(&rmh, 0, sizeof(rmh));
+    rmh.msg_iov = &riov; rmh.msg_iovlen = 1;
+    rmh.msg_control = rcbuf; rmh.msg_controllen = sizeof(rcbuf);
+    ssize_t rn = recvmsg(sv[1], &rmh, MSG_CMSG_CLOEXEC);
+    CHECK(rn == 1 && rpay == 'F', "recvmsg 收到 payload(1B, 'F')");
+    CHECK((rmh.msg_flags & MSG_CTRUNC) == 0, "控制缓冲充足 -> 无 MSG_CTRUNC");
+
+    struct cmsghdr *rc = CMSG_FIRSTHDR(&rmh);
+    CHECK(rc != NULL && rc->cmsg_level == SOL_SOCKET && rc->cmsg_type == SCM_RIGHTS,
+          "收到 SOL_SOCKET/SCM_RIGHTS 控制消息");
+    CHECK(rc != NULL && rc->cmsg_len == CMSG_LEN(sizeof(int)),
+          "cmsg_len == CMSG_LEN(1 fd)");
+    int gotfd = -1;
+    if (rc) memcpy(&gotfd, CMSG_DATA(rc), sizeof(int));
+    CHECK(gotfd >= 0 && gotfd != tmp, "收到新的独立 fd(与发端号不同)");
+
+    if (gotfd >= 0) {
+        int fdfl = fcntl(gotfd, F_GETFD);
+        CHECK(fdfl != -1 && (fdfl & FD_CLOEXEC),
+              "MSG_CMSG_CLOEXEC -> 收到 fd 置 FD_CLOEXEC");
+
+        char vb[16];
+        memset(vb, 0, sizeof(vb));
+        ssize_t vn = pread(gotfd, vb, 10, 0);
+        CHECK(vn == 10 && memcmp(vb, "SCMPAYLOAD", 10) == 0,
+              "收到 fd 可用且读回原内容(同一 open file description)");
+
+        off_t pos = lseek(gotfd, 3, SEEK_SET);
+        CHECK(pos == 3, "收端 lseek(gotfd, 3)");
+        off_t spos = lseek(tmp, 0, SEEK_CUR);
+        CHECK(spos == 3, "发端 offset 随动(共享 offset)");
+        close(gotfd);
+    }
+
+    if (tmp >= 0) close(tmp);
+    close(sv[0]); close(sv[1]);
+    TEST_DONE();
+}
+
+/* ===== J. SCM_RIGHTS 控制缓冲过小 -> 多余 fd 丢弃 + MSG_CTRUNC ===== */
+static int test_scm_rights_trunc(void)
+{
+    TEST_START("J. SEQPACKET SCM_RIGHTS 超缓冲截断(多余 fd 丢弃 + MSG_CTRUNC)");
+    int sv[2];
+    if (sp_seqpacket(sv) != 0) { CHECK(0, "前置 socketpair 失败"); TEST_DONE(); }
+
+    int fds[3];
+    for (int i = 0; i < 3; i++) fds[i] = dup(STDOUT_FILENO);
+    CHECK(fds[0] >= 0 && fds[1] >= 0 && fds[2] >= 0, "dup 出 3 个待传 fd");
+
+    char cbuf[CMSG_SPACE(3 * sizeof(int))];
+    memset(cbuf, 0, sizeof(cbuf));
+    char pay = 'M';
+    struct iovec siov = { &pay, 1 };
+    struct msghdr smh;
+    memset(&smh, 0, sizeof(smh));
+    smh.msg_iov = &siov; smh.msg_iovlen = 1;
+    smh.msg_control = cbuf; smh.msg_controllen = sizeof(cbuf);
+    struct cmsghdr *scm = CMSG_FIRSTHDR(&smh);
+    scm->cmsg_level = SOL_SOCKET;
+    scm->cmsg_type = SCM_RIGHTS;
+    scm->cmsg_len = CMSG_LEN(3 * sizeof(int));
+    memcpy(CMSG_DATA(scm), fds, 3 * sizeof(int));
+    CHECK_RET(sendmsg(sv[0], &smh, 0), 1, "sendmsg 携 3 个 SCM_RIGHTS fd");
+
+    char rcbuf[CMSG_SPACE(1 * sizeof(int))];
+    memset(rcbuf, 0, sizeof(rcbuf));
+    char rpay = 0;
+    struct iovec riov = { &rpay, 1 };
+    struct msghdr rmh;
+    memset(&rmh, 0, sizeof(rmh));
+    rmh.msg_iov = &riov; rmh.msg_iovlen = 1;
+    rmh.msg_control = rcbuf; rmh.msg_controllen = sizeof(rcbuf);
+    ssize_t rn = recvmsg(sv[1], &rmh, 0);
+    CHECK(rn == 1, "recvmsg 收到 payload 1B");
+    CHECK((rmh.msg_flags & MSG_CTRUNC) != 0, "fd 超控制缓冲 -> MSG_CTRUNC 置位");
+
+    struct cmsghdr *rc = CMSG_FIRSTHDR(&rmh);
+    CHECK(rc != NULL && rc->cmsg_type == SCM_RIGHTS, "仍交付一个 SCM_RIGHTS cmsg");
+    int nfds = 0;
+    if (rc) nfds = (int)((rc->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+    CHECK(nfds >= 1 && nfds < 3, "交付的 fd 数被截断(1..<3, 少于发送的 3)");
+    for (int i = 0; i < nfds; i++) {
+        int gf;
+        memcpy(&gf, CMSG_DATA(rc) + i * sizeof(int), sizeof(int));
+        CHECK(gf >= 0 && fcntl(gf, F_GETFD) != -1, "交付的 fd 有效");
+        if (gf >= 0) close(gf);
+    }
+
+    for (int i = 0; i < 3; i++) if (fds[i] >= 0) close(fds[i]);
+    close(sv[0]); close(sv[1]);
+    TEST_DONE();
+}
+
 int main(void)
 {
     signal(SIGPIPE, sigpipe_handler);
@@ -347,6 +476,8 @@ int main(void)
     fail |= test_errno_paths();
     fail |= test_sockopt();
     fail |= test_connected();
+    fail |= test_scm_rights();
+    fail |= test_scm_rights_trunc();
     printf("\n==== test-seqpacket 汇总: %s ====\n", fail ? "FAIL" : "PASS");
     return fail;
 }
