@@ -178,7 +178,7 @@ impl FileBackendInner {
 #[derive(Clone)]
 pub struct FileBackend(Arc<FileBackendInner>, Weak<Mutex<AddrSpace>>);
 impl FileBackend {
-    fn check_flags(&self, flags: MappingFlags) -> AxResult {
+    pub(crate) fn check_flags(&self, flags: MappingFlags) -> AxResult {
         let mut required_flags = FileFlags::empty();
         if flags.contains(MappingFlags::READ) {
             required_flags |= FileFlags::READ;

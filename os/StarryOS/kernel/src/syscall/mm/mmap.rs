@@ -642,10 +642,20 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> AxResult<isize> {
         return Err(AxError::NoMemory);
     }
     if permission_flags.contains(MmapProt::WRITE) {
+        let new_flags: MappingFlags = permission_flags.into();
         for (_frag_start, _frag_size, _old_flags, backend) in
             aspace.areas_in_range(start_addr, length)
         {
             memfd_check_write_seal_for_shared_file_backend(&backend)?;
+            // man 2 mprotect EACCES: a MAP_SHARED mapping of a file opened
+            // read-only has no VM_MAYWRITE, so upgrading it to PROT_WRITE is
+            // rejected. Validate against the file's open mode here (mirroring
+            // Linux mprotect_fixup); the area-level protect() only reports a
+            // bool, so the EACCES must surface from this pre-check rather than
+            // being swallowed downstream.
+            if let Backend::File(fb) = &backend {
+                fb.check_flags(new_flags)?;
+            }
         }
     }
     aspace.protect_with_reported_flags(

@@ -34,6 +34,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #ifndef PROT_SEM
 #define PROT_SEM 0x8
@@ -155,6 +157,17 @@ static int test_protection_faults(void)
         munmap(q, (size_t)PS);
     }
 
+    /* PROT_WRITE 隐含 PROT_READ (man NOTES: i386 等; StarryOS mmap.rs WRITE->
+     * READ|WRITE 提升)。mprotect 到仅 PROT_WRITE 后该页应可读: 写后回读一致。 */
+    void *w = mmap(NULL, (size_t)PS, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (w != MAP_FAILED) {
+        CHECK(mprotect(w, (size_t)PS, PROT_WRITE) == 0, "mprotect -> PROT_WRITE(不带 READ)");
+        *(volatile unsigned char *)w = 0x3c;
+        CHECK(*(volatile unsigned char *)w == 0x3c, "PROT_WRITE 单独 -> 页可读(隐含 READ)");
+        munmap(w, (size_t)PS);
+    }
+
     /* noexec: 写码但不 mprotect EXEC, 跳转执行 -> fault(W^X)。
      * 内核对非 EXEC 映射置 PTE no-execute 位(x86 NX / aarch64 UXN / riscv !X /
      * loongarch NX, 见 ax-page-table-entry <arch>.rs 的 MappingFlags->PTEFlags:
@@ -251,6 +264,48 @@ static int test_multipage(void)
     TEST_DONE();
 }
 
+/* ===== E. EACCES: 只读文件 MAP_SHARED 映射 mprotect PROT_WRITE ===== */
+static int test_eacces_ro_file(void)
+{
+    TEST_START("E. 只读文件 MAP_SHARED 映射 mprotect PROT_WRITE -> EACCES");
+    /* 只读文件的 MAP_SHARED 映射无 VM_MAYWRITE, 升级 PROT_WRITE -> EACCES
+     * (MAP_PRIVATE 因 COW 总有 VM_MAYWRITE 会成功, 故用 MAP_SHARED)。
+     * 对齐 Linux mm/mprotect.c mprotect_fixup 的 VM_MAYWRITE 门禁。 */
+    const char *path = "/tmp/mprotect_ro_test.bin";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0, "创建临时文件");
+    if (fd < 0) { TEST_DONE(); }
+    {
+        char buf[64];
+        memset(buf, 0xAB, sizeof(buf));
+        long need = PS, done = 0;
+        while (done < need) {
+            ssize_t n = write(fd, buf, sizeof(buf));
+            if (n <= 0) break;
+            done += n;
+        }
+    }
+    close(fd);
+
+    int rfd = open(path, O_RDONLY);
+    CHECK(rfd >= 0, "O_RDONLY 打开文件");
+    if (rfd < 0) { unlink(path); TEST_DONE(); }
+
+    void *m = mmap(NULL, (size_t)PS, PROT_READ, MAP_SHARED, rfd, 0);
+    CHECK(m != MAP_FAILED, "mmap 只读文件(MAP_SHARED, PROT_READ)");
+    if (m != MAP_FAILED) {
+        CHECK(*(volatile unsigned char *)m == 0xAB, "只读映射内容可读");
+        errno = 0;
+        CHECK(mprotect(m, (size_t)PS, PROT_READ | PROT_WRITE) == -1 && errno == EACCES,
+              "只读文件映射 mprotect PROT_WRITE -> EACCES");
+        munmap(m, (size_t)PS);
+    }
+
+    close(rfd);
+    unlink(path);
+    TEST_DONE();
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -262,6 +317,7 @@ int main(void)
     fail |= test_protection_faults();
     fail |= test_errno();
     fail |= test_multipage();
+    fail |= test_eacces_ro_file();
     printf("\n==== test-mprotect-wx 汇总: %s ====\n", fail ? "FAIL" : "PASS");
     return fail;
 }
