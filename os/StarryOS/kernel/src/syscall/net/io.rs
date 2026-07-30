@@ -27,6 +27,9 @@ use crate::{
 
 // Linux ABI for sendmmsg/recvmmsg limits vlen to UIO_MAXIOV (1024).
 const MMSG_MAX_VLEN: u32 = 1024;
+// recvmmsg-only flag (uapi/linux/socket.h): after the first datagram is
+// received, the remaining recvs behave as if MSG_DONTWAIT were set.
+const MSG_WAITFORONE: u32 = 0x10000;
 const PROTO_IP: u32 = linux_raw_sys::net::IPPROTO_IP as u32;
 
 fn parse_recvmmsg_timeout(timeout: UserConstPtr<timespec>) -> AxResult<Option<Duration>> {
@@ -366,9 +369,9 @@ pub fn sys_sendmmsg(fd: i32, msgvec: UserPtr<mmsghdr>, vlen: u32, flags: u32) ->
     if vlen == 0 {
         return Ok(0);
     }
-    if vlen > MMSG_MAX_VLEN {
-        return Err(AxError::InvalidInput);
-    }
+    // Linux clamps vlen to UIO_MAXIOV and proceeds (net/socket.c:2796); it
+    // never rejects an over-cap batch with EINVAL.
+    let vlen = vlen.min(MMSG_MAX_VLEN);
 
     let msgvec = msgvec.get_as_mut_slice(vlen as usize)?;
     let mut sent = 0;
@@ -409,9 +412,11 @@ pub fn sys_recvmmsg(
     if vlen == 0 {
         return Ok(0);
     }
-    if vlen > MMSG_MAX_VLEN {
-        return Err(AxError::InvalidInput);
-    }
+    // Linux do_recvmmsg does not cap vlen; StarryOS bounds the batch to
+    // UIO_MAXIOV so `get_as_mut_slice` copies a bounded user array. Clamp
+    // rather than reject with EINVAL so an over-cap batch still makes
+    // progress, matching sendmmsg's UIO_MAXIOV clamp (net/socket.c:2796).
+    let vlen = vlen.min(MMSG_MAX_VLEN);
 
     let timeout = parse_recvmmsg_timeout(timeout)?;
     // TODO: deadline is only checked between recv_impl calls. If a single
@@ -422,6 +427,7 @@ pub fn sys_recvmmsg(
     let _socket = Socket::from_fd(fd)?;
     let msgvec = msgvec.get_as_mut_slice(vlen as usize)?;
     let mut received = 0;
+    let mut flags = flags;
     for msg in msgvec.iter_mut() {
         if let Some(deadline) = deadline
             && wall_time() >= deadline
@@ -452,6 +458,14 @@ pub fn sys_recvmmsg(
             Ok(n) => {
                 msg.msg_len = n as u32;
                 received += 1;
+                // MSG_WAITFORONE: once a datagram is received, remaining
+                // recvs must not block (Linux do_recvmmsg net/socket.c:3055
+                // sets MSG_DONTWAIT after the first packet). Without this a
+                // vlen>1 recvmmsg on a socket with fewer datagrams blocks
+                // forever on the next recv.
+                if flags & MSG_WAITFORONE != 0 {
+                    flags |= MSG_DONTWAIT;
+                }
             }
             Err(e) => {
                 if received == 0 {
