@@ -479,9 +479,14 @@ impl TransportOps for DgramTransport {
                 **from = SocketAddrEx::Unix(packet.sender.clone());
             }
             if peek {
-                // MSG_PEEK: leave the record queued for the next recv. Ancillary
-                // data stays with the parked packet (fd cloning on peek is not
-                // modeled), matching a data-only peek.
+                // MSG_PEEK does not consume the record: deliver a duplicate of
+                // the ancillary data (SCM_RIGHTS fds are cloned via Arc, sharing
+                // the open file description like Linux `unix_peek_fds` /
+                // `scm_fp_dup`) and re-park the packet so the next recv delivers
+                // the rights again.
+                if let Some(dst) = options.cmsg.as_mut() {
+                    dst.extend(packet.cmsg.iter().map(|c| c.clone_box()));
+                }
                 *peeked = Some(packet);
             } else if let Some(dst) = options.cmsg.as_mut() {
                 dst.extend(packet.cmsg);

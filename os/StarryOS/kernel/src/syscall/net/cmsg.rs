@@ -22,6 +22,7 @@ pub fn cmsg_space(len: usize) -> Option<usize> {
     size_of::<cmsghdr>().checked_add(len).map(cmsg_align)
 }
 
+#[derive(Clone)]
 pub enum CMsg {
     Rights { fds: Vec<Arc<dyn FileLike>> },
 }

@@ -250,7 +250,7 @@ fn recv_impl(
 
     if let Some(mut builder) = cmsg_builder {
         for cmsg in cmsg {
-            let pushed = match cmsg.downcast::<CMsg>() {
+            let pushed = match cmsg.into_any().downcast::<CMsg>() {
                 Ok(cmsg) => match *cmsg {
                     CMsg::Rights { fds } => {
                         // Deliver as many fds as fit; excess are dropped (closed)

@@ -412,33 +412,49 @@ static int test_errno(void)
 }
 
 /* ===== F. MSG_PEEK 保留 fd ===== */
-static int test_peek_keeps_fd(void)
+/* MSG_PEEK 交付 SCM_RIGHTS 的复制 fd 且不消费记录: Linux net/unix/af_unix.c
+ * unix_peek_fds() -> scm_fp_dup() 在 peek 时复制 fd 列表交付, skb 保留原 fd, 后续
+ * 真 recv 再次交付。peek/消费/原 fd 共享同一 OFD, 用 lseek(0)+read 验证可用而不因
+ * 共享 offset 互相干扰。覆盖 STREAM/DGRAM/SEQPACKET 三种连接式/数据报路径。 */
+static void peek_delivers_rights(int type, const char *label)
 {
-    TEST_START("F. MSG_PEEK 不消费 SCM_RIGHTS");
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { CHECK(0, "socketpair"); TEST_DONE(); }
+    if (socketpair(AF_UNIX, type, 0, sv) != 0) { CHECK(0, label); return; }
+    int sfd = make_seekable_fd("PEEKOK", 6);
+    if (sfd < 0) { CHECK(0, label); close(sv[0]); close(sv[1]); return; }
 
-    int f = make_readable_fd("P", 1);
-    if (f >= 0) {
-        CHECK(send_fds(sv[0], &f, 1) == 1, "send fd (for peek)");
-        /* MSG_PEEK returns the record without consuming it. Whether the fd is
-         * cloned on peek is implementation-defined: Linux clones it (so a
-         * later recv delivers it again), StarryOS defers it to the real recv
-         * to avoid duplicating the descriptor. Accept either; close any peeked
-         * fd. The invariant tested is that peek does NOT consume the record. */
-        int got[4];
-        int n = recv_fds(sv[1], MSG_PEEK, got, 1, NULL);
-        CHECK(n >= 0, "MSG_PEEK 成功且不消费记录");
-        for (int i = 0; i < n; i++) close(got[i]);
-        /* Real recv must still deliver the fd, proving peek did not consume it. */
-        int got2[4];
-        int n2 = recv_fds(sv[1], MSG_DONTWAIT, got2, 1, NULL);
-        CHECK(n2 == 1, "PEEK 后真 recv 仍交付 fd(证 peek 未消费)");
-        for (int i = 0; i < n2; i++) close(got2[i]);
-        close(f);
+    CHECK(send_fds(sv[0], &sfd, 1) == 1, label);
+    close(sfd);
+
+    /* peek 必须交付一个可用的复制 fd(此前 gap: peek 交付 0 个 fd) */
+    int pfd[4];
+    int np = recv_fds(sv[1], MSG_PEEK, pfd, 1, NULL);
+    CHECK(np == 1, label);
+    if (np == 1) {
+        char b = 0;
+        CHECK(lseek(pfd[0], 0, SEEK_SET) == 0 && read(pfd[0], &b, 1) == 1 && b == 'P', label);
+        close(pfd[0]);
+    }
+
+    /* peek 未消费记录: 后续真 recv 再次交付可用 fd */
+    int rfd[4];
+    int nr = recv_fds(sv[1], MSG_DONTWAIT, rfd, 1, NULL);
+    CHECK(nr == 1, label);
+    if (nr == 1) {
+        char b = 0;
+        CHECK(lseek(rfd[0], 0, SEEK_SET) == 0 && read(rfd[0], &b, 1) == 1 && b == 'P', label);
+        close(rfd[0]);
     }
     close(sv[0]);
     close(sv[1]);
+}
+
+static int test_peek_keeps_fd(void)
+{
+    TEST_START("F. MSG_PEEK 交付 SCM_RIGHTS 复制 fd + 后续真 recv 再交付");
+    peek_delivers_rights(SOCK_STREAM, "STREAM: peek 与消费各得可用 fd");
+    peek_delivers_rights(SOCK_DGRAM, "DGRAM: peek 与消费各得可用 fd");
+    peek_delivers_rights(SOCK_SEQPACKET, "SEQPACKET: peek 与消费各得可用 fd");
     TEST_DONE();
 }
 
