@@ -40,6 +40,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 
 static void alarm_handler(int s)
 {
@@ -122,6 +123,121 @@ static int make_readable_fd(const char *marker, int len)
     (void)w;
     close(pfd[1]);
     return pfd[0];
+}
+
+/* ===== G. MSG_CMSG_CLOEXEC 跨 socket 类型(DGRAM/SEQPACKET) ===== */
+static void cloexec_on_type(int type, const char *tname)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, type, 0, sv) != 0) {
+        CHECK(0, "socketpair(该类型)");
+        return;
+    }
+    int f = make_readable_fd("Z", 1);
+    if (f < 0) { CHECK(0, "make_readable_fd"); close(sv[0]); close(sv[1]); return; }
+
+    CHECK(send_fds(sv[0], &f, 1) == 1, tname);
+    int got[4];
+    int n = recv_fds(sv[1], MSG_CMSG_CLOEXEC, got, 1, NULL);
+    CHECK(n == 1, tname);
+    if (n == 1) {
+        int fl = fcntl(got[0], F_GETFD);
+        CHECK(fl != -1 && (fl & FD_CLOEXEC), tname);
+        char buf[4] = { 0 };
+        CHECK(read(got[0], buf, 1) == 1 && buf[0] == 'Z', tname);
+        close(got[0]);
+    }
+
+    CHECK(send_fds(sv[0], &f, 1) == 1, tname);
+    n = recv_fds(sv[1], 0, got, 1, NULL);
+    CHECK(n == 1, tname);
+    if (n == 1) {
+        int fl = fcntl(got[0], F_GETFD);
+        CHECK(fl != -1 && !(fl & FD_CLOEXEC), tname);
+        close(got[0]);
+    }
+    close(f);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static int test_cloexec_across_types(void)
+{
+    TEST_START("G. MSG_CMSG_CLOEXEC on DGRAM/SEQPACKET");
+    cloexec_on_type(SOCK_DGRAM,
+                    "DGRAM: SCM_RIGHTS + MSG_CMSG_CLOEXEC 语义");
+    cloexec_on_type(SOCK_SEQPACKET,
+                    "SEQPACKET: SCM_RIGHTS + MSG_CMSG_CLOEXEC 语义");
+    TEST_DONE();
+}
+
+/* 建一个可 lseek 的临时文件 fd, 写入 content, offset 归零。 */
+static int make_seekable_fd(const char *content, int len)
+{
+    char path[] = "/tmp/cmsg_ofd_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    unlink(path);
+    if (write(fd, content, (size_t)len) != len) { close(fd); return -1; }
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+
+/* ===== H. 收端 fd 与发端共享 open file description(offset + status flags) ===== */
+static int test_shared_ofd(void)
+{
+    TEST_START("H. SCM_RIGHTS 收端与发端共享同一 OFD");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { CHECK(0, "socketpair"); TEST_DONE(); }
+
+    /* --- H1: 共享 file offset --- */
+    int sfd = make_seekable_fd("ABCDEFGH", 8);
+    CHECK(sfd >= 0, "建可 lseek 临时文件 fd");
+    if (sfd >= 0) {
+        CHECK(send_fds(sv[0], &sfd, 1) == 1, "send seekable fd");
+        int got[4];
+        int n = recv_fds(sv[1], 0, got, 1, NULL);
+        CHECK(n == 1, "收到共享 OFD 的 fd");
+        if (n == 1) {
+            off_t p = lseek(got[0], 3, SEEK_SET);
+            CHECK(p == 3, "收端 lseek(recv_fd, 3) 成功");
+            char c = 0;
+            ssize_t rd = read(sfd, &c, 1);
+            CHECK(rd == 1 && c == 'D', "发端 read 从收端设置的 offset 3 起(共享 offset -> 'D')");
+            char c2 = 0;
+            ssize_t rd2 = read(got[0], &c2, 1);
+            CHECK(rd2 == 1 && c2 == 'E', "收端 read 接续发端推进的 offset(共享 offset -> 'E')");
+            close(got[0]);
+        }
+        close(sfd);
+    }
+
+    /* --- H2: 共享 file status flags(F_SETFL 一端可见于另一端) --- */
+    int sfd2 = make_seekable_fd("xyz", 3);
+    if (sfd2 >= 0) {
+        CHECK(send_fds(sv[0], &sfd2, 1) == 1, "send fd (for status-flag share)");
+        int got[4];
+        int n = recv_fds(sv[1], 0, got, 1, NULL);
+        CHECK(n == 1, "收到 fd (for status-flag share)");
+        if (n == 1) {
+            int fl0 = fcntl(sfd2, F_GETFL);
+            CHECK(fl0 != -1 && fcntl(sfd2, F_SETFL, fl0 | O_APPEND) == 0,
+                  "发端 F_SETFL O_APPEND");
+            int fl_recv = fcntl(got[0], F_GETFL);
+            CHECK(fl_recv != -1 && (fl_recv & O_APPEND),
+                  "收端 F_GETFL 见 O_APPEND(共享 status flags)");
+            CHECK(fcntl(got[0], F_SETFL, fl_recv & ~O_APPEND) == 0,
+                  "收端 F_SETFL 清 O_APPEND");
+            int fl_send = fcntl(sfd2, F_GETFL);
+            CHECK(fl_send != -1 && !(fl_send & O_APPEND),
+                  "发端 F_GETFL 见 O_APPEND 已清(双向共享 status flags)");
+            close(got[0]);
+        }
+        close(sfd2);
+    }
+    close(sv[0]);
+    close(sv[1]);
+    TEST_DONE();
 }
 
 /* ===== A. 基础 SCM_RIGHTS fd 传递 ===== */
@@ -338,6 +454,8 @@ int main(void)
     fail |= test_ctrunc();
     fail |= test_errno();
     fail |= test_peek_keeps_fd();
+    fail |= test_cloexec_across_types();
+    fail |= test_shared_ofd();
     printf("\n==== test-cmsg-cloexec 汇总: %s ====\n", fail ? "FAIL" : "PASS");
     return fail;
 }
