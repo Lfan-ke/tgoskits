@@ -150,6 +150,10 @@ pub fn sys_sendmsg(fd: i32, msg: UserConstPtr<msghdr>, flags: u32) -> AxResult<i
     )
 }
 
+// Data-truncation and control-truncation are reported through separate out
+// flags because they feed different sinks (one into RecvOptions, one set
+// directly), so they stay as distinct parameters rather than a bundled struct.
+#[allow(clippy::too_many_arguments)]
 fn recv_impl(
     fd: i32,
     mut dst: impl Write + IoBufMut,

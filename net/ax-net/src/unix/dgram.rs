@@ -45,6 +45,9 @@ struct Packet {
     sender: UnixSocketAddr,
 }
 
+/// Receiver plus its poll set: the half a socket reads incoming packets from.
+type PacketRx = (async_channel::Receiver<Packet>, Arc<PollSet>);
+
 struct Channel {
     /// Sender side of the peer's datagram queue.
     data_tx: async_channel::Sender<Packet>,
@@ -71,7 +74,7 @@ impl Bind {
 /// Server-side halves handed to a seqpacket listener's `accept`.
 struct SeqConnRequest {
     /// Receiver + poll set the accepted socket reads incoming packets from.
-    data_rx: (async_channel::Receiver<Packet>, Arc<PollSet>),
+    data_rx: PacketRx,
     /// Channel the accepted socket sends packets to the client through.
     connected: Channel,
     /// Client address reported to `accept`.
@@ -93,11 +96,7 @@ pub struct SeqBind {
 impl SeqBind {
     /// Establish a connection: build a packet channel pair, hand the
     /// server side to the listener, and return the client side.
-    fn connect(
-        &self,
-        addr: UnixSocketAddr,
-        pid: u32,
-    ) -> AxResult<((async_channel::Receiver<Packet>, Arc<PollSet>), Channel)> {
+    fn connect(&self, addr: UnixSocketAddr, pid: u32) -> AxResult<(PacketRx, Channel)> {
         let (tx1, rx1) = async_channel::unbounded();
         let (tx2, rx2) = async_channel::unbounded();
         let poll1 = Arc::new(PollSet::new());
