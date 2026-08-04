@@ -1,0 +1,19 @@
+# cpu-font-test x86_64 - the "pyte for fonts" carpet: drive libfreetype (rasterization + metrics) and
+# libharfbuzz (shaping) and assert BYTE-EXACT (per-pixel SHA-256 / exact-integer 26.6 metrics / exact
+# glyph-index+position shaping) against goldens captured host-side. Runtime dependency is the Alpine musl
+# `freetype` + `harfbuzz` shared libs; the SHA-256 and golden constants are self-written in the cells. No
+# GPU or display. -smp 1: single vCPU. 2048M: font tables + shaping buffers + the 54-font realassets walk.
+args = [
+    "-machine", "q35",
+    "-nographic", "-cpu", "Haswell", "-m", "2048M", "-smp", "1",
+    "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:"
+shell_init_cmd = "sh /usr/bin/run_all.sh"
+success_regex = ['(?m)^TEST PASSED\s*$']
+fail_regex = ['(?i)\bpanic(?:ked)?\b', '(?m)^TEST FAILED\s*$']
+timeout = 12000

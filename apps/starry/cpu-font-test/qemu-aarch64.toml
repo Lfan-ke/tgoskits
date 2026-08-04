@@ -1,0 +1,17 @@
+# cpu-font-test aarch64 - "pyte for fonts" byte-exact carpet on the Alpine musl `freetype` + `harfbuzz`
+# libs, which Alpine builds for aarch64. Per-pixel SHA / exact 26.6 metrics / exact shaping are asserted
+# against host-captured goldens; the SHA-256 is self-written in the cells. -cpu max exposes the full
+# AArch64 feature set. -smp 1: single vCPU. 2048M: font tables + shaping buffers + the realassets walk.
+args = [
+    "-nographic", "-cpu", "max", "-m", "2048M", "-smp", "1",
+    "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
+    "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = "sh /usr/bin/run_all.sh"
+success_regex = ['(?m)^TEST PASSED\s*$']
+fail_regex = ['(?i)\bpanic(?:ked)?\b', '(?m)^TEST FAILED\s*$']
+timeout = 15000
