@@ -261,6 +261,74 @@ pub fn sys_sched_getparam(pid: i32, param: *mut ()) -> StarryResult<isize> {
     Ok(0)
 }
 
+/// Round-robin quantum: MAX_TIME_SLICE scheduler ticks (axtask api.rs sets
+/// MAX_TIME_SLICE = 5) at the scheduler tick rate (axconfig ticks-per-sec =
+/// 100), i.e. 5 * 10 ms.
+const RR_QUANTUM: TimeValue = TimeValue::from_millis(50);
+
+/// `sched_get_priority_max(2)`: highest priority usable by a policy. Mirrors
+/// Linux kernel/sched/syscalls.c - SCHED_FIFO/RR use MAX_RT_PRIO-1 (99), the
+/// fair policies use 0, and any other policy is EINVAL.
+pub fn sys_sched_get_priority_max(policy: i32) -> StarryResult<isize> {
+    match policy as u32 {
+        SCHED_FIFO | SCHED_RR => Ok(99),
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => Ok(0),
+        _ => Err(StarryError::InvalidInput),
+    }
+}
+
+/// `sched_get_priority_min(2)`: lowest priority usable by a policy. SCHED_FIFO/RR
+/// use 1, the fair policies use 0, any other policy is EINVAL.
+pub fn sys_sched_get_priority_min(policy: i32) -> StarryResult<isize> {
+    match policy as u32 {
+        SCHED_FIFO | SCHED_RR => Ok(1),
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => Ok(0),
+        _ => Err(StarryError::InvalidInput),
+    }
+}
+
+/// `sched_setparam(2)`: set only the priority, keeping the current policy.
+/// Mirrors Linux `do_sched_setscheduler(pid, SETPARAM_POLICY, param)`: the
+/// priority is validated against the task's existing policy (0 for the fair
+/// policies, 1..=99 with CAP_SYS_NICE for SCHED_FIFO/RR).
+pub fn sys_sched_setparam(pid: i32, param: *const ()) -> StarryResult<isize> {
+    let task = SchedulerTarget::try_from(pid)?.resolve()?;
+    check_sched_permission(&task)?;
+    let caller = current().as_thread().cred();
+    if param.is_null() {
+        return Err(StarryError::InvalidInput);
+    }
+    let user_param = vm_load::<SchedParam>(param.cast(), 1)?;
+    let prio = user_param[0].sched_priority;
+    match task.sched_policy() as u32 {
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => {
+            if prio != 0 {
+                return Err(StarryError::InvalidInput);
+            }
+        }
+        SCHED_FIFO | SCHED_RR => {
+            if !(1..=99).contains(&prio) {
+                return Err(StarryError::InvalidInput);
+            }
+            if !caller.has_cap_sys_nice() {
+                return Err(StarryError::OperationNotPermitted);
+            }
+        }
+        _ => return Err(StarryError::InvalidInput),
+    }
+    task.set_sched_priority(prio);
+    Ok(0)
+}
+
+/// `sched_rr_get_interval(2)`: write the round-robin quantum of a task to a
+/// timespec. Mirrors Linux kernel/sched/syscalls.c - a negative pid is EINVAL, a
+/// missing task is ESRCH.
+pub fn sys_sched_rr_get_interval(pid: i32, interval: *mut timespec) -> StarryResult<isize> {
+    let _task = SchedulerTarget::try_from(pid)?.resolve()?;
+    interval.vm_write(timespec::from_time_value(RR_QUANTUM))?;
+    Ok(0)
+}
+
 enum PrioritySelector {
     CurrentProcess,
     Process(TgidNumber),

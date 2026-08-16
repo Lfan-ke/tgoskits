@@ -1,10 +1,23 @@
-use ax_runtime::hal::time::TimeValue;
+use ax_runtime::hal::time::{NANOS_PER_SEC, TimeValue};
 use linux_raw_sys::general::{
     __kernel_old_timespec, __kernel_old_timeval, __kernel_sock_timeval, __kernel_timespec,
     timespec, timeval,
 };
 
 use crate::{StarryError, StarryResult};
+
+/// Tick rate of the `clock_t` unit reported by times(2), /proc/[pid]/stat and
+/// getrusage. Linux fixes USER_HZ at 100 (`sysconf(_SC_CLK_TCK)`), so one tick
+/// is 10 ms.
+pub const USER_HZ: u64 = 100;
+
+/// Convert an elapsed [`TimeValue`] to `clock_t` ticks, mirroring Linux
+/// `nsec_to_clock_t` (kernel/time/time.c). Sharing one conversion across
+/// times(2) and the /proc CPU-time fields keeps the kernel on a single tick
+/// unit.
+pub fn clock_t_ticks(elapsed: TimeValue) -> u64 {
+    (elapsed.as_nanos() / (NANOS_PER_SEC as u128 / USER_HZ as u128)) as u64
+}
 
 /// A helper trait for converting from and to `TimeValue`.
 pub trait TimeValueLike {

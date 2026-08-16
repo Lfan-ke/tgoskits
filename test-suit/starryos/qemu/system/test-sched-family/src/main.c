@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "test_framework.h"
 #include <sched.h>
+#include <sys/syscall.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -286,6 +287,63 @@ int main(void)
 
         // nonexistent pid -> ESRCH
         CHECK_ERR(getpriority(PRIO_PROCESS, 999999), ESRCH, "getpriority for non-existent pid returns ESRCH");
+    }
+
+    // ==== sched_get_priority_max / _min ====
+    {
+        CHECK(sched_get_priority_max(SCHED_FIFO) == 99, "get_priority_max(SCHED_FIFO)==99");
+        CHECK(sched_get_priority_max(SCHED_RR) == 99, "get_priority_max(SCHED_RR)==99");
+        CHECK(sched_get_priority_max(SCHED_OTHER) == 0, "get_priority_max(SCHED_OTHER)==0");
+        CHECK(sched_get_priority_max(SCHED_BATCH) == 0, "get_priority_max(SCHED_BATCH)==0");
+        CHECK(sched_get_priority_max(SCHED_IDLE) == 0, "get_priority_max(SCHED_IDLE)==0");
+        CHECK_ERR(sched_get_priority_max(0xbeef), EINVAL, "get_priority_max(invalid)->EINVAL");
+
+        CHECK(sched_get_priority_min(SCHED_FIFO) == 1, "get_priority_min(SCHED_FIFO)==1");
+        CHECK(sched_get_priority_min(SCHED_RR) == 1, "get_priority_min(SCHED_RR)==1");
+        CHECK(sched_get_priority_min(SCHED_OTHER) == 0, "get_priority_min(SCHED_OTHER)==0");
+        CHECK_ERR(sched_get_priority_min(0xbeef), EINVAL, "get_priority_min(invalid)->EINVAL");
+
+        CHECK(sched_get_priority_max(SCHED_FIFO) >= sched_get_priority_min(SCHED_FIFO),
+              "FIFO max >= min");
+    }
+
+    // ==== sched_rr_get_interval ====
+    {
+        struct timespec ts = { -1, -1 };
+        CHECK_RET(sched_rr_get_interval(0, &ts), 0, "rr_get_interval(0) returns 0");
+        CHECK(ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1000000000,
+              "rr_get_interval fills a valid timespec");
+        CHECK_ERR(sched_rr_get_interval(-1, &ts), EINVAL, "rr_get_interval(-1) -> EINVAL");
+        CHECK_ERR(sched_rr_get_interval(999999, &ts), ESRCH, "rr_get_interval(nonexistent) -> ESRCH");
+    }
+
+    // ==== sched_setparam (keeps current policy) ====
+    // musl stubs the process-scheduling wrappers (sched_setparam/setscheduler/
+    // getparam) to ENOSYS, so drive them through raw syscalls, like the
+    // sched_setscheduler cases above.
+    {
+        struct sched_param z = { .sched_priority = 0 };
+        // Establish a known non-RT policy first.
+        syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &z);
+        CHECK_RET(syscall(SYS_sched_setparam, 0, &z), 0, "setparam(prio=0) under SCHED_OTHER returns 0");
+        struct sched_param n = { .sched_priority = 5 };
+        CHECK_ERR(syscall(SYS_sched_setparam, 0, &n), EINVAL, "setparam(nonzero) under non-RT policy -> EINVAL");
+        CHECK_ERR(syscall(SYS_sched_setparam, -1, &z), EINVAL, "setparam(-1) -> EINVAL");
+        CHECK_ERR(syscall(SYS_sched_setparam, 999999, &z), ESRCH, "setparam(nonexistent) -> ESRCH");
+
+        // RT path (requires CAP_SYS_NICE; the suite runs privileged).
+        struct sched_param f = { .sched_priority = 10 };
+        if (syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &f) == 0) {
+            struct sched_param f2 = { .sched_priority = 20 };
+            CHECK_RET(syscall(SYS_sched_setparam, 0, &f2), 0, "setparam(prio=20) under SCHED_FIFO returns 0");
+            struct sched_param rd = { .sched_priority = -1 };
+            syscall(SYS_sched_getparam, 0, &rd);
+            CHECK(rd.sched_priority == 20, "setparam RT priority reads back via getparam");
+            struct sched_param bad = { .sched_priority = 200 };
+            CHECK_ERR(syscall(SYS_sched_setparam, 0, &bad), EINVAL, "setparam RT priority out of range -> EINVAL");
+            // Restore a benign policy so later state is clean.
+            syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &z);
+        }
     }
 
     TEST_DONE();

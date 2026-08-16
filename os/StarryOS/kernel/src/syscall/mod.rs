@@ -46,6 +46,14 @@ pub fn syscall_allows_signal_restart(sysno: usize) -> bool {
         return false;
     }
 
+    // nanosleep/clock_nanosleep use ERESTART_RESTARTBLOCK, not ERESTARTSYS: a
+    // handler interrupts them with EINTR, never a plain SA_RESTART re-run (which
+    // would restart from the original interval and over-sleep). The remaining
+    // time is reported to userspace, which resumes the sleep itself.
+    if matches!(sysno, Sysno::nanosleep | Sysno::clock_nanosleep) {
+        return false;
+    }
+
     // The legacy multiplexing entry points exist in the x86_64 syscall table
     // but not in the generic tables used by riscv64, aarch64, and loongarch64.
     #[cfg(target_arch = "x86_64")]
@@ -639,6 +647,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
         // task sched
         Sysno::sched_yield => sys_sched_yield(),
+        // restart_syscall resumes a syscall the kernel restarted via a
+        // restart_block. StarryOS reports the remaining time to userspace on
+        // interruption (ERESTART_RESTARTBLOCK semantics) instead of arming a
+        // kernel-side restart block, so a direct call has nothing pending and
+        // returns EINTR, matching Linux do_no_restart_syscall.
+        Sysno::restart_syscall => Err(StarryError::Interrupted),
         Sysno::nanosleep => sys_nanosleep(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::clock_nanosleep => sys_clock_nanosleep(
             uctx.arg0() as _,
@@ -657,6 +671,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             sys_sched_setscheduler(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }
         Sysno::sched_getparam => sys_sched_getparam(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::sched_setparam => sys_sched_setparam(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::sched_get_priority_max => sys_sched_get_priority_max(uctx.arg0() as _),
+        Sysno::sched_get_priority_min => sys_sched_get_priority_min(uctx.arg0() as _),
+        Sysno::sched_rr_get_interval => {
+            sys_sched_rr_get_interval(uctx.arg0() as _, uctx.arg1() as _)
+        }
         Sysno::getpriority => sys_getpriority(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setpriority => sys_setpriority(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 

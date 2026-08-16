@@ -42,6 +42,7 @@ use crate::{
         TaskStat, TgidNumber, Thread, TidNumber, get_process_data_by_number, processes, tasks,
         tick_cpu_time,
     },
+    time::clock_t_ticks,
 };
 
 /// Global IRQ counter incremented on every timer tick.
@@ -268,7 +269,7 @@ fn render_stat() -> String {
     let up = monotonic_time();
     let cpu_count = ax_runtime::hal::cpu_num() as u64;
     // Total CPU-time budget in jiffies across all CPUs (USER_HZ = 100).
-    let up_jiffies = up.as_secs() * 100 + (up.subsec_millis() / 10) as u64;
+    let up_jiffies = clock_t_ticks(up);
     let total_budget = up_jiffies.saturating_mul(cpu_count);
 
     // Single snapshot: aggregate CPU time and count task states together

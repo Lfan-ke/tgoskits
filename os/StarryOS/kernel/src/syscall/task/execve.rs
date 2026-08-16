@@ -13,7 +13,7 @@ use core::{
 
 use ax_runtime::hal::cpu::uspace::UserContext;
 use ax_task::{current, future::block_on, yield_now};
-use axfs_ng_vfs::Location;
+use axfs_ng_vfs::{Location, NodePermission};
 use kernel_elf_parser::AuxType;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 use starry_vm::vm_load_until_nul;
@@ -22,7 +22,7 @@ use crate::{
     StarryError, StarryResult,
     config::USER_HEAP_BASE,
     file::{ResolveAtResult, memfd::Memfd, resolve_at},
-    mm::{copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
+    mm::{ExecCreds, copy_from_kernel, load_user_app, new_user_aspace_empty, vm_load_string},
     sync::Mutex,
     task::{AsThread, Tid, TidNumber, zap_thread},
 };
@@ -179,10 +179,36 @@ fn do_execve(
     // also acts as the bprm-equivalent: the executable contents are
     // pinned now, so the post-teardown commit phase doesn't re-resolve
     // the pathname (the FS could change while siblings are being reaped).
+    // Post-exec credentials from the image's set-user-ID/set-group-ID bits,
+    // computed before `loc` is consumed and held in a local (Linux bprm->cred
+    // model): only committed past the point of no return, so a failed exec
+    // leaves the caller's credentials untouched. Mirrors Linux
+    // security/commoncap.c cap_bprm_creds_from_file.
+    let exec_meta = loc.metadata()?;
+    let mut post_cred = (*thr.cred()).clone();
+    post_cred.set_keep_capabilities(false);
+    if exec_meta.mode.contains(NodePermission::SET_UID) {
+        post_cred.euid = exec_meta.uid;
+        post_cred.suid = exec_meta.uid;
+        post_cred.fsuid = exec_meta.uid;
+    }
+    if exec_meta.mode.contains(NodePermission::SET_GID) {
+        post_cred.egid = exec_meta.gid;
+        post_cred.sgid = exec_meta.gid;
+        post_cred.fsgid = exec_meta.gid;
+    }
+    let exec_creds = ExecCreds {
+        uid: post_cred.uid,
+        euid: post_cred.euid,
+        gid: post_cred.gid,
+        egid: post_cred.egid,
+        secure: post_cred.euid != post_cred.uid || post_cred.egid != post_cred.gid,
+    };
+
     let mut new_aspace = new_user_aspace_empty()?;
     copy_from_kernel(&mut new_aspace)?;
     let (entry_point, user_stack_base, auxv) =
-        match load_user_app(&mut new_aspace, loc, &path, &args, &envs) {
+        match load_user_app(&mut new_aspace, loc, &path, &args, &envs, &exec_creds) {
             Ok(result) => result,
             Err(StarryError::InvalidExecutable) => {
                 // ENOEXEC fallback: retry via /bin/sh.
@@ -198,7 +224,14 @@ fn do_execve(
                 args = iter::once(String::from(shell_path))
                     .chain(args.iter().cloned())
                     .collect();
-                load_user_app(&mut new_aspace, shell_loc, shell_path, &args, &envs)?
+                load_user_app(
+                    &mut new_aspace,
+                    shell_loc,
+                    shell_path,
+                    &args,
+                    &envs,
+                    &exec_creds,
+                )?
             }
             Err(e) => return Err(e),
         };
@@ -283,15 +316,10 @@ fn do_execve(
     proc_data.replace_current_aspace(&curr, newaspace_arc);
     proc_data.mark_vm_aspace_private_after_exec();
 
-    // PR_SET_KEEPCAPS is deliberately not inherited by a new executable
-    // image. Do this only after crossing the point of no return so a failed
-    // exec leaves the caller's credential state untouched.
-    let old_cred = thr.cred();
-    if old_cred.keep_capabilities() {
-        let mut new_cred = (*old_cred).clone();
-        new_cred.set_keep_capabilities(false);
-        thr.set_cred(new_cred);
-    }
+    // Commit the credentials computed before the point of no return: cleared
+    // PR_SET_KEEPCAPS (not inherited across exec) plus any set-user-ID /
+    // set-group-ID transition. Doing it here keeps a failed exec harmless.
+    thr.set_cred(post_cred);
 
     curr.set_name(&new_name);
     *proc_data.exe_path.write() = new_exe_path;

@@ -1,6 +1,4 @@
-use ax_runtime::hal::time::{
-    NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks, wall_time,
-};
+use ax_runtime::hal::time::{NANOS_PER_SEC, TimeValue, monotonic_time, wall_time};
 use ax_task::current;
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
@@ -11,8 +9,8 @@ use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
     StarryError, StarryResult,
-    task::{AsThread, ITimerType, posix_timer::TimerSpec},
-    time::TimeValueLike,
+    task::{AsThread, ITimerType, get_task_by_number, posix_timer::TimerSpec, task_cpu_time},
+    time::{TimeValueLike, clock_t_ticks},
 };
 
 pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> StarryResult<isize> {
@@ -89,15 +87,33 @@ pub struct Tms {
 }
 
 pub fn sys_times(tms: *mut Tms) -> StarryResult<isize> {
-    let (utime, stime) = current().as_thread().time.borrow().output();
-    let (cutime, cstime) = current().as_thread().proc_data.children_cpu_time();
-    tms.vm_write(Tms {
-        tms_utime: utime.as_micros() as usize,
-        tms_stime: stime.as_micros() as usize,
-        tms_cutime: cutime.as_micros() as usize,
-        tms_cstime: cstime.as_micros() as usize,
-    })?;
-    Ok(nanos_to_ticks(monotonic_time_nanos()) as _)
+    let curr = current();
+    let thr = curr.as_thread();
+    // Thread-group CPU time: sum every thread in the process, matching Linux
+    // `thread_group_cputime` (do_sys_times) and getrusage(RUSAGE_SELF).
+    let (utime, stime) = thr.proc_data.proc.threads().into_iter().fold(
+        (TimeValue::ZERO, TimeValue::ZERO),
+        |(u, s), tid| match get_task_by_number(tid) {
+            Ok(task) => {
+                let (tu, ts) = task_cpu_time(&task);
+                (u + tu, s + ts)
+            }
+            Err(_) => (u, s),
+        },
+    );
+    let (cutime, cstime) = thr.proc_data.children_cpu_time();
+    // Linux copies the struct only when buf is non-NULL (kernel/sys.c times()).
+    if !tms.is_null() {
+        tms.vm_write(Tms {
+            tms_utime: clock_t_ticks(utime) as usize,
+            tms_stime: clock_t_ticks(stime) as usize,
+            tms_cutime: clock_t_ticks(cutime) as usize,
+            tms_cstime: clock_t_ticks(cstime) as usize,
+        })?;
+    }
+    // Return elapsed wall time in the same clock_t ticks, mirroring Linux
+    // `jiffies_64_to_clock_t(get_jiffies_64())`.
+    Ok(clock_t_ticks(monotonic_time()) as isize)
 }
 
 pub fn sys_getitimer(which: i32, value: *mut itimerval) -> StarryResult<isize> {

@@ -3,7 +3,10 @@ use core::mem::size_of;
 use ax_task::current;
 use starry_vm::{VmMutPtr, VmPtr};
 
-use crate::{Errno, StarryError, task::AsThread};
+use crate::{
+    Errno, StarryError,
+    task::{AsThread, Thread},
+};
 
 /// Linux rseq area layout used for ABI validation.
 #[repr(C)]
@@ -87,6 +90,24 @@ pub fn sys_rseq(addr: *mut u8, len: usize, flags: u32, sig: u32) -> Result<isize
     ensure_rseq_area_accessible(addr)?;
     thr.set_rseq_state(addr, sig);
     Ok(0)
+}
+
+/// Publish the current CPU id into a thread's registered rseq area on return to
+/// user, mirroring Linux `rseq_update_cpu_node_id` (kernel/rseq.c). userspace
+/// reads `rseq.cpu_id` for a lock-free `sched_getcpu` fast path; before this it
+/// stayed `RSEQ_CPU_ID_UNINITIALIZED`.
+pub fn update_rseq_cpu_id(thr: &Thread) {
+    let addr = thr.rseq_area();
+    if addr == 0 {
+        return;
+    }
+    let cpu = ax_runtime::hal::percpu::this_cpu_id() as u32;
+    // struct rseq: cpu_id_start at offset 0, cpu_id at offset 4. Best-effort: a
+    // task that unmapped its area just misses the update, it is not fatal.
+    let cpu_id_start = addr as *mut u32;
+    let cpu_id = (addr + size_of::<u32>()) as *mut u32;
+    let _ = cpu_id_start.vm_write(cpu);
+    let _ = cpu_id.vm_write(cpu);
 }
 
 #[cfg(axtest)]

@@ -23,6 +23,8 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/auxv.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -323,8 +325,65 @@ static void test_execveat_non_directory_dirfd_enotdir(void)
     close(fd);
 }
 
-int main(void)
+/*
+ * execve credential transition + AT_SECURE (Linux commoncap.c
+ * cap_bprm_creds_from_file + fs/binfmt_elf.c create_elf_tables):
+ *   - AT_UID/EUID/GID/EGID reflect the real credentials, not a hardcoded 0.
+ *   - A plain (non-setuid) exec leaves AT_SECURE == 0.
+ *   - Executing a set-user-ID-root binary raises euid to the file owner (0)
+ *     and sets AT_SECURE == 1, even when the caller had dropped to non-root.
+ * The child branch re-execs this binary (argv[1] == "suidchild") after the
+ * file has been made set-uid root and the caller has dropped its ids.
+ */
+static void test_execve_setuid_creds_at_secure(const char *self_path)
 {
+    CHECK((uid_t)getauxval(AT_UID) == getuid(), "AT_UID == getuid()");
+    CHECK((uid_t)getauxval(AT_EUID) == geteuid(), "AT_EUID == geteuid()");
+    CHECK((gid_t)getauxval(AT_GID) == getgid(), "AT_GID == getgid()");
+    CHECK((gid_t)getauxval(AT_EGID) == getegid(), "AT_EGID == getegid()");
+    CHECK(getauxval(AT_SECURE) == 0, "plain exec: AT_SECURE == 0");
+
+    if (self_path == NULL || self_path[0] != '/') {
+        CHECK(0, "setuid test: need an absolute self path");
+        return;
+    }
+    if (chown(self_path, 0, 0) != 0) {
+        CHECK(0, "chown self to root:root");
+        return;
+    }
+    if (chmod(self_path, S_ISUID | 0755) != 0) {
+        CHECK(0, "chmod u+s self");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Drop every id to non-root, then exec the set-uid-root image. */
+        if (setresgid(1000, 1000, 1000) != 0 || setresuid(1000, 1000, 1000) != 0) {
+            _exit(120);
+        }
+        execl(self_path, self_path, "suidchild", (char *)NULL);
+        _exit(127);
+    }
+    CHECK(pid > 0, "fork for setuid child");
+    int st = 0;
+    waitpid(pid, &st, 0);
+    /* The child exits 42 only if euid==0 (elevated by set-uid root) AND
+     * AT_SECURE==1; 43 if it ran but the credential/AT_SECURE was wrong. */
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 42,
+          "set-uid-root exec elevates euid to owner and sets AT_SECURE");
+    chmod(self_path, 0755);
+}
+
+int main(int argc, char **argv)
+{
+    /* Re-exec'd child of the set-uid test: report elevation + AT_SECURE. */
+    if (argc >= 2 && argv[1] != NULL && strcmp(argv[1], "suidchild") == 0) {
+        int elevated = (geteuid() == 0);
+        int secure = (getauxval(AT_SECURE) == 1);
+        return (elevated && secure) ? 42 : 43;
+    }
+
     TEST_START("execve/execveat family semantics");
 
     test_fork_child_exit_wait4();
@@ -338,6 +397,8 @@ int main(void)
     test_execveat_memfd_sealed_exec();
     test_execveat_error_returns();
     test_execveat_non_directory_dirfd_enotdir();
+
+    test_execve_setuid_creds_at_secure(argv[0]);
 
     TEST_DONE();
 }

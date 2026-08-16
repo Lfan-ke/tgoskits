@@ -114,6 +114,35 @@ static void part_04_register_after_unregister(void)
               "cleanup unregister succeeds");
 }
 
+/*
+ * After registration the kernel must publish the current CPU id into the rseq
+ * area on return to user (Linux rseq_update_cpu_node_id): userspace reads
+ * rseq.cpu_id for a lock-free sched_getcpu fast path. Before this fix the field
+ * stayed RSEQ_CPU_ID_UNINITIALIZED forever.
+ */
+static void part_05_cpu_id_published(void)
+{
+    reset_area(&primary_area);
+    CHECK_RET(rseq_call(&primary_area, sizeof(primary_area), 0, RSEQ_SIG), 0,
+              "register for cpu_id publication");
+
+    /* A syscall crosses into the kernel; the publish happens on the return. */
+    unsigned gc_cpu = (unsigned)-1;
+    syscall(SYS_getcpu, &gc_cpu, NULL, NULL);
+
+    uint32_t cid = *(volatile uint32_t *)&primary_area.cpu_id;
+    uint32_t cid_start = *(volatile uint32_t *)&primary_area.cpu_id_start;
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+
+    CHECK(cid != RSEQ_CPU_ID_UNINITIALIZED,
+          "rseq cpu_id is published after a syscall (not left UNINITIALIZED)");
+    CHECK(nproc > 0 && cid < (uint32_t)nproc, "rseq cpu_id is in [0, nproc)");
+    CHECK(cid_start == cid, "rseq cpu_id_start matches cpu_id");
+    CHECK(cid == gc_cpu, "rseq cpu_id matches getcpu() syscall");
+
+    rseq_call(&primary_area, sizeof(primary_area), RSEQ_FLAG_UNREGISTER, RSEQ_SIG);
+}
+
 int main(void)
 {
     TEST_START("rseq syscall");
@@ -125,6 +154,7 @@ int main(void)
     part_02_bad_user_memory();
     part_03_registration_lifecycle();
     part_04_register_after_unregister();
+    part_05_cpu_id_published();
 
     TEST_DONE();
 }

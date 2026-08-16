@@ -7,6 +7,7 @@ use crate::{
     StarryResult,
     mm::ProcessMemStats,
     task::{AsThread, task_cpu_time},
+    time::clock_t_ticks,
 };
 
 /// Represents the `/proc/[pid]/stat` file.
@@ -89,12 +90,11 @@ impl TaskStat {
         let session = proc.group().session().sid();
 
         let (utime_tv, stime_tv) = task_cpu_time(task);
-        // Convert to jiffies (USER_HZ = 100, so 1 jiffy = 10 ms = 10_000_000 ns).
-        let utime = (utime_tv.as_millis() / 10) as u64;
-        let stime = (stime_tv.as_millis() / 10) as u64;
+        let utime = clock_t_ticks(utime_tv);
+        let stime = clock_t_ticks(stime_tv);
         let (cutime_tv, cstime_tv) = proc_data.children_cpu_time();
-        let cutime = (cutime_tv.as_millis() / 10) as u64;
-        let cstime = (cstime_tv.as_millis() / 10) as u64;
+        let cutime = clock_t_ticks(cutime_tv);
+        let cstime = clock_t_ticks(cstime_tv);
 
         let mem = ProcessMemStats::collect(&proc_data.aspace().lock());
 

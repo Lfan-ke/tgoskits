@@ -645,11 +645,8 @@ impl ElfLoader {
             AuxType::HWCAP,
             ax_runtime::hal::cpu::cap::elf_hwcap(),
         ));
-        auxv.push(AuxEntry::new(AuxType::UID, 0));
-        auxv.push(AuxEntry::new(AuxType::EUID, 0));
-        auxv.push(AuxEntry::new(AuxType::GID, 0));
-        auxv.push(AuxEntry::new(AuxType::EGID, 0));
-        auxv.push(AuxEntry::new(AuxType::SECURE, 0));
+        // AT_UID/EUID/GID/EGID/SECURE are filled by load_user_app, which knows
+        // the post-exec credentials (a set-uid/set-gid image changes them).
 
         debug!(
             "loader: entry={:#x} auxv_len={} has_ldso={} auxv_last_type={}",
@@ -673,6 +670,18 @@ static ELF_LOADER: Mutex<ElfLoader> = Mutex::new(ElfLoader::new());
 #[cfg(feature = "memtrack")]
 pub fn clear_elf_cache() {
     ELF_LOADER.lock().0.clear();
+}
+
+/// Post-exec credentials the loader records in the ELF auxiliary vector
+/// (AT_UID/EUID/GID/EGID/SECURE). A set-user-ID/set-group-ID image changes
+/// euid/egid and makes the exec "secure" (glibc/musl read AT_SECURE to harden
+/// the process).
+pub struct ExecCreds {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub secure: bool,
 }
 
 /// Load the user app to the user address space.
@@ -701,6 +710,7 @@ pub fn load_user_app(
     path: &str,
     args: &[String],
     envs: &[String],
+    creds: &ExecCreds,
 ) -> StarryResult<(VirtAddr, VirtAddr, Vec<AuxEntry>)> {
     // `/proc/self/exe` is available in procfs; busybox can `readlink` it
     // to re-exec itself as a shell on ENOEXEC, provided the busybox build
@@ -712,10 +722,10 @@ pub fn load_user_app(
         let sh = ax_fs_ng::vfs::current_fs_context()
             .lock()
             .resolve("/bin/sh")?;
-        return load_user_app(uspace, sh, "/bin/sh", &new_args, envs);
+        return load_user_app(uspace, sh, "/bin/sh", &new_args, envs, creds);
     }
 
-    let (entry, auxv) = match { ELF_LOADER.lock().load(uspace, loc)? } {
+    let (entry, mut auxv) = match { ELF_LOADER.lock().load(uspace, loc)? } {
         Ok((entry, auxv)) => (entry, auxv),
         Err(data) => {
             if data.starts_with(b"#!") {
@@ -736,7 +746,7 @@ pub fn load_user_app(
                 let interp = ax_fs_ng::vfs::current_fs_context()
                     .lock()
                     .resolve(&new_args[0])?;
-                return load_user_app(uspace, interp, &new_args[0], &new_args, envs);
+                return load_user_app(uspace, interp, &new_args[0], &new_args, envs, creds);
             }
             return Err(StarryError::InvalidExecutable);
         }
@@ -754,6 +764,14 @@ pub fn load_user_app(
         false,
         Backend::new_alloc(ustack_start, PAGE_SIZE_4K, "[stack]"),
     )?;
+
+    // Record the post-exec credentials (Linux fs/binfmt_elf.c create_elf_tables:
+    // AT_UID/EUID/GID/EGID from cred, AT_SECURE from bprm->secureexec).
+    auxv.push(AuxEntry::new(AuxType::UID, creds.uid as usize));
+    auxv.push(AuxEntry::new(AuxType::EUID, creds.euid as usize));
+    auxv.push(AuxEntry::new(AuxType::GID, creds.gid as usize));
+    auxv.push(AuxEntry::new(AuxType::EGID, creds.egid as usize));
+    auxv.push(AuxEntry::new(AuxType::SECURE, creds.secure as usize));
 
     let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
     let user_sp = ustack_top - stack_data.len();

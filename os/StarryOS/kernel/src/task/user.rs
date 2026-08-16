@@ -15,7 +15,7 @@ use super::{
     poll_process_timer, ptrace_stop_current, ptrace_syscall_stop_current, raise_signal_fatal,
     set_timer_state, unblock_next_signal, wait_existing_ptrace_stop_current,
 };
-use crate::syscall::{handle_syscall, syscall_allows_signal_restart};
+use crate::syscall::{handle_syscall, syscall_allows_signal_restart, update_rseq_cpu_id};
 
 fn handle_user_page_fault(
     thread: &Thread,
@@ -120,6 +120,10 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
 
                     crate::syscall::ptrace_setup_singlestep(&thr.proc_data, tid, &mut uctx);
                 }
+
+                // Publish the current CPU id into a registered rseq area before
+                // resuming user code (Linux rseq_update_cpu_node_id).
+                update_rseq_cpu_id(thr);
 
                 let reason = uctx.run();
 

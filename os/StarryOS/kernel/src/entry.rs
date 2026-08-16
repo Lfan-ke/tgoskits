@@ -8,7 +8,7 @@ use ax_task::{AxTaskExt, spawn_task_with};
 
 use crate::{
     file::{FD_TABLE, FileTable},
-    mm::{copy_from_kernel, load_user_app, new_user_aspace_empty},
+    mm::{ExecCreds, copy_from_kernel, load_user_app, new_user_aspace_empty},
     pseudofs::{self, dev::tty},
     sync::{Mutex, PreemptIrqSaveGuard, RwLock},
     task::{
@@ -60,8 +60,17 @@ pub fn init(args: &[String], envs: &[String]) {
         })
         .expect("Failed to create user address space");
 
-    let (entry_vaddr, ustack_top, auxv) = load_user_app(&mut uspace, loc, &args[0], args, envs)
-        .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
+    // The init process runs as root with no set-uid/set-gid transition.
+    let init_creds = ExecCreds {
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        secure: false,
+    };
+    let (entry_vaddr, ustack_top, auxv) =
+        load_user_app(&mut uspace, loc, &args[0], args, envs, &init_creds)
+            .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
     let mut task = new_user_task(&name, uctx, 0);
