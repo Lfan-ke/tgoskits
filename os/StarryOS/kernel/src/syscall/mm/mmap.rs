@@ -1200,6 +1200,54 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> StarryResult<isize>
     Ok(0)
 }
 
+pub fn sys_munlock(addr: usize, length: usize) -> StarryResult<isize> {
+    // Linux mm/mlock.c apply_vma_lock_flags(flags == 0): clear VM_LOCKED over the
+    // page-rounded range. This kernel has no swap, so unlocking has no residency
+    // effect, but the range is still validated exactly like mlock and reports
+    // ENOMEM when it covers an unmapped hole.
+    if length == 0 {
+        return Ok(0);
+    }
+    let aligned = addr.align_down(PAGE_SIZE_4K);
+    let raw_end = addr.checked_add(length).ok_or(StarryError::InvalidInput)?;
+    let end = raw_end.align_up(PAGE_SIZE_4K);
+    if end < raw_end {
+        return Err(StarryError::InvalidInput);
+    }
+    let size = end - aligned;
+    let curr = current();
+    let aspace_arc = curr.as_thread().proc_data.aspace();
+    let aspace = aspace_arc.lock();
+    if !aspace.can_access_range(VirtAddr::from(aligned), size, MappingFlags::empty()) {
+        return Err(StarryError::NoMemory);
+    }
+    Ok(0)
+}
+
+pub fn sys_mlockall(flags: u32) -> StarryResult<isize> {
+    // Linux mm/mlock.c sys_mlockall flag validation: reject empty flags, unknown
+    // bits, or MCL_ONFAULT without MCL_CURRENT|MCL_FUTURE. On this no-reclaim
+    // kernel a mapped page is never evicted, so the residency guarantee holds
+    // without an eager fault-in (pages fault on first access as usual); the call
+    // therefore reduces to validating the MCL_* matrix.
+    const MCL_CURRENT: u32 = 1;
+    const MCL_FUTURE: u32 = 2;
+    const MCL_ONFAULT: u32 = 4;
+    if flags == 0
+        || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0
+        || flags == MCL_ONFAULT
+    {
+        return Err(StarryError::InvalidInput);
+    }
+    Ok(0)
+}
+
+pub fn sys_munlockall() -> StarryResult<isize> {
+    // Linux mm/mlock.c sys_munlockall clears MCL_* for the whole address space
+    // and always returns 0 (barring a fatal signal). No swap here, so a no-op.
+    Ok(0)
+}
+
 #[cfg(axtest)]
 pub(crate) fn mmap_capped_device_map_len_rules_hold_for_test() -> bool {
     // capped_device_map_len: returns min of request and aligned available.

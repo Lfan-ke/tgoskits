@@ -28,6 +28,68 @@ struct SchedParam {
     sched_priority: i32,
 }
 
+/// `SCHED_RESET_ON_FORK` bit OR'd into the policy word by
+/// sched_setscheduler/getscheduler (`include/uapi/linux/sched.h`).
+const SCHED_RESET_ON_FORK: u32 = 0x4000_0000;
+
+// sched_attr (`include/uapi/linux/sched/types.h`) size versions and flags.
+const SCHED_ATTR_SIZE_VER0: usize = 48;
+const SCHED_ATTR_SIZE_VER1: usize = 56;
+const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+const SCHED_FLAG_UTIL_CLAMP: u64 = 0x20 | 0x40;
+const SCHED_FLAG_ALL: u64 = 0x7f;
+const SCHED_ATTR_SIZE_MAX: usize = 4096;
+
+/// `struct sched_attr` (`include/uapi/linux/sched/types.h`), 56 bytes = VER1.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct SchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+    sched_util_min: u32,
+    sched_util_max: u32,
+}
+
+/// Read a size-versioned `sched_attr` from userspace, 1:1 with Linux
+/// `sched_copy_attr`: `size == 0` becomes VER0, `size < VER0` or trailing
+/// non-zero bytes past the known struct is E2BIG, UTIL_CLAMP needs VER1, and
+/// `sched_nice` is clamped to `[-20, 19]`.
+fn copy_sched_attr(uattr: *const u8) -> StarryResult<SchedAttr> {
+    let head = vm_load(uattr, 4)?;
+    let mut size = u32::from_ne_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    if size == 0 {
+        size = SCHED_ATTR_SIZE_VER0;
+    }
+    if size < SCHED_ATTR_SIZE_VER0 {
+        return Err(StarryError::ArgumentListTooLong);
+    }
+    let ksize = core::mem::size_of::<SchedAttr>();
+    if size > ksize {
+        let tail = vm_load(unsafe { uattr.add(ksize) }, size - ksize)?;
+        if tail.iter().any(|&b| b != 0) {
+            return Err(StarryError::ArgumentListTooLong);
+        }
+    }
+    let copy = size.min(ksize);
+    let src = vm_load(uattr, copy)?;
+    let mut buf = [0u8; core::mem::size_of::<SchedAttr>()];
+    buf[..copy].copy_from_slice(&src);
+    let mut attr: SchedAttr = bytemuck::pod_read_unaligned(&buf);
+    if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP != 0 && size < SCHED_ATTR_SIZE_VER1 {
+        return Err(StarryError::InvalidInput);
+    }
+    attr.sched_nice = attr.sched_nice.clamp(-20, 19);
+    Ok(attr)
+}
+
 pub fn sys_sched_yield() -> StarryResult<isize> {
     ax_task::yield_now();
     Ok(0)
@@ -200,7 +262,11 @@ impl TryFrom<i32> for SchedulerTarget {
 
 pub fn sys_sched_getscheduler(pid: i32) -> StarryResult<isize> {
     let task = SchedulerTarget::try_from(pid)?.resolve()?;
-    Ok(task.sched_policy() as isize)
+    let mut policy = task.sched_policy();
+    if task.reset_on_fork() {
+        policy |= SCHED_RESET_ON_FORK as i32;
+    }
+    Ok(policy as isize)
 }
 
 pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const ()) -> StarryResult<isize> {
@@ -213,8 +279,7 @@ pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const ()) -> Starry
     let user_param = vm_load::<SchedParam>(param.cast(), 1)?;
     let user_param = user_param[0];
     let mut policy = policy as u32;
-    const SCHED_RESET_ON_FORK: u32 = 0x40000000;
-    let _reset_on_fork = (policy & SCHED_RESET_ON_FORK) != 0;
+    let reset_on_fork = (policy & SCHED_RESET_ON_FORK) != 0;
     policy &= !SCHED_RESET_ON_FORK;
     let prio = user_param.sched_priority;
     match policy {
@@ -239,6 +304,7 @@ pub fn sys_sched_setscheduler(pid: i32, policy: i32, param: *const ()) -> Starry
     }
     task.set_sched_policy(policy as i32);
     task.set_sched_priority(prio);
+    task.set_reset_on_fork(reset_on_fork);
     Ok(0)
 }
 
@@ -258,6 +324,96 @@ pub fn sys_sched_getparam(pid: i32, param: *mut ()) -> StarryResult<isize> {
         );
         vm_write_slice(ptr as *mut u8, bytes)?;
     }
+    Ok(0)
+}
+
+/// `sched_setattr(2)` - superset of setscheduler with the size-versioned
+/// `sched_attr`. SCHED_DEADLINE is rejected (no deadline class here). 1:1 with
+/// `kernel/sched/syscalls.c` sys_sched_setattr / __sched_setscheduler.
+pub fn sys_sched_setattr(pid: i32, uattr: *const u8, flags: u32) -> StarryResult<isize> {
+    if uattr.is_null() || pid < 0 || flags != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let attr = copy_sched_attr(uattr)?;
+    if attr.sched_flags & !SCHED_FLAG_ALL != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let task = SchedulerTarget::try_from(pid)?.resolve()?;
+    check_sched_permission(&task)?;
+    let caller = current().as_thread().cred();
+
+    let keep_policy = attr.sched_flags & SCHED_FLAG_KEEP_POLICY != 0;
+    let keep_params = attr.sched_flags & SCHED_FLAG_KEEP_PARAMS != 0;
+    let policy = if keep_policy {
+        task.sched_policy() as u32
+    } else {
+        if (attr.sched_policy as i32) < 0 {
+            return Err(StarryError::InvalidInput);
+        }
+        attr.sched_policy
+    };
+    let prio = attr.sched_priority as i32;
+    match policy {
+        SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE => {
+            if !keep_params && prio != 0 {
+                return Err(StarryError::InvalidInput);
+            }
+        }
+        SCHED_FIFO | SCHED_RR => {
+            if !keep_params && !(1..=99).contains(&prio) {
+                return Err(StarryError::InvalidInput);
+            }
+            if !caller.has_cap_sys_nice() {
+                return Err(StarryError::OperationNotPermitted);
+            }
+        }
+        // SCHED_DEADLINE and any other value: unsupported.
+        _ => return Err(StarryError::InvalidInput),
+    }
+    if !keep_policy {
+        task.set_sched_policy(policy as i32);
+    }
+    if !keep_params {
+        task.set_sched_priority(prio);
+        if matches!(policy, SCHED_NORMAL | SCHED_BATCH) {
+            task.as_thread().proc_data.set_nice(attr.sched_nice);
+        }
+    }
+    task.set_reset_on_fork(attr.sched_flags & SCHED_FLAG_RESET_ON_FORK != 0);
+    Ok(0)
+}
+
+/// `sched_getattr(2)` - reports policy, priority (RT) or nice (fair), and the
+/// RESET_ON_FORK flag, writing `min(usize, sizeof)` bytes. 1:1 with
+/// `kernel/sched/syscalls.c` sys_sched_getattr.
+pub fn sys_sched_getattr(pid: i32, uattr: *mut u8, usize_: u32, flags: u32) -> StarryResult<isize> {
+    let usize_ = usize_ as usize;
+    if uattr.is_null()
+        || pid < 0
+        || !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_SIZE_MAX).contains(&usize_)
+    {
+        return Err(StarryError::InvalidInput);
+    }
+    let task = SchedulerTarget::try_from(pid)?.resolve()?;
+    // Non-DEADLINE tasks reject any getattr flag (only DL_DYNAMIC is defined).
+    if flags != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let policy = task.sched_policy();
+    let mut attr = SchedAttr::zeroed();
+    attr.sched_policy = policy as u32;
+    if task.reset_on_fork() {
+        attr.sched_flags |= SCHED_FLAG_RESET_ON_FORK;
+    }
+    if matches!(policy as u32, SCHED_FIFO | SCHED_RR) {
+        attr.sched_priority = task.sched_priority() as u32;
+    } else {
+        attr.sched_nice = task.as_thread().proc_data.nice();
+    }
+    let ksize = core::mem::size_of::<SchedAttr>();
+    let n = usize_.min(ksize);
+    attr.size = n as u32;
+    vm_write_slice(uattr, &bytemuck::bytes_of(&attr)[..n])?;
     Ok(0)
 }
 

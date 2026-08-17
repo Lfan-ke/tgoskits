@@ -37,6 +37,14 @@ pub fn try_init_epoch_offset(epoch_time_nanos: u64) -> bool {
         .is_ok()
 }
 
+/// Set the wall-clock epoch unconditionally (clock_settime/settimeofday).
+/// `epoch_time_nanos` is the desired CLOCK_REALTIME value now; the stored offset
+/// makes `wall_time() = monotonic + offset` read it back, forward or backward.
+pub fn set_epoch_offset(epoch_time_nanos: u64) {
+    let offset = epoch_time_nanos.saturating_sub(ticks_to_nanos(current_ticks()));
+    EPOCH_OFFSET_NANOS.store(offset, Ordering::Release);
+}
+
 #[cfg(all(feature = "rtc", target_arch = "loongarch64"))]
 pub(crate) fn try_init_epoch_offset_from_firmware() -> bool {
     let Some(epoch_time_nanos) = somehal::rtc::epoch_time_nanos() else {

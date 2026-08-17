@@ -436,6 +436,29 @@ pub fn sys_fadvise64(
     Ok(0)
 }
 
+pub fn sys_readahead(fd: c_int, _offset: __kernel_off_t, _count: usize) -> StarryResult<isize> {
+    debug!("sys_readahead <= fd: {fd}");
+    // Linux mm/readahead.c ksys_readahead: an advisory WILLNEED hint. A bad or
+    // closed fd is EBADF; a fd not open for reading is EBADF; a fd that is
+    // neither a regular file nor a block device (pipe/socket/dir/char device)
+    // is EINVAL. offset and count are not range-checked. This kernel has no
+    // page cache to prefetch into, so a validated fd is a no-op like fadvise64.
+    let file = File::from_fd(fd).map_err(|e| match e {
+        StarryError::BadFileDescriptor => e,
+        _ => StarryError::InvalidInput,
+    })?;
+    // FMODE_READ is checked before the type gate, so an O_WRONLY regular file
+    // yields EBADF rather than EINVAL.
+    file.inner()
+        .access(FileFlags::READ)
+        .map_err(|_| StarryError::BadFileDescriptor)?;
+    let node_type = file.inner().location().metadata()?.node_type;
+    if !matches!(node_type, NodeType::RegularFile | NodeType::BlockDevice) {
+        return Err(StarryError::InvalidInput);
+    }
+    Ok(0)
+}
+
 pub fn sys_pread64(
     fd: c_int,
     buf: *mut u8,

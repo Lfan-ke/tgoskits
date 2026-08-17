@@ -1,9 +1,10 @@
 use ax_runtime::hal::time::{
-    NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks, wall_time,
+    MICROS_PER_SEC, NANOS_PER_SEC, TimeValue, monotonic_time, monotonic_time_nanos, nanos_to_ticks,
+    wall_time,
 };
 use ax_task::current;
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
+    __kernel_clockid_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE,
     CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE,
     CLOCK_THREAD_CPUTIME_ID, itimerval, timespec, timeval,
 };
@@ -46,6 +47,69 @@ pub fn sys_gettimeofday(ts: *mut timeval, tz: *mut Timezone) -> StarryResult<isi
     }
     if let Some(tz) = tz.nullable() {
         tz.vm_write(Timezone::default())?;
+    }
+    Ok(0)
+}
+
+fn require_cap_sys_time() -> StarryResult<()> {
+    if current().as_thread().cred().has_cap(CAP_SYS_TIME) {
+        Ok(())
+    } else {
+        Err(StarryError::OperationNotPermitted)
+    }
+}
+
+/// Set CLOCK_REALTIME to `wall` (Linux do_settimeofday64): store the epoch offset
+/// so a later clock_gettime(CLOCK_REALTIME) reads it back, forward or backward.
+fn set_realtime(wall: TimeValue) {
+    ax_runtime::hal::time::set_epoch_offset(wall.as_nanos() as u64);
+}
+
+pub fn sys_clock_settime(clock_id: __kernel_clockid_t, tp: *const timespec) -> StarryResult<isize> {
+    // Only CLOCK_REALTIME is settable; every other clock is EINVAL (posix-timers.c
+    // clockid_to_kclock + kc->clock_set). Checked before EFAULT and EPERM.
+    if clock_id as u32 != CLOCK_REALTIME {
+        return Err(StarryError::InvalidInput);
+    }
+    // EFAULT (bad pointer) first, then timespec validity (EINVAL) before the
+    // permission hook, mirroring do_sys_settimeofday64 ordering.
+    let ts = unsafe { tp.vm_read_uninit()?.assume_init() };
+    let wall = ts.try_into_time_value()?;
+    require_cap_sys_time()?;
+    set_realtime(wall);
+    Ok(0)
+}
+
+pub fn sys_settimeofday(tv: *const timeval, tz: *const Timezone) -> StarryResult<isize> {
+    // tv is copied and range-validated first (tv_usec out of range -> EINVAL),
+    // matching the raw settimeofday handler, before the permission check.
+    let wall = match tv.nullable() {
+        Some(tv) => {
+            let tv = unsafe { tv.vm_read_uninit()?.assume_init() };
+            if tv.tv_usec < 0 || tv.tv_usec as u64 >= MICROS_PER_SEC || tv.tv_sec < 0 {
+                return Err(StarryError::InvalidInput);
+            }
+            Some(TimeValue::new(tv.tv_sec as u64, (tv.tv_usec as u32) * 1000))
+        }
+        None => None,
+    };
+    let tzv = match tz.nullable() {
+        Some(tz) => Some(unsafe { tz.vm_read_uninit()?.assume_init() }),
+        None => None,
+    };
+    // A NULL/NULL call is a no-op; any real update needs CAP_SYS_TIME.
+    if wall.is_some() || tzv.is_some() {
+        require_cap_sys_time()?;
+    }
+    if let Some(tz) = tzv
+        && !(-15 * 60..=15 * 60).contains(&tz.tz_minuteswest)
+    {
+        // Out-of-range timezone -> EINVAL (checked after the cap hook). An
+        // in-range tz is accepted but not persisted; gettimeofday returns zero.
+        return Err(StarryError::InvalidInput);
+    }
+    if let Some(wall) = wall {
+        set_realtime(wall);
     }
     Ok(0)
 }

@@ -42,6 +42,8 @@ pub fn syscall_allows_signal_restart(sysno: usize) -> bool {
             | Sysno::epoll_pwait2
             | Sysno::msgsnd
             | Sysno::msgrcv
+            | Sysno::semop
+            | Sysno::semtimedop
     ) {
         return false;
     }
@@ -309,6 +311,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3() as _,
         ),
+        Sysno::readahead => sys_readahead(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::pread64 => sys_pread64(
             uctx.arg0() as _,
             uctx.arg1() as _,
@@ -630,6 +633,9 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::msync => sys_msync(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::mlock => sys_mlock(uctx.arg0(), uctx.arg1() as _),
         Sysno::mlock2 => sys_mlock2(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::munlock => sys_munlock(uctx.arg0(), uctx.arg1() as _),
+        Sysno::mlockall => sys_mlockall(uctx.arg0() as _),
+        Sysno::munlockall => sys_munlockall(),
 
         // task info
         Sysno::getpid => sys_getpid(),
@@ -657,6 +663,15 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             sys_sched_setscheduler(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }
         Sysno::sched_getparam => sys_sched_getparam(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::sched_setattr => {
+            sys_sched_setattr(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }
+        Sysno::sched_getattr => sys_sched_getattr(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
         Sysno::getpriority => sys_getpriority(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setpriority => sys_setpriority(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
@@ -868,8 +883,10 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         #[cfg(target_arch = "x86_64")]
         Sysno::time => sys_time(uctx.arg0() as _),
         Sysno::gettimeofday => sys_gettimeofday(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::settimeofday => sys_settimeofday(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::times => sys_times(uctx.arg0() as _),
         Sysno::clock_gettime => sys_clock_gettime(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::clock_settime => sys_clock_settime(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::clock_getres => sys_clock_getres(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::getitimer => sys_getitimer(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setitimer => sys_setitimer(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
@@ -923,6 +940,22 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::shmat => sys_shmat(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::shmctl => sys_shmctl(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2().into()),
         Sysno::shmdt => sys_shmdt(uctx.arg0() as _),
+
+        // sem
+        Sysno::semget => sys_semget(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::semop => sys_semop(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::semtimedop => sys_semtimedop(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::semctl => sys_semctl(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
 
         // net
         Sysno::socket => sys_socket(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
@@ -1089,6 +1122,8 @@ pub(crate) fn syscall_signal_restart_rules_hold_for_test() -> bool {
         Sysno::epoll_pwait2,
         Sysno::msgsnd,
         Sysno::msgrcv,
+        Sysno::semop,
+        Sysno::semtimedop,
     ] {
         assert!(!syscall_allows_signal_restart(sysno as usize));
     }

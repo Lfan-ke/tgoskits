@@ -95,6 +95,9 @@ pub struct TaskInner {
     /// Scheduling priority of the task.
     sched_priority: AtomicI32,
 
+    /// SCHED_RESET_ON_FORK: children reset to a default policy on fork.
+    reset_on_fork: AtomicBool,
+
     /// Mark whether the task is in the wait queue.
     in_wait_queue: AtomicBool,
 
@@ -314,6 +317,16 @@ impl TaskInner {
         self.sched_priority.store(prio, Ordering::Release)
     }
 
+    #[inline]
+    pub fn reset_on_fork(&self) -> bool {
+        self.reset_on_fork.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_reset_on_fork(&self, value: bool) {
+        self.reset_on_fork.store(value, Ordering::Release)
+    }
+
     /// Polls whether the task has been interrupted.
     #[inline]
     pub fn poll_interrupt(&self, cx: &Context) -> Poll<()> {
@@ -391,6 +404,7 @@ impl TaskInner {
             cpumask: SpinLock::new(crate::api::cpu_mask_full()),
             sched_policy: AtomicI32::new(0),
             sched_priority: AtomicI32::new(0),
+            reset_on_fork: AtomicBool::new(false),
             in_wait_queue: AtomicBool::new(false),
             #[cfg(feature = "irq")]
             timer_ticket_id: AtomicU64::new(0),

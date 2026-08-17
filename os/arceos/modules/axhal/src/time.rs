@@ -29,3 +29,15 @@ pub fn try_init_epoch_offset(epoch_time_nanos: u64) -> bool {
     #[cfg(not(any(test, feature = "host-test")))]
     crate::platform::try_init_epoch_offset(epoch_time_nanos)
 }
+
+/// Set the wall-clock epoch (clock_settime/settimeofday). On host-test builds
+/// there is no settable platform clock, so this is a no-op.
+pub fn set_epoch_offset(epoch_time_nanos: u64) {
+    #[cfg(any(test, feature = "host-test"))]
+    {
+        let _ = epoch_time_nanos;
+    }
+
+    #[cfg(not(any(test, feature = "host-test")))]
+    crate::platform::set_epoch_offset(epoch_time_nanos);
+}

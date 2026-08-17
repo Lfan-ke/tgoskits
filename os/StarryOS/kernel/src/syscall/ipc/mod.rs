@@ -2,6 +2,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 mod mqueue;
 mod msg;
+mod sem;
 mod shm;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
@@ -9,7 +10,7 @@ use linux_raw_sys::{
     general::*,
 };
 
-pub use self::{mqueue::*, msg::*, shm::*};
+pub use self::{mqueue::*, msg::*, sem::*, shm::*};
 
 static IPC_ID: AtomicI32 = AtomicI32::new(0);
 

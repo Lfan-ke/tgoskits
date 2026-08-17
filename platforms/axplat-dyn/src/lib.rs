@@ -26,7 +26,7 @@ mod platform;
 mod power;
 
 pub use boot::{boot_stack_bounds, bootargs};
-pub use generic_timer::try_init_epoch_offset;
+pub use generic_timer::{set_epoch_offset, try_init_epoch_offset};
 
 #[cfg(feature = "irq")]
 pub fn enable_timer_irq() {

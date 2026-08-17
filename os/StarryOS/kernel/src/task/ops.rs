@@ -445,6 +445,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
             &thr.proc_data.aspace(),
         );
 
+        // Apply this process's System V SEM_UNDO adjustments back to their sets
+        // before it becomes a zombie (Linux `exit_sem`), so a process dying
+        // while holding a semaphore does not leave peers blocked forever.
+        crate::syscall::clear_proc_sem_undo(process_identity_id);
+
         // Drop memfd inode accounting before waitpid returns (SMP); use
         // process_slots refcounting — not vm_aspace_shared + clear().
         thr.proc_data.release_aspace_slot_if_needed();

@@ -1306,6 +1306,59 @@ impl DirectRwFsFileOps for ProcMemFile {
     }
 }
 
+/// Render `/proc/[pid]/limits`, one row per `RLIMIT_*` in Linux `lnames[]` order
+/// (`fs/proc/base.c` proc_pid_limits) with the `%-25s %-20s %-20s %-10s` columns.
+/// `RLIM_INFINITY` renders as "unlimited"; NICE/RTPRIO have no unit.
+fn render_thread_limits(proc_data: &Arc<ProcessData>) -> VfsResult<String> {
+    use linux_raw_sys::general::{
+        RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS,
+        RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NICE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_RSS,
+        RLIMIT_RTPRIO, RLIMIT_RTTIME, RLIMIT_SIGPENDING, RLIMIT_STACK,
+    };
+    const LIMITS: [(u32, &str, Option<&str>); 16] = [
+        (RLIMIT_CPU, "Max cpu time", Some("seconds")),
+        (RLIMIT_FSIZE, "Max file size", Some("bytes")),
+        (RLIMIT_DATA, "Max data size", Some("bytes")),
+        (RLIMIT_STACK, "Max stack size", Some("bytes")),
+        (RLIMIT_CORE, "Max core file size", Some("bytes")),
+        (RLIMIT_RSS, "Max resident set", Some("bytes")),
+        (RLIMIT_NPROC, "Max processes", Some("processes")),
+        (RLIMIT_NOFILE, "Max open files", Some("files")),
+        (RLIMIT_MEMLOCK, "Max locked memory", Some("bytes")),
+        (RLIMIT_AS, "Max address space", Some("bytes")),
+        (RLIMIT_LOCKS, "Max file locks", Some("locks")),
+        (RLIMIT_SIGPENDING, "Max pending signals", Some("signals")),
+        (RLIMIT_MSGQUEUE, "Max msgqueue size", Some("bytes")),
+        (RLIMIT_NICE, "Max nice priority", None),
+        (RLIMIT_RTPRIO, "Max realtime priority", None),
+        (RLIMIT_RTTIME, "Max realtime timeout", Some("us")),
+    ];
+    let limits = proc_data.rlim.read();
+    let mut buf = String::from(
+        "Limit                     Soft Limit           Hard Limit           Units     \n",
+    );
+    for (res, name, unit) in LIMITS {
+        let rl = &limits[res];
+        if rl.current == u64::MAX {
+            let _ = write!(buf, "{name:<25} {:<20} ", "unlimited");
+        } else {
+            let _ = write!(buf, "{name:<25} {:<20} ", rl.current);
+        }
+        if rl.max == u64::MAX {
+            let _ = write!(buf, "{:<20} ", "unlimited");
+        } else {
+            let _ = write!(buf, "{:<20} ", rl.max);
+        }
+        match unit {
+            Some(u) => {
+                let _ = writeln!(buf, "{u:<10}");
+            }
+            None => buf.push('\n'),
+        }
+    }
+    Ok(buf)
+}
+
 impl SimpleDirOps for ThreadDir {
     fn child_names<'a>(&'a self) -> Box<dyn Iterator<Item = Cow<'a, str>> + 'a> {
         Box::new(
@@ -1313,6 +1366,7 @@ impl SimpleDirOps for ThreadDir {
                 "stat",
                 "statm",
                 "status",
+                "limits",
                 "oom_score_adj",
                 "task",
                 "maps",
@@ -1373,6 +1427,10 @@ impl SimpleDirOps for ThreadDir {
                     render_thread_status(&task, &proc_data, path_pid, procfs_pid, &view)
                 })
                 .into()
+            }
+            "limits" => {
+                let proc_data = self.proc_data.clone();
+                SimpleFile::new_regular(fs, move || render_thread_limits(&proc_data)).into()
             }
             "oom_score_adj" => SimpleFile::new_regular(
                 fs,
@@ -1872,6 +1930,30 @@ fn builder(fs: Arc<SimpleFs>, view: PidView) -> DirMaker {
             Ok(format!("{secs}.{cs:02} {idle_secs}.00\n"))
         }),
     );
+    // /proc/version — linux_proc_banner "%s version %s (...) %s\n" (sysname
+    // "Linux"); release kept in step with /proc/sys/kernel/osrelease.
+    root.add(
+        "version",
+        SimpleFile::new_regular(fs.clone(), || {
+            Ok("Linux version 6.6.0-starry (starry@build) (rustc) #1 SMP\n")
+        }),
+    );
+    // /proc/thread-self — symlink to "<tgid>/task/<tid>" of the calling thread
+    // (fs/proc/thread_self.c). Resolves under /proc to the per-thread dir.
+    root.add("thread-self", {
+        let view = view.clone();
+        SimpleFile::new(fs.clone(), NodeType::Symlink, move || {
+            let task = current();
+            let thread = task.as_thread();
+            let tgid =
+                procfs_visible_pid(&view, &thread.proc_data.proc).ok_or(VfsError::NotFound)?;
+            let tid = view
+                .visible_number(&thread.pid_identity())
+                .map(PidNumber::get)
+                .ok_or(VfsError::NotFound)?;
+            Ok(format!("{tgid}/task/{tid}"))
+        })
+    });
     root.add(
         "loadavg",
         SimpleFile::new_regular(fs.clone(), || {
