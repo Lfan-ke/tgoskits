@@ -152,12 +152,28 @@ update-mime-database /usr/share/mime >/dev/null 2>&1 || true
 # ---- Serve the page over http, launch NetSurf, then capture ----
 # NetSurf's file:// navigation left the window on about:blank; its http fetcher
 # is proven working (the earlier example.com fetch succeeded), so serve the
-# local page over loopback http instead.
+# local page over http instead. StarryOS loopback is unreliable here, so bind
+# the server to all interfaces and fetch it through the guest's own eth0 IP.
 ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
-busybox httpd -p 127.0.0.1:8080 -h /usr/share/web-browser >/tmp/httpd.log 2>&1 \
-    || httpd -p 127.0.0.1:8080 -h /usr/share/web-browser >/tmp/httpd.log 2>&1 || true
-sleep 1
-page="http://127.0.0.1:8080/test.html"
+guest_ip=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+[ -n "$guest_ip" ] || guest_ip=$(ifconfig eth0 2>/dev/null | awk '/inet /{print $2}' | sed 's/addr://' | head -1)
+[ -n "$guest_ip" ] || guest_ip=10.0.2.15
+echo "WEB_BROWSER_STAGE guest ip = $guest_ip"
+busybox httpd -p 0.0.0.0:8080 -h /usr/share/web-browser >/tmp/httpd.log 2>&1 \
+    || httpd -p 0.0.0.0:8080 -h /usr/share/web-browser >/tmp/httpd.log 2>&1 || true
+# Prefer the bundled local page, but qemu user-net (SLIRP) does not hairpin a
+# guest back to its own address and StarryOS loopback is unreliable, so the
+# guest usually cannot fetch its own server. Fall back to a real external site
+# (reachable through user-net NAT, proven by the wget probe) so NetSurf renders
+# actual web content either way.
+local_page="http://$guest_ip:8080/test.html"
+page="$local_page"
+if wget -q -T 4 -O /dev/null "$local_page" 2>/dev/null; then
+    echo "WEB_BROWSER_STAGE local http server reachable, serving test.html"
+else
+    page="http://example.com/"
+    echo "WEB_BROWSER_STAGE local server not self-reachable, loading real site $page"
+fi
 echo "WEB_BROWSER_STAGE launching netsurf on $page ..."
 /usr/bin/netsurf "$page" >/tmp/ns_stdout.log 2>/tmp/ns_err.log &
 ns_pid=$!
