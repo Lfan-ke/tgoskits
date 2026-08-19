@@ -618,7 +618,8 @@ pub fn mutex_acquire(request: MutexAcquireRequest<'_>) -> bool {
                 Err(owner) => {
                     assert_ne!(
                         owner, current_id,
-                        "task {current_id} tried to recursively acquire a mutex"
+                        "task {current_id} tried to recursively acquire a mutex at {:#x} from {}",
+                        request.lock_addr, request.caller,
                     );
                     super::mutex::runtime_wait_until_unlocked(request.wait_queue, request.owner_id);
                 }

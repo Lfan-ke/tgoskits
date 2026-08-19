@@ -695,12 +695,19 @@ impl Pollable for DgramTransport {
         if !events.contains(IoEvents::IN) {
             return;
         }
+        // Snapshot the Arc<PollSet>s and drop the transport guards BEFORE
+        // registering. PollSet::register can evict-and-wake a replaced waker
+        // synchronously, and a level-triggered epoll wake re-enters poll() ->
+        // data_rx/conn_rx.lock() on the same task; holding a guard across
+        // register would recursively acquire these mutexes.
+        let data_poll = self.data_rx.lock().as_ref().map(|(_, poll)| poll.clone());
+        let conn_poll = self.conn_rx.lock().as_ref().map(|(_, poll)| poll.clone());
         // Registration happens from socket poll task context.
-        if let Some((_, poll)) = self.data_rx.lock().as_ref() {
+        if let Some(poll) = data_poll {
             unsafe { poll.register(context.waker(), IoEvents::IN) };
         }
         // Seqpacket listener waits for incoming connections.
-        if let Some((_, poll)) = self.conn_rx.lock().as_ref() {
+        if let Some(poll) = conn_poll {
             unsafe { poll.register(context.waker(), IoEvents::IN) };
         }
     }
@@ -717,6 +724,11 @@ impl Drop for DgramTransport {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
+    use alloc::{sync::Arc, task::Wake};
+    use core::task::{Context, Waker};
+
     use super::*;
     use crate::unix::BindSlot;
 
@@ -728,5 +740,40 @@ mod tests {
 
         let client = DgramTransport::new(2);
         client.connect(&slot, &UnixSocketAddr::Unnamed).unwrap();
+    }
+
+    // Twin of the stream regression: register() must drop the data_rx/conn_rx
+    // guards before PollSet::register, whose evict-and-wake re-enters poll() ->
+    // *_rx.lock() on the same task. Holding a guard across register recursively
+    // acquires the mutex (kernel panic on-target).
+    #[test]
+    fn datagram_register_does_not_hold_data_rx_across_pollset_register() {
+        let slot = BindSlot::default();
+        let server = Arc::new(DgramTransport::new(1u32));
+        server.bind(&slot, &UnixSocketAddr::Unnamed).unwrap();
+
+        struct Reentrant(Arc<DgramTransport>);
+        impl Wake for Reentrant {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                assert!(
+                    self.0.data_rx.try_lock().is_some(),
+                    "register() held data_rx across PollSet::register -> recursive lock",
+                );
+            }
+        }
+        let reentrant: Waker = Arc::new(Reentrant(server.clone())).into();
+        server.register(&mut Context::from_waker(&reentrant), IoEvents::IN);
+
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        for _ in 0..80 {
+            let filler: Waker = Arc::new(Noop).into();
+            server.register(&mut Context::from_waker(&filler), IoEvents::IN);
+        }
     }
 }

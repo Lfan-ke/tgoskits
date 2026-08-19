@@ -680,11 +680,22 @@ impl Pollable for StreamTransport {
         if let Some(poll) = chan_poll {
             // Registration happens from socket poll task context.
             unsafe { poll.register(context.waker(), events) };
-        } else if let Some((_, poll_new_conn)) = self.conn_rx.lock().as_ref()
-            && events.contains(IoEvents::IN)
-        {
-            // Registration happens from socket poll task context.
-            unsafe { poll_new_conn.register(context.waker(), IoEvents::IN) };
+        } else if events.contains(IoEvents::IN) {
+            // Snapshot the Arc<PollSet> and drop the conn_rx guard BEFORE
+            // registering. PollSet::register can evict-and-wake a replaced waker
+            // synchronously, and a level-triggered epoll wake re-enters poll()
+            // -> conn_rx.lock() on the same task; holding the guard across
+            // register would recursively acquire this mutex. Mirrors the channel
+            // path above, which clones poll_update out before registering.
+            let conn_poll = self
+                .conn_rx
+                .lock()
+                .as_ref()
+                .map(|(_, poll_new_conn)| poll_new_conn.clone());
+            if let Some(poll_new_conn) = conn_poll {
+                // Registration happens from socket poll task context.
+                unsafe { poll_new_conn.register(context.waker(), IoEvents::IN) };
+            }
         }
         // Registration happens from socket poll task context.
         unsafe { self.poll_state.register(context.waker(), events) };
@@ -713,5 +724,56 @@ impl Drop for StreamTransport {
             self.poll_state
                 .wake(IoEvents::IN | IoEvents::OUT | IoEvents::RDHUP)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+
+    use alloc::{sync::Arc, task::Wake};
+    use core::task::{Context, Waker};
+
+    use super::*;
+    use crate::unix::BindSlot;
+
+    // Regression: register() must snapshot the conn_rx PollSet and drop the
+    // guard before calling PollSet::register. That register evicts-and-wakes a
+    // replaced waker synchronously; a level-triggered epoll waker re-enters
+    // poll()/register() -> conn_rx.lock() on the same task, so holding the guard
+    // across register recursively acquires the mutex (kernel panic on-target).
+    #[test]
+    fn stream_register_does_not_hold_conn_rx_across_pollset_register() {
+        let slot = BindSlot::default();
+        let server = Arc::new(StreamTransport::new(1u32));
+        server.bind(&slot, &UnixSocketAddr::Unnamed).unwrap();
+
+        // Woken when the PollSet evicts it; asserts conn_rx is not locked then.
+        struct Reentrant(Arc<StreamTransport>);
+        impl Wake for Reentrant {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                assert!(
+                    self.0.conn_rx.try_lock().is_some(),
+                    "register() held conn_rx across PollSet::register -> recursive lock",
+                );
+            }
+        }
+        let reentrant: Waker = Arc::new(Reentrant(server.clone())).into();
+        // Occupies slot 0 of the conn_rx PollSet.
+        server.register(&mut Context::from_waker(&reentrant), IoEvents::IN);
+
+        // Distinct filler wakers overflow the 64-slot PollSet and evict slot 0,
+        // firing the reentrant waker inside the last register() call.
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        for _ in 0..80 {
+            let filler: Waker = Arc::new(Noop).into();
+            server.register(&mut Context::from_waker(&filler), IoEvents::IN);
+        }
     }
 }
