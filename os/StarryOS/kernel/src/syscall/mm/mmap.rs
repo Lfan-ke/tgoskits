@@ -274,6 +274,14 @@ pub fn sys_mmap(
     let start = if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) {
         let dst_addr = VirtAddr::from(aligned);
         if !map_flags.contains(MmapFlags::FIXED_NOREPLACE) {
+            // mseal: MAP_FIXED replacing any sealed byte would unmap a sealed
+            // area, so refuse with EPERM before the teardown. This is the only
+            // destructive unmap for MAP_FIXED (the vendor/device backends below
+            // never tear down the fixed target), so guarding it covers them all.
+            // FIXED_NOREPLACE does not unmap and needs no guard.
+            if aspace.range_has_sealed(dst_addr, length) {
+                return Err(StarryError::OperationNotPermitted);
+            }
             aspace.unmap(dst_addr, length)?;
         }
         dst_addr
@@ -611,6 +619,11 @@ pub fn sys_munmap(addr: usize, length: usize) -> StarryResult<isize> {
     let mut aspace = aspace_arc.lock();
     let length = align_up_4k(length);
     let start_addr = VirtAddr::from(addr);
+    // mseal: unmapping any sealed byte fails the whole call with EPERM and
+    // tears down nothing (Linux vms_gather_munmap_vmas gate).
+    if aspace.range_has_sealed(start_addr, length) {
+        return Err(StarryError::OperationNotPermitted);
+    }
     aspace.unmap(start_addr, length)?;
     Ok(0)
 }
@@ -668,6 +681,14 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> StarryResult<isize
                 fb.check_flags(new_flags)?;
             }
         }
+    }
+    // mseal: mprotect on any sealed byte -> EPERM. Placed AFTER the PROT_WRITE
+    // EACCES check so a sealed read-only MAP_SHARED file upgraded to PROT_WRITE
+    // reports EACCES first, matching Linux do_mprotect_pkey ordering (the
+    // per-VMA EACCES at mprotect.c:937-943 precedes the seal EPERM raised inside
+    // mprotect_fixup).
+    if aspace.range_has_sealed(start_addr, length) {
+        return Err(StarryError::OperationNotPermitted);
     }
     aspace.protect_with_reported_flags(
         start_addr,
@@ -853,6 +874,15 @@ pub fn sys_mremap(
         return Err(StarryError::InvalidInput);
     }
 
+    // mseal: mremap of a sealed source is refused. Linux check_prep_vma runs
+    // vma_is_sealed unconditionally (mm/mremap.c), before the old_len==0 dup
+    // path and regardless of MREMAP_DONTUNMAP, so this guard precedes both. For
+    // old_len==0 the source span is the VMA fragment at `addr` that Linux
+    // checks, so cover at least one page.
+    if aspace.range_has_sealed(addr, old_size.max(page_size)) {
+        return Err(StarryError::OperationNotPermitted);
+    }
+
     // old_size == 0: duplicate a shared mapping (Linux special case).
     if old_size == 0 {
         if shared_pages.is_none() || !may_move {
@@ -867,6 +897,11 @@ pub fn sys_mremap(
         let target = if fixed {
             if !new_addr.is_multiple_of(page_size) {
                 return Err(StarryError::InvalidInput);
+            }
+            // mseal: a MREMAP_FIXED destination that overlaps a sealed mapping
+            // would tear it down, so refuse with EPERM before unmapping.
+            if aspace.range_has_sealed(VirtAddr::from(new_addr), new_size) {
+                return Err(StarryError::OperationNotPermitted);
             }
             aspace.unmap(VirtAddr::from(new_addr), new_size)?;
             VirtAddr::from(new_addr)
@@ -904,6 +939,10 @@ pub fn sys_mremap(
             return Err(StarryError::InvalidInput);
         }
         let target = VirtAddr::from(new_addr);
+        // mseal: refuse a MREMAP_FIXED destination overlapping a sealed mapping.
+        if aspace.range_has_sealed(target, new_size) {
+            return Err(StarryError::OperationNotPermitted);
+        }
         aspace.unmap(target, new_size)?;
 
         mremap_move(
@@ -1026,6 +1065,26 @@ pub fn sys_madvise(addr: usize, length: usize, advice: i32) -> StarryResult<isiz
         MappingFlags::empty(),
     ) {
         return Err(StarryError::NoMemory);
+    }
+
+    // mseal (Linux can_madvise_modify, mm/madvise.c): a discard advice on a
+    // sealed, private read-only anonymous fragment is refused with EPERM.
+    // Non-discard advice, and discards on writable-anon / file-backed / shared
+    // mappings, stay allowed. MADV_GUARD_INSTALL is absent from this set because
+    // Starry already rejects it with EINVAL above, before any seal logic.
+    let is_discard = matches!(
+        advice as u32,
+        MADV_FREE
+            | MADV_DONTNEED
+            | MADV_DONTNEED_LOCKED
+            | MADV_REMOVE
+            | MADV_DONTFORK
+            | MADV_WIPEONFORK
+    );
+    if is_discard
+        && aspace.madvise_discard_blocked_by_seal(VirtAddr::from(addr), align_up_4k(length))
+    {
+        return Err(StarryError::OperationNotPermitted);
     }
 
     // MADV_DONTNEED: drop the pages now; next access re-faults to a fresh zero
@@ -1197,6 +1256,47 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> StarryResult<isize>
         // residency guarantee. `populate_area` is the MAP_POPULATE primitive.
         aspace.populate_area(start, size, MappingFlags::READ)?;
     }
+    Ok(0)
+}
+
+/// mseal(2) (Linux 6.10): seal `[addr, addr+length)` so it can no longer be
+/// mprotect'd, munmap'd, mremap'd, MAP_FIXED-replaced, or discard-madvise'd.
+/// Sealing is irreversible; re-sealing is a no-op. 1:1 with do_mseal
+/// (mm/mseal.c): flags must be 0, start page-aligned, a length that rounds up to
+/// 0 is EINVAL, an end that overflows is EINVAL, an empty range succeeds, and an
+/// unmapped hole in the range is ENOMEM.
+pub fn sys_mseal(addr: usize, length: usize, flags: u32) -> StarryResult<isize> {
+    debug!("sys_mseal <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
+
+    if flags != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    if !addr.is_multiple_of(PAGE_SIZE_4K) {
+        return Err(StarryError::InvalidInput);
+    }
+    let len = align_up_4k(length);
+    // A nonzero length that page-aligns to zero has wrapped (Linux
+    // `len_in && !len`).
+    if length != 0 && len == 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let end = addr.checked_add(len).ok_or(StarryError::InvalidInput)?;
+    // Empty range is a success no-op (Linux `end == start -> return 0`).
+    if end == addr {
+        return Ok(0);
+    }
+
+    let curr = current();
+    let aspace_arc = curr.as_thread().proc_data.aspace();
+    let mut aspace = aspace_arc.lock();
+    let start = VirtAddr::from(addr);
+    // The whole range must be gap-free, else ENOMEM (Linux
+    // range_contains_unmapped). An empty access mask makes `can_access_range` a
+    // pure contiguous-coverage check.
+    if !aspace.can_access_range(start, len, MappingFlags::empty()) {
+        return Err(StarryError::NoMemory);
+    }
+    aspace.seal_range(start, len)?;
     Ok(0)
 }
 

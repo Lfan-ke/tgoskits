@@ -10,7 +10,8 @@ use ax_task::current;
 use axfs_ng_vfs::{NodePermission, NodeType};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::{
-    __kernel_off_t, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, O_APPEND,
+    __kernel_off_t, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, O_ACCMODE,
+    O_APPEND, O_RDONLY, O_WRONLY,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
@@ -1071,6 +1072,89 @@ pub fn sys_splice(
 
     let n = do_send(src, dst, len, flags & SPLICE_F_NONBLOCK != 0)?;
 
+    isize::try_from(n).map_err(|_| StarryError::InvalidInput)
+}
+
+/// vmsplice(2): gather user memory into a pipe (write end) or scatter a pipe
+/// (read end) into user memory. 1:1 with linux/fs/splice.c SYSCALL_DEFINE4(vmsplice):
+/// flags, then fd existence + direction (EBADF), then iovec import (EINVAL/EFAULT),
+/// then zero-length success, then the non-pipe EBADF and the transfer.
+pub fn sys_vmsplice(
+    fd: c_int,
+    iov: *const IoVec,
+    nr_segs: usize,
+    flags: u32,
+) -> StarryResult<isize> {
+    debug!("sys_vmsplice <= fd: {fd}, nr_segs: {nr_segs}, flags: {flags:#x}");
+
+    const SPLICE_F_NONBLOCK: u32 = 0x02;
+    const SPLICE_F_ALL: u32 = 0x0f;
+
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    let file = get_file_like(fd).map_err(|_| StarryError::BadFileDescriptor)?;
+    // Direction from the fd access mode: a writable fd gathers user memory into
+    // the pipe (ITER_SOURCE); a read-only fd scatters the pipe into user memory.
+    let to_pipe = (file.open_flags() & O_ACCMODE) != O_RDONLY;
+    // Import (nr_segs>1024 -> EINVAL, bad iov -> EFAULT) runs BEFORE the non-pipe
+    // check, and a zero-length request succeeds without touching the pipe.
+    let buf = IoVectorBuf::new(iov, nr_segs)?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let pipe = file
+        .downcast_arc::<Pipe>()
+        .map_err(|_| StarryError::BadFileDescriptor)?;
+    // vmsplice honors SPLICE_F_NONBLOCK alone, independent of the fd's O_NONBLOCK.
+    let non_blocking = flags & SPLICE_F_NONBLOCK != 0;
+    let n = if to_pipe {
+        pipe.write_nb(&mut buf.into_io(), non_blocking)?
+    } else {
+        pipe.read_nb(&mut buf.into_io(), non_blocking)?
+    };
+    isize::try_from(n).map_err(|_| StarryError::InvalidInput)
+}
+
+/// tee(2): duplicate up to `len` bytes between two distinct pipes without
+/// consuming the source. 1:1 with linux/fs/splice.c SYSCALL_DEFINE4(tee) + do_tee:
+/// flags first, then len==0 success, then fd existence (EBADF), then the FMODE
+/// direction gate (EBADF) on the raw access mode, then the both-pipes-and-distinct
+/// requirement (EINVAL), then the copy.
+pub fn sys_tee(fd_in: c_int, fd_out: c_int, len: usize, flags: u32) -> StarryResult<isize> {
+    debug!("sys_tee <= fd_in: {fd_in}, fd_out: {fd_out}, len: {len}, flags: {flags:#x}");
+
+    const SPLICE_F_NONBLOCK: u32 = 0x02;
+    const SPLICE_F_ALL: u32 = 0x0f;
+
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    let in_file = get_file_like(fd_in).map_err(|_| StarryError::BadFileDescriptor)?;
+    let out_file = get_file_like(fd_out).map_err(|_| StarryError::BadFileDescriptor)?;
+    // do_tee's FMODE gate (splice.c:1945-1947) runs before the pipe/EINVAL
+    // fall-through and applies to any fd: fd_in must be readable, fd_out
+    // writable, else EBADF - even for a non-pipe end.
+    if (in_file.open_flags() & O_ACCMODE) == O_WRONLY {
+        return Err(StarryError::BadFileDescriptor);
+    }
+    if (out_file.open_flags() & O_ACCMODE) == O_RDONLY {
+        return Err(StarryError::BadFileDescriptor);
+    }
+    // Both ends must be pipes and must be different pipes; a non-pipe end or the
+    // same pipe on both ends falls through to EINVAL (ret seeds -EINVAL).
+    let in_pipe = in_file.downcast_arc::<Pipe>().ok();
+    let out_pipe = out_file.downcast_arc::<Pipe>().ok();
+    let (src, dst) = match (in_pipe, out_pipe) {
+        (Some(src), Some(dst)) if !src.shares_ring_with(&dst) => (src, dst),
+        _ => return Err(StarryError::InvalidInput),
+    };
+    // tee folds the fds' own O_NONBLOCK into SPLICE_F_NONBLOCK (splice.c:1954).
+    let non_blocking = (flags & SPLICE_F_NONBLOCK != 0) || src.nonblocking() || dst.nonblocking();
+    let n = src.tee_to(&dst, len, non_blocking)?;
     isize::try_from(n).map_err(|_| StarryError::InvalidInput)
 }
 

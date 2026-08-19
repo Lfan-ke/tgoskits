@@ -439,6 +439,200 @@ fn set_priority_for_processes(
     Ok(0)
 }
 
+// ioprio(2), include/uapi/linux/ioprio.h.
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+const IOPRIO_CLASS_MASK: u32 = 0x07;
+const IOPRIO_LEVEL_MASK: u32 = 0x07;
+const IOPRIO_CLASS_NONE: u32 = 0;
+const IOPRIO_CLASS_RT: u32 = 1;
+const IOPRIO_CLASS_BE: u32 = 2;
+const IOPRIO_CLASS_IDLE: u32 = 3;
+const IOPRIO_WHO_PROCESS: i32 = 1;
+const IOPRIO_WHO_PGRP: i32 = 2;
+const IOPRIO_WHO_USER: i32 = 3;
+
+/// 1:1 Linux block/ioprio.c ioprio_check_cap: validate the class/level and gate
+/// the RT class on CAP_SYS_ADMIN or CAP_SYS_NICE. The data/level field is not
+/// range-checked (Linux stores any value verbatim).
+fn ioprio_check_cap(ioprio: i32) -> StarryResult<()> {
+    let class = ((ioprio as u32) >> IOPRIO_CLASS_SHIFT) & IOPRIO_CLASS_MASK;
+    let level = (ioprio as u32) & IOPRIO_LEVEL_MASK;
+    match class {
+        IOPRIO_CLASS_RT => {
+            let caller = current().as_thread().cred();
+            if !caller.has_cap_sys_admin() && !caller.has_cap_sys_nice() {
+                return Err(StarryError::OperationNotPermitted);
+            }
+        }
+        IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => {}
+        IOPRIO_CLASS_NONE => {
+            if level != 0 {
+                return Err(StarryError::InvalidInput);
+            }
+        }
+        _ => return Err(StarryError::InvalidInput),
+    }
+    Ok(())
+}
+
+/// IOPRIO_WHO_* are 1/2/3; map onto the shared PrioritySelector (PRIO_* 0/1/2).
+fn ioprio_selector(which: i32, who: i32) -> StarryResult<PrioritySelector> {
+    let prio_which = match which {
+        IOPRIO_WHO_PROCESS => PRIO_PROCESS,
+        IOPRIO_WHO_PGRP => PRIO_PGRP,
+        IOPRIO_WHO_USER => PRIO_USER,
+        _ => return Err(StarryError::InvalidInput),
+    };
+    PrioritySelector::parse(prio_which, who as u32)
+}
+
+/// Linux blk-ioc.c set_task_ioprio gate: CAP_SYS_NICE, or the target's uid
+/// matches the caller's uid or euid.
+fn ioprio_set_perm(proc: &ProcessData) -> StarryResult<()> {
+    let caller = current().as_thread().cred();
+    if caller.has_cap_sys_nice() {
+        return Ok(());
+    }
+    let target = process_cred(proc)?;
+    if target.uid == caller.uid || target.uid == caller.euid {
+        Ok(())
+    } else {
+        Err(StarryError::OperationNotPermitted)
+    }
+}
+
+fn set_ioprio_for_processes(
+    procs: impl Iterator<Item = Arc<ProcessData>>,
+    ioprio: i32,
+) -> StarryResult<isize> {
+    let procs: Vec<_> = procs.collect();
+    if procs.is_empty() {
+        return Err(StarryError::NoSuchProcess);
+    }
+    for proc in &procs {
+        ioprio_set_perm(proc)?;
+    }
+    for proc in procs {
+        proc.set_ioprio(ioprio);
+    }
+    Ok(0)
+}
+
+/// Read a process's CPU scheduler policy through its thread-group leader,
+/// mirroring how Linux's task_nice_ioclass consults task->policy.
+fn proc_sched_policy(proc: &ProcessData) -> i32 {
+    let leader = TidNumber::from(proc.proc.pid().pid_number());
+    get_task_by_number(leader)
+        .map(|task| task.sched_policy())
+        .unwrap_or(SCHED_NORMAL as i32)
+}
+
+/// 1:1 Linux __get_task_ioprio (include/linux/ioprio.h): report an explicitly
+/// set (non-NONE) I/O priority verbatim, otherwise derive one from the CPU
+/// scheduler nice value and policy. ioprio_get's WHO_PGRP/WHO_USER aggregation
+/// uses this effective value, whereas WHO_PROCESS reports the raw stored value
+/// (get_task_raw_ioprio).
+fn effective_ioprio(proc: &ProcessData) -> i32 {
+    let raw = proc.ioprio();
+    if ((raw as u32) >> IOPRIO_CLASS_SHIFT) & IOPRIO_CLASS_MASK != IOPRIO_CLASS_NONE {
+        return raw;
+    }
+    let class = match proc_sched_policy(proc) as u32 {
+        SCHED_IDLE => IOPRIO_CLASS_IDLE,
+        SCHED_FIFO | SCHED_RR => IOPRIO_CLASS_RT,
+        _ => IOPRIO_CLASS_BE,
+    };
+    let level = ((proc.nice() + 20) / 5) as u32;
+    ((class << IOPRIO_CLASS_SHIFT) | level) as i32
+}
+
+/// ioprio_best over a set of tasks: Linux aggregates get_task_ioprio (the
+/// nice-derived effective value) with min for WHO_PGRP/WHO_USER.
+fn min_ioprio_for_processes(procs: impl Iterator<Item = Arc<ProcessData>>) -> StarryResult<isize> {
+    procs
+        .map(|proc| effective_ioprio(&proc))
+        .min()
+        .map(|value| value as isize)
+        .ok_or(StarryError::NoSuchProcess)
+}
+
+pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> StarryResult<isize> {
+    // ioprio_check_cap runs first: a bad class returns EINVAL before a bad who
+    // would return ESRCH (matching ioprio_set's ordering).
+    ioprio_check_cap(ioprio)?;
+    // set_task_ioprio stores the value in io_context->ioprio, an unsigned short,
+    // so the low 16 bits are what a later ioprio_get reads back.
+    let ioprio = (ioprio as u16) as i32;
+    match ioprio_selector(which, who)? {
+        PrioritySelector::CurrentProcess => {
+            let proc = current().as_thread().proc_data.clone();
+            ioprio_set_perm(&proc)?;
+            proc.set_ioprio(ioprio);
+            Ok(0)
+        }
+        PrioritySelector::Process(tgid) => {
+            let proc = get_user_process_data_by_number(tgid)?;
+            ioprio_set_perm(&proc)?;
+            proc.set_ioprio(ioprio);
+            Ok(0)
+        }
+        PrioritySelector::CurrentProcessGroup => {
+            let group = current().as_thread().proc_data.proc.group();
+            set_ioprio_for_processes(
+                processes()
+                    .into_iter()
+                    .filter(|proc| Arc::ptr_eq(&proc.proc.group(), &group)),
+                ioprio,
+            )
+        }
+        PrioritySelector::ProcessGroup(pgid) => {
+            let group = current_pid_view().resolve_group(pgid)?;
+            set_ioprio_for_processes(
+                processes()
+                    .into_iter()
+                    .filter(|proc| Arc::ptr_eq(&proc.proc.group(), &group)),
+                ioprio,
+            )
+        }
+        PrioritySelector::CurrentUser => set_ioprio_for_processes(
+            processes_for_uid(current().as_thread().cred().uid).into_iter(),
+            ioprio,
+        ),
+        PrioritySelector::User(uid) => {
+            set_ioprio_for_processes(processes_for_uid(uid).into_iter(), ioprio)
+        }
+    }
+}
+
+pub fn sys_ioprio_get(which: i32, who: i32) -> StarryResult<isize> {
+    match ioprio_selector(which, who)? {
+        PrioritySelector::CurrentProcess => Ok(current().as_thread().proc_data.ioprio() as isize),
+        PrioritySelector::Process(tgid) => {
+            Ok(get_user_process_data_by_number(tgid)?.ioprio() as isize)
+        }
+        PrioritySelector::CurrentProcessGroup => {
+            let group = current().as_thread().proc_data.proc.group();
+            min_ioprio_for_processes(
+                processes()
+                    .into_iter()
+                    .filter(|proc| Arc::ptr_eq(&proc.proc.group(), &group)),
+            )
+        }
+        PrioritySelector::ProcessGroup(pgid) => {
+            let group = current_pid_view().resolve_group(pgid)?;
+            min_ioprio_for_processes(
+                processes()
+                    .into_iter()
+                    .filter(|proc| Arc::ptr_eq(&proc.proc.group(), &group)),
+            )
+        }
+        PrioritySelector::CurrentUser => min_ioprio_for_processes(
+            processes_for_uid(current().as_thread().cred().uid).into_iter(),
+        ),
+        PrioritySelector::User(uid) => min_ioprio_for_processes(processes_for_uid(uid).into_iter()),
+    }
+}
+
 #[cfg(axtest)]
 pub(crate) fn schedule_clock_and_sched_validation_rules_hold_for_test() -> bool {
     use linux_raw_sys::general::{

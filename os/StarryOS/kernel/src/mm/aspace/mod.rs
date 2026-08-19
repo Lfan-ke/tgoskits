@@ -542,6 +542,41 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// mseal(2): mark `[start, start+size)` sealed. The range must be gap-free
+    /// (the caller checks this via [`Self::can_access_range`], matching Linux
+    /// `range_contains_unmapped` -> ENOMEM). Sealing changes metadata only, so
+    /// there is no page-table work.
+    pub fn seal_range(&mut self, start: VirtAddr, size: usize) -> StarryResult {
+        self.validate_region(start, size)?;
+        self.areas.seal(start, size)?;
+        Ok(())
+    }
+
+    /// True if any area overlapping `[start, start+size)` is sealed. The
+    /// mutating memory syscalls use this to reject mprotect/munmap/mremap/
+    /// MAP_FIXED over a sealed range with EPERM.
+    pub fn range_has_sealed(&self, start: VirtAddr, size: usize) -> bool {
+        self.areas.range_has_sealed(start, size)
+    }
+
+    /// Linux `can_madvise_modify` (mm/madvise.c): a discard advice is refused
+    /// only on a sealed, private-anonymous, non-writable fragment. File-backed
+    /// mappings (including MAP_SHARED and shmem-backed shared-anon, for which
+    /// `vma_is_anonymous` is false) and writable-anon sealed mappings stay
+    /// permitted.
+    pub fn madvise_discard_blocked_by_seal(&self, start: VirtAddr, size: usize) -> bool {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        self.areas.iter().any(|area| {
+            area.sealed()
+                && area.start() < range.end
+                && area.end() > range.start
+                && matches!(area.backend(), Backend::Cow(cow) if cow.is_anonymous())
+                && !area.flags().contains(MappingFlags::WRITE)
+        })
+    }
+
     /// Removes all mappings in the address space.
     pub fn clear(&mut self) {
         crate::syscall::memfd_release_all_shared_writable_counts_for_aspace(self);

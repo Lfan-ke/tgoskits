@@ -950,6 +950,9 @@ pub struct ProcessData {
     /// The process nice value used by getpriority/setpriority compatibility.
     nice: AtomicI32,
 
+    /// The process I/O priority (ioprio_get/ioprio_set), stored raw.
+    ioprio: AtomicI32,
+
     /// Process-local membarrier(2) registration state bitmask.
     membarrier_state: AtomicU32,
 
@@ -1141,6 +1144,7 @@ impl ProcessData {
 
             umask: AtomicU32::new(0o022),
             nice: AtomicI32::new(0),
+            ioprio: AtomicI32::new(0),
             membarrier_state: AtomicU32::new(0),
             dumpable: AtomicI32::new(1),
             thp_disable: AtomicU32::new(0),
@@ -1263,6 +1267,16 @@ impl ProcessData {
     /// Set the process nice value.
     pub fn set_nice(&self, nice: i32) {
         self.nice.store(nice, Ordering::SeqCst);
+    }
+
+    /// Get the process I/O priority (raw ioprio value).
+    pub fn ioprio(&self) -> i32 {
+        self.ioprio.load(Ordering::SeqCst)
+    }
+
+    /// Set the process I/O priority (raw ioprio value).
+    pub fn set_ioprio(&self, ioprio: i32) {
+        self.ioprio.store(ioprio, Ordering::SeqCst);
     }
 
     /// Get the membarrier(2) registration state bitmask.

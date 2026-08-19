@@ -45,6 +45,11 @@ impl IoVectorBuf {
         Ok(Self { iovs, iovcnt, len })
     }
 
+    /// Whether the gather/scatter list moves no bytes (total iovec length 0).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn into_io(self) -> IoVectorBufIo {
         IoVectorBufIo {
             inner: self,

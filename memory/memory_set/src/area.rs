@@ -14,6 +14,10 @@ pub struct MemoryArea<B: MappingBackend> {
     flags: B::Flags,
     reported_flags: B::Flags,
     backend: B,
+    /// Set by mseal(2): a sealed area rejects mprotect/munmap/mremap/MAP_FIXED
+    /// and discard-madvise. Monotonic - there is no unseal. Propagated to both
+    /// fragments on `split`.
+    sealed: bool,
 }
 
 impl<B: MappingBackend> MemoryArea<B> {
@@ -46,6 +50,7 @@ impl<B: MappingBackend> MemoryArea<B> {
             flags,
             reported_flags,
             backend,
+            sealed: false,
         }
     }
 
@@ -82,6 +87,17 @@ impl<B: MappingBackend> MemoryArea<B> {
     /// Returns the mapping backend of the memory area.
     pub const fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Returns whether this area has been sealed by mseal(2).
+    pub const fn sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// Seals this area. Sealing is monotonic (mseal has no unseal) and
+    /// idempotent.
+    pub(crate) fn seal(&mut self) {
+        self.sealed = true;
     }
 }
 
@@ -250,7 +266,7 @@ impl<B: MappingBackend> MemoryArea<B> {
                 .split(align_diff)
                 .expect("backend should be splittable");
 
-            let new_area = Self::new_with_reported_flags(
+            let mut new_area = Self::new_with_reported_flags(
                 pos,
                 // Use wrapping_sub_addr to avoid overflow check. It is safe because
                 // `pos` is within the memory area.
@@ -259,6 +275,11 @@ impl<B: MappingBackend> MemoryArea<B> {
                 self.reported_flags,
                 right,
             );
+            // A seal covers the whole original area, so both fragments inherit
+            // it. The left fragment (`self`) keeps its own `sealed`; only its
+            // end shrinks. Dropping this would silently unseal the tail when a
+            // partial munmap/mprotect of an adjacent range splits a sealed area.
+            new_area.sealed = self.sealed;
             self.va_range.end = pos;
             Some(new_area)
         } else {
@@ -277,6 +298,7 @@ where
             .field("va_range", &self.va_range)
             .field("flags", &self.flags)
             .field("reported_flags", &self.reported_flags)
+            .field("sealed", &self.sealed)
             .finish()
     }
 }

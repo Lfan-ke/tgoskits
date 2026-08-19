@@ -1,4 +1,4 @@
-use alloc::{borrow::Cow, collections::VecDeque, format, sync::Arc};
+use alloc::{borrow::Cow, collections::VecDeque, format, sync::Arc, vec::Vec};
 use core::{
     mem,
     sync::atomic::{AtomicBool, Ordering},
@@ -217,6 +217,7 @@ impl Pipe {
         &self,
         src: &mut IoSrc,
         on_broken_pipe: impl Fn(),
+        non_blocking: bool,
     ) -> StarryResult<usize> {
         if !self.is_write() {
             return Err(StarryError::BadFileDescriptor);
@@ -230,7 +231,7 @@ impl Pipe {
         let mut merge_pending = true;
         let merge_bytes = size % PIPE_BUF;
 
-        let result = block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
+        let result = block_on(poll_io(self, IoEvents::OUT, non_blocking, || {
             enum WriteStep {
                 Closed,
                 WouldBlock,
@@ -282,7 +283,7 @@ impl Pipe {
                 // Pipe bytes were committed before waking readers.
                 unsafe { self.shared.poll_rx.wake(IoEvents::IN) };
                 total_written += written;
-                if total_written == size || self.nonblocking() {
+                if total_written == size || non_blocking {
                     return Ok(total_written);
                 }
             }
@@ -302,12 +303,136 @@ impl Pipe {
         }
     }
 
+    /// Two ends of one pipe are distinct `Pipe` structs sharing a single
+    /// `Arc<Shared>`, so identity must be tested on the ring, not the wrapper.
+    /// tee(2) uses this to reject both ends of the same pipe.
+    pub fn shares_ring_with(&self, other: &Pipe) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    /// Read with an explicit blocking mode. splice/vmsplice honor
+    /// SPLICE_F_NONBLOCK independently of the fd's own O_NONBLOCK, so the
+    /// decision is threaded in rather than read from `self.nonblocking()`.
+    pub(crate) fn read_nb(&self, dst: &mut IoDst, non_blocking: bool) -> StarryResult<usize> {
+        if !self.is_read() {
+            return Err(StarryError::BadFileDescriptor);
+        }
+        if dst.is_full() {
+            return Ok(0);
+        }
+
+        block_on(poll_io(self, IoEvents::IN, non_blocking, || {
+            let (read, writers) = {
+                let mut state = self.shared.state.lock();
+                let (left, right) = state.buffer.as_slices();
+                let mut count = dst.write(left)?;
+                if count >= left.len() {
+                    count += dst.write(right)?;
+                }
+                unsafe { state.buffer.advance_read_index(count) };
+                state.consume(count);
+                (count, state.writers)
+            };
+            if read > 0 {
+                // Pipe capacity was freed before waking writers.
+                unsafe { self.shared.poll_tx.wake(IoEvents::OUT) };
+                Ok(read)
+            } else if writers == 0 {
+                Ok(0)
+            } else {
+                Err(StarryError::WouldBlock)
+            }
+        }))
+    }
+
+    /// Write with an explicit blocking mode (see [`Self::read_nb`]).
+    pub(crate) fn write_nb(&self, src: &mut IoSrc, non_blocking: bool) -> StarryResult<usize> {
+        self.write_with_broken_pipe_handler(src, raise_pipe, non_blocking)
+    }
+
+    /// tee(2): duplicate up to `len` bytes from `self` (read end) into `dst`
+    /// (write end) WITHOUT consuming the source. Mirrors do_tee's
+    /// ipipe_prep -> opipe_prep -> link_pipe (linux/fs/splice.c:1938-1974): wait
+    /// for source data (or EOF), wait for destination room (or SIGPIPE/EPIPE on
+    /// a reader-less destination), then copy by peeking the source ring so its
+    /// read index is never advanced. `self` and `dst` must be different pipes
+    /// (checked by the caller via [`Self::shares_ring_with`]).
+    pub(crate) fn tee_to(&self, dst: &Pipe, len: usize, non_blocking: bool) -> StarryResult<usize> {
+        let has_data = block_on(poll_io(self, IoEvents::IN, non_blocking, || {
+            let state = self.shared.state.lock();
+            if state.buffer.occupied_len() > 0 {
+                Ok(true)
+            } else if state.writers == 0 {
+                Ok(false)
+            } else {
+                Err(StarryError::WouldBlock)
+            }
+        }))?;
+        if !has_data {
+            return Ok(0);
+        }
+
+        block_on(poll_io(dst, IoEvents::OUT, non_blocking, || {
+            let state = dst.shared.state.lock();
+            if state.readers == 0 {
+                raise_pipe();
+                Err(StarryError::BrokenPipe)
+            } else if state.has_free_buffer() {
+                Ok(())
+            } else {
+                Err(StarryError::WouldBlock)
+            }
+        }))?;
+
+        let copied = {
+            // Lock both rings in address order to avoid the ABBA that Linux
+            // guards against at splice.c:1737-1741.
+            let self_addr = Arc::as_ptr(&self.shared) as usize;
+            let dst_addr = Arc::as_ptr(&dst.shared) as usize;
+            let (src_state, mut dst_state) = if self_addr < dst_addr {
+                let s = self.shared.state.lock();
+                let d = dst.shared.state.lock();
+                (s, d)
+            } else {
+                let d = dst.shared.state.lock();
+                let s = self.shared.state.lock();
+                (s, d)
+            };
+            let want = len.min(src_state.buffer.occupied_len());
+            let (left, right) = src_state.buffer.as_slices();
+            // Peek only: the source read index is never advanced, so the source
+            // retains its bytes (tee is non-consuming).
+            let mut peek = Vec::with_capacity(want);
+            let from_left = left.len().min(want);
+            peek.extend_from_slice(&left[..from_left]);
+            if peek.len() < want {
+                peek.extend_from_slice(&right[..want - peek.len()]);
+            }
+            let mut cursor: &[u8] = &peek;
+            let src_io: &mut IoSrc = &mut cursor;
+            let mut written = 0;
+            while src_io.remaining() > 0 && dst_state.has_free_buffer() {
+                let appended = dst_state.append_from(src_io)?;
+                if appended == 0 {
+                    break;
+                }
+                written += appended;
+            }
+            written
+        };
+        if copied > 0 {
+            // Duplicated bytes are committed before waking destination readers.
+            unsafe { dst.shared.poll_rx.wake(IoEvents::IN) };
+        }
+        Ok(copied)
+    }
+
     #[cfg(axtest)]
     fn write_without_sigpipe_for_test(&self, src: &mut IoSrc) -> StarryResult<usize> {
         // Axtests run in a kernel task without Starry process signal state. The
         // write transition is identical, but SIGPIPE delivery is outside this
         // direct pipe test and cannot be requested from that task.
-        self.write_with_broken_pipe_handler(src, || {})
+        self.write_with_broken_pipe_handler(src, || {}, self.nonblocking())
     }
 
     #[cfg(axtest)]
@@ -524,39 +649,11 @@ fn raise_pipe() {
 
 impl FileLike for Pipe {
     fn read(&self, dst: &mut IoDst) -> StarryResult<usize> {
-        if !self.is_read() {
-            return Err(StarryError::BadFileDescriptor);
-        }
-        if dst.is_full() {
-            return Ok(0);
-        }
-
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
-            let (read, writers) = {
-                let mut state = self.shared.state.lock();
-                let (left, right) = state.buffer.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { state.buffer.advance_read_index(count) };
-                state.consume(count);
-                (count, state.writers)
-            };
-            if read > 0 {
-                // Pipe capacity was freed before waking writers.
-                unsafe { self.shared.poll_tx.wake(IoEvents::OUT) };
-                Ok(read)
-            } else if writers == 0 {
-                Ok(0)
-            } else {
-                Err(StarryError::WouldBlock)
-            }
-        }))
+        self.read_nb(dst, self.nonblocking())
     }
 
     fn write(&self, src: &mut IoSrc) -> StarryResult<usize> {
-        self.write_with_broken_pipe_handler(src, raise_pipe)
+        self.write_with_broken_pipe_handler(src, raise_pipe, self.nonblocking())
     }
 
     fn stat(&self) -> StarryResult<Kstat> {

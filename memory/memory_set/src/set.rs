@@ -402,6 +402,52 @@ impl<B: MappingBackend> MemorySet<B> {
         self.areas.extend(to_insert);
         Ok(())
     }
+
+    /// Returns whether any area overlapping `[start, start+size)` is sealed.
+    /// Used by the mutating memory syscalls to enforce mseal(2) (EPERM).
+    pub fn range_has_sealed(&self, start: B::Addr, size: usize) -> bool {
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
+        self.areas
+            .values()
+            .any(|area| area.sealed() && area.start() < end && area.end() > start)
+    }
+
+    /// Seals every area fragment within `[start, start+size)`, splitting areas
+    /// that straddle a boundary so only the requested bytes are sealed. Mirrors
+    /// `protect_with_reported_flags` but marks metadata only (no page-table op).
+    /// Idempotent; the caller must have verified the range is gap-free.
+    pub fn seal(&mut self, start: B::Addr, size: usize) -> MappingResult {
+        let end = start.checked_add(size).ok_or(MappingError::InvalidParam)?;
+        let mut to_insert = Vec::new();
+        for (&area_start, area) in self.areas.iter_mut() {
+            let area_end = area.end();
+            if area_start >= end {
+                break;
+            } else if area_end <= start {
+                // before the range
+            } else if area_start >= start && area_end <= end {
+                area.seal();
+            } else if area_start < start && area_end > end {
+                let mut middle_part = area.split(start).unwrap();
+                let right_part = middle_part.split(end).unwrap();
+                middle_part.seal();
+                to_insert.push((right_part.start(), right_part));
+                to_insert.push((middle_part.start(), middle_part));
+            } else if area_end > end {
+                let right_part = area.split(end).unwrap();
+                area.seal();
+                to_insert.push((right_part.start(), right_part));
+            } else {
+                let mut right_part = area.split(start).unwrap();
+                right_part.seal();
+                to_insert.push((right_part.start(), right_part));
+            }
+        }
+        self.areas.extend(to_insert);
+        Ok(())
+    }
 }
 
 impl<B: MappingBackend> Default for MemorySet<B> {

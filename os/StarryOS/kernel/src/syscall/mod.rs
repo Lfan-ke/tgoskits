@@ -425,6 +425,18 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg4() as _,
             uctx.arg5() as _,
         ),
+        Sysno::tee => sys_tee(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
+        Sysno::vmsplice => sys_vmsplice(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
 
         // io mpx
         #[cfg(target_arch = "x86_64")]
@@ -630,6 +642,7 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::msync => sys_msync(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
         Sysno::mlock => sys_mlock(uctx.arg0(), uctx.arg1() as _),
         Sysno::mlock2 => sys_mlock2(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::mseal => sys_mseal(uctx.arg0(), uctx.arg1() as _, uctx.arg2() as _),
 
         // task info
         Sysno::getpid => sys_getpid(),
@@ -659,6 +672,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         Sysno::sched_getparam => sys_sched_getparam(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::getpriority => sys_getpriority(uctx.arg0() as _, uctx.arg1() as _),
         Sysno::setpriority => sys_setpriority(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::ioprio_get => sys_ioprio_get(uctx.arg0() as _, uctx.arg1() as _),
+        Sysno::ioprio_set => sys_ioprio_set(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
 
         // task ops
         Sysno::execve => sys_execve(uctx, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
