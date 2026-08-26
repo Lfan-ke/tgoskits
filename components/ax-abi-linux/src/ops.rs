@@ -92,6 +92,13 @@ pub trait Mem: Sync {
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
 }
 
+/// A source of randomness (`getrandom`, `/dev/urandom`). Fills a kernel buffer;
+/// the domain copies it to user memory. Every modern libc calls this at startup.
+pub trait Random: Sync {
+    /// Fill `buf` with random bytes, returning the count produced.
+    fn fill(&self, buf: &mut [u8]) -> SysResult;
+}
+
 /// Signal delivery and the blocked-signal mask. The domain reads/writes the
 /// user `sigset_t` itself; this port takes and returns the mask as a `u64`.
 pub trait Signals: Sync {
@@ -129,4 +136,6 @@ pub trait LinuxHost: Sync {
     fn signals(&self) -> &dyn Signals;
     /// Clocks and sleeping.
     fn clock(&self) -> &dyn Clock;
+    /// Randomness.
+    fn random(&self) -> &dyn Random;
 }

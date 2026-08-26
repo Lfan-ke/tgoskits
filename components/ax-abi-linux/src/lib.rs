@@ -107,6 +107,9 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
             .tgkill(arg(0) as i32, arg(1) as i32, arg(2) as i32),
         Sysno::rt_sigprocmask => sys_rt_sigprocmask(host, arg(0) as i32, arg(1), arg(2), arg(3)),
 
+        // Randomness - the domain fills user memory from the Random port.
+        Sysno::getrandom => sys_getrandom(host, arg(0), arg(1)),
+
         _ => Err(ENOSYS),
     }
 }
@@ -138,6 +141,27 @@ fn sys_read(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize) -> SysResult
     while done < len {
         let n = (len - done).min(CHUNK);
         let got = files.read(fd, &mut buf[..n])? as usize;
+        if got == 0 {
+            break;
+        }
+        platform.write_user(ubuf + done, &buf[..got])?;
+        done += got;
+        if got < n {
+            break;
+        }
+    }
+    Ok(done as isize)
+}
+
+/// `getrandom(ubuf, len)`: fill user memory from the Random port in bounded
+/// chunks. Flags (GRND_NONBLOCK/RANDOM) do not change behavior for this backend.
+fn sys_getrandom(host: &dyn LinuxHost, ubuf: usize, len: usize) -> SysResult {
+    let (platform, random) = (host.platform(), host.random());
+    let mut buf = [0u8; CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        let got = random.fill(&mut buf[..n])? as usize;
         if got == 0 {
             break;
         }
@@ -245,7 +269,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{Clock, EFAULT, Files, Mem, Platform, Signals, Tasks},
+        ops::{Clock, EFAULT, Files, Mem, Platform, Random, Signals, Tasks},
         *,
     };
 
@@ -384,6 +408,12 @@ mod tests {
             Ok(old)
         }
     }
+    impl Random for Host {
+        fn fill(&self, buf: &mut [u8]) -> SysResult {
+            buf.fill(0xAB); // deterministic for the test
+            Ok(buf.len() as isize)
+        }
+    }
     impl Clock for Host {
         fn monotonic_ns(&self) -> u64 {
             5 * NS_PER_SEC + 250
@@ -407,6 +437,9 @@ mod tests {
             self
         }
         fn clock(&self) -> &dyn Clock {
+            self
+        }
+        fn random(&self) -> &dyn Random {
             self
         }
         fn files(&self) -> &dyn Files {
@@ -532,6 +565,15 @@ mod tests {
             dispatch(&host, &Trap::new(Sysno::rt_sigprocmask, [2, 0, 0, 4, 0, 0])),
             Err(EINVAL)
         );
+    }
+
+    #[test]
+    fn getrandom_fills_user_memory() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![0u8; 5];
+        let r = dispatch(&host, &Trap::new(Sysno::getrandom, [0, 5, 0, 0, 0, 0]));
+        assert_eq!(r, Ok(5));
+        assert_eq!(&*host.umem.borrow(), &[0xAB; 5]);
     }
 
     #[test]
