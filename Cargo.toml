@@ -23,6 +23,7 @@ members = [
     "components/ax-binfmt",
     "components/ax-abi-windows",
     "components/ax-abi-path",
+    "components/ax-abi-driver",
     "components/ax-cgroup",
     "components/ax-lazyinit",
     "components/axbacktrace",
@@ -137,6 +138,7 @@ ax-arm-pl031 = { version = "0.4", path = "drivers/rtc/arm_pl031" }
 ax-binfmt = { version = "0.1", path = "components/ax-binfmt" }
 ax-abi-windows = { version = "0.1", path = "components/ax-abi-windows" }
 ax-abi-path = { version = "0.1", path = "components/ax-abi-path" }
+ax-abi-driver = { version = "0.1", path = "components/ax-abi-driver" }
 cpu-local = { version = "0.2", path = "components/cpu-local" }
 ax-cpu = { version = "0.8", path = "components/axcpu" }
 ax-cpumask = { version = "0.4", path = "components/cpumask" }
