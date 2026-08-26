@@ -1,0 +1,18 @@
+[package]
+name = "ax-abi-windows"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+description = "Windows NT personality for ArceOS: a PE image loader and NT syscall dispatch that map onto the shared ax-* primitives."
+keywords = ["windows", "pe", "personality", "no-std"]
+categories = ["no-std", "os"]
+license = "Apache-2.0"
+
+[dependencies]
+ax-binfmt = { workspace = true }
+
+[features]
+# Layer a thin Win32 (kernel32/kernelbase) shim over the NT syscall core.
+# Off by default: a NATIVE-subsystem PE links only ntdll and needs no Win32.
+win32 = []
