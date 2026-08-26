@@ -7,6 +7,7 @@ axbacktrace
 ax-binfmt
 ax-abi-windows
 ax-abi-path
+ax-abi-driver
 axdevice
 axdevice_base
 axfs-ng-vfs
