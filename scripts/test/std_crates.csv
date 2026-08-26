@@ -5,6 +5,7 @@ arm_vgic
 axaddrspace
 axbacktrace
 ax-binfmt
+ax-abi
 ax-abi-windows
 ax-abi-path
 ax-abi-driver
