@@ -118,6 +118,20 @@ pub trait TrapEnv {
     fn set_result(&mut self, value: usize);
 }
 
+/// Whether a trapped index was serviced.
+///
+/// A syscall, a VM exit, an interrupt vector and a custom instruction are the
+/// same shape - an index carried by a trap - so dispatch reports only whether
+/// something claimed it. `Passthrough` lets the caller try the next handler
+/// (a [`CustomHandler`]) or apply the domain's default (e.g. `ENOSYS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// The index was handled; the result is already written to the trap frame.
+    Handled,
+    /// The index is not one this handler owns; try the next handler.
+    Passthrough,
+}
+
 /// A loadable, runnable OS personality: one entry in the dispatch table, the
 /// analogue of a `struct linux_binfmt`.
 ///
@@ -135,8 +149,37 @@ pub trait Personality: Sync {
     /// `linux_binfmt::load_binary`.
     fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded>;
 
-    /// Dispatch one trapped syscall for a task of this personality.
-    fn handle_syscall(&self, env: &mut dyn TrapEnv);
+    /// Service one trapped index (a syscall) for a task of this personality,
+    /// reporting whether it was this personality's. `Passthrough` defers to the
+    /// registered [`CustomHandler`]s.
+    fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch;
+}
+
+/// A user-registered handler for a reserved index range - the extension point
+/// for adding syscalls/hypercalls/instructions without forking a personality,
+/// analogous to RISC-V's reserved custom opcode space or a Chipyard RoCC
+/// accelerator. Tried, in order, after the personality passes an index through.
+pub trait CustomHandler: Sync {
+    /// Service the trapped index if it is one this extension owns.
+    fn handle(&self, env: &mut dyn TrapEnv) -> Dispatch;
+}
+
+/// Route one trapped index to the personality, then to the custom extensions in
+/// order, stopping at the first that claims it. Returns [`Dispatch::Passthrough`]
+/// when none does, so the caller can apply the personality's default (`ENOSYS`).
+pub fn dispatch_trap(
+    personality: &dyn Personality,
+    custom: &[&dyn CustomHandler],
+    env: &mut dyn TrapEnv,
+) -> Dispatch {
+    if personality.handle_syscall(env) == Dispatch::Handled {
+        return Dispatch::Handled;
+    }
+    custom
+        .iter()
+        .map(|h| h.handle(env))
+        .find(|&d| d == Dispatch::Handled)
+        .unwrap_or(Dispatch::Passthrough)
 }
 
 /// Route `image` to the first registered personality that recognizes it, the
@@ -257,7 +300,71 @@ mod tests {
         fn load(&self, _req: &LoadRequest<'_>, _env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
             Ok(Loaded { entry: 0, stack: 0 })
         }
-        fn handle_syscall(&self, _env: &mut dyn TrapEnv) {}
+        fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
+            // This mock owns no syscalls, so every index passes through - which is
+            // exactly what lets the extension tests reach the custom handlers.
+            Dispatch::Passthrough
+        }
+    }
+
+    // A trap frame exposing a fixed index, enough to drive dispatch routing.
+    struct Trap {
+        nr: usize,
+        result: Option<usize>,
+    }
+    impl TrapEnv for Trap {
+        fn nr(&self) -> usize {
+            self.nr
+        }
+        fn arg(&self, _i: usize) -> usize {
+            0
+        }
+        fn set_result(&mut self, value: usize) {
+            self.result = Some(value);
+        }
+    }
+
+    // A custom extension that claims one reserved index (RoCC-style), writing a
+    // sentinel result so the test can see it ran.
+    struct CustomOne(usize);
+    impl CustomHandler for CustomOne {
+        fn handle(&self, env: &mut dyn TrapEnv) -> Dispatch {
+            if env.nr() == self.0 {
+                env.set_result(0xC0DE);
+                Dispatch::Handled
+            } else {
+                Dispatch::Passthrough
+            }
+        }
+    }
+
+    #[test]
+    fn custom_handler_extends_a_passthrough_personality() {
+        let linux = MagicHandler(Abi::Linux);
+        let custom = CustomOne(0x900);
+        let handlers: [&dyn CustomHandler; 1] = [&custom];
+
+        // The reserved index reaches the custom handler and is serviced.
+        let mut owned = Trap {
+            nr: 0x900,
+            result: None,
+        };
+        assert_eq!(
+            dispatch_trap(&linux, &handlers, &mut owned),
+            Dispatch::Handled
+        );
+        assert_eq!(owned.result, Some(0xC0DE));
+
+        // An index nobody claims passes through for the caller's default.
+        let mut unowned = Trap {
+            nr: 0x901,
+            result: None,
+        };
+        assert_eq!(
+            dispatch_trap(&linux, &handlers, &mut unowned),
+            Dispatch::Passthrough
+        );
+        assert_eq!(unowned.result, None);
     }
 
     #[test]
