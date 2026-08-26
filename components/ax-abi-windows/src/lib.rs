@@ -284,6 +284,50 @@ mod tests {
         );
     }
 
+    const RO: u32 = 0x4000_0000; // read only
+
+    #[test]
+    fn loads_a_realistic_toolchain_layout() {
+        // A typical MinGW/MSVC x64 layout: code, read-only data, writable data,
+        // and a .bss whose virtual size exceeds its (zero) raw size.
+        let text = sect(0x1000, 0x1000, 0x40, 0x400, RX);
+        let rdata = sect(0x2000, 0x1000, 0x20, 0x600, RO);
+        let data = sect(0x3000, 0x1000, 0x10, 0x800, RW);
+        let bss = sect(0x4000, 0x1000, 0, 0, RW);
+        let img = synth(
+            0x1_4000_0000,
+            0x1000,
+            &[
+                (text, &[0x90; 0x40]),
+                (rdata, &[0xAB; 0x20]),
+                (data, &[0xCD; 0x10]),
+                (bss, &[]),
+            ],
+        );
+
+        let mut env = RecordingEnv::default();
+        WindowsAbi
+            .load(
+                &LoadRequest {
+                    image: &img,
+                    args: &[],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .expect("load");
+        assert_eq!(env.maps.len(), 4);
+        assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
+        assert_eq!(env.maps[1].1, Prot::READ);
+        assert_eq!(env.maps[2].1, Prot::READ | Prot::WRITE);
+        // .bss is fully zero-filled to its virtual size with no file backing.
+        let (va, prot, page) = &env.maps[3];
+        assert_eq!(*va, 0x1_4000_4000);
+        assert_eq!(*prot, Prot::READ | Prot::WRITE);
+        assert_eq!(page.len(), 0x1000);
+        assert!(page.iter().all(|&b| b == 0));
+    }
+
     #[test]
     fn rejects_non_pe_and_pe32() {
         let mut env = RecordingEnv::default();

@@ -187,4 +187,23 @@ mod tests {
     fn drive_less_absolute_uses_backslash_root() {
         assert_eq!(to_win("/Windows/notepad.exe"), r"\Windows\notepad.exe");
     }
+
+    #[test]
+    fn translates_typical_program_paths() {
+        // Paths a real Windows program hands the loader/VFS, spaces and all.
+        assert_eq!(
+            to_posix(r"C:\Program Files\App\app.exe"),
+            "/c/Program Files/App/app.exe"
+        );
+        assert_eq!(
+            to_posix(r"C:\Windows\System32\kernel32.dll"),
+            "/c/Windows/System32/kernel32.dll"
+        );
+        assert_eq!(
+            to_posix(r"\??\C:\Users\me\AppData\file.txt"),
+            "/c/Users/me/AppData/file.txt"
+        );
+        // A device path keeps its single-root shape after prefix stripping.
+        assert_eq!(to_posix(r"\??\NUL"), "NUL");
+    }
 }
