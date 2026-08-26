@@ -19,11 +19,17 @@
 pub mod ops;
 
 use ax_binfmt::{Abi, TrapEnv};
-use ops::{ENOSYS, LinuxHost, SysResult};
+use ops::{EINVAL, ENOSYS, LinuxHost, SysResult};
 use syscalls::Sysno;
 
 /// Bounce-buffer size for user-memory copies; larger transfers loop.
 const CHUNK: usize = 256;
+/// Nanoseconds per second, for packing `timespec`/`timeval`.
+const NS_PER_SEC: u64 = 1_000_000_000;
+/// `CLOCK_REALTIME` - wall-clock time since the Unix epoch.
+const CLOCK_REALTIME: i32 = 0;
+/// `CLOCK_MONOTONIC` - time since an arbitrary fixed point.
+const CLOCK_MONOTONIC: i32 = 1;
 
 /// The Linux personality: recognizes ELF images and services Linux syscalls
 /// against a host's ports.
@@ -87,6 +93,11 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         Sysno::munmap => host.mem().munmap(arg(0), arg(1)),
         Sysno::mprotect => host.mem().mprotect(arg(0), arg(1), arg(2) as i32),
 
+        // Clocks - the domain packs the timespec/timeval itself.
+        Sysno::clock_gettime => sys_clock_gettime(host, arg(0) as i32, arg(1)),
+        Sysno::gettimeofday => sys_gettimeofday(host, arg(0)),
+        Sysno::nanosleep => sys_nanosleep(host, arg(0), arg(1)),
+
         _ => Err(ENOSYS),
     }
 }
@@ -130,6 +141,57 @@ fn sys_read(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize) -> SysResult
     Ok(done as isize)
 }
 
+/// `clock_gettime(clockid, ts)`: read the requested clock and pack a `timespec`
+/// (two 64-bit words) into user memory.
+fn sys_clock_gettime(host: &dyn LinuxHost, clockid: i32, ts: usize) -> SysResult {
+    let ns = match clockid {
+        CLOCK_REALTIME => host.clock().wall_ns(),
+        CLOCK_MONOTONIC => host.clock().monotonic_ns(),
+        _ => return Err(EINVAL),
+    };
+    let packed = pack_time_pair((ns / NS_PER_SEC) as i64, (ns % NS_PER_SEC) as i64);
+    host.platform().write_user(ts, &packed)?;
+    Ok(0)
+}
+
+/// `gettimeofday(tv)`: pack the wall clock as a `timeval` (seconds + microseconds).
+fn sys_gettimeofday(host: &dyn LinuxHost, tv: usize) -> SysResult {
+    if tv == 0 {
+        return Ok(0);
+    }
+    let ns = host.clock().wall_ns();
+    let packed = pack_time_pair((ns / NS_PER_SEC) as i64, (ns % NS_PER_SEC / 1_000) as i64);
+    host.platform().write_user(tv, &packed)?;
+    Ok(0)
+}
+
+/// `nanosleep(req, rem)`: read the requested `timespec`, sleep, and clear `rem`
+/// (this personality does not interrupt sleeps yet, so no time ever remains).
+fn sys_nanosleep(host: &dyn LinuxHost, req: usize, rem: usize) -> SysResult {
+    let mut buf = [0u8; 16];
+    host.platform().read_user(req, &mut buf)?;
+    let sec = i64::from_le_bytes(buf[..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(buf[8..].try_into().unwrap());
+    if sec < 0 || !(0..NS_PER_SEC as i64).contains(&nsec) {
+        return Err(EINVAL);
+    }
+    host.clock()
+        .sleep_ns(sec as u64 * NS_PER_SEC + nsec as u64)?;
+    if rem != 0 {
+        host.platform().write_user(rem, &[0u8; 16])?;
+    }
+    Ok(0)
+}
+
+/// Pack two 64-bit little-endian words - the shared layout of `timespec` and
+/// `timeval` on 64-bit Linux.
+fn pack_time_pair(hi: i64, lo: i64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&hi.to_le_bytes());
+    b[8..].copy_from_slice(&lo.to_le_bytes());
+    b
+}
+
 /// Encode a [`SysResult`] the Linux way: the value on success, `-errno` on
 /// failure (both as raw register-width bits).
 fn encode(result: SysResult) -> usize {
@@ -144,7 +206,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{EFAULT, Files, Mem, Platform, Tasks},
+        ops::{Clock, EFAULT, Files, Mem, Platform, Tasks},
         *,
     };
 
@@ -179,6 +241,7 @@ mod tests {
         umem: RefCell<Vec<u8>>,
         written: RefCell<Vec<u8>>,
         to_read: RefCell<Vec<u8>>,
+        slept: RefCell<u64>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Host {}
@@ -258,11 +321,26 @@ mod tests {
             Ok(0)
         }
     }
+    impl Clock for Host {
+        fn monotonic_ns(&self) -> u64 {
+            5 * NS_PER_SEC + 250
+        }
+        fn wall_ns(&self) -> u64 {
+            1_700_000_000 * NS_PER_SEC + 500_000
+        }
+        fn sleep_ns(&self, ns: u64) -> SysResult {
+            *self.slept.borrow_mut() = ns;
+            Ok(0)
+        }
+    }
     impl LinuxHost for Host {
         fn platform(&self) -> &dyn Platform {
             self
         }
         fn tasks(&self) -> &dyn Tasks {
+            self
+        }
+        fn clock(&self) -> &dyn Clock {
             self
         }
         fn files(&self) -> &dyn Files {
@@ -320,9 +398,47 @@ mod tests {
     fn unknown_syscall_is_enosys() {
         let host = Host::default();
         assert_eq!(
-            dispatch(&host, &Trap::new(Sysno::gettimeofday, [0; 6])),
+            dispatch(&host, &Trap::new(Sysno::reboot, [0; 6])),
             Err(ENOSYS)
         );
+    }
+
+    #[test]
+    fn clock_gettime_packs_monotonic_into_user() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![0u8; 16];
+        let r = dispatch(
+            &host,
+            &Trap::new(
+                Sysno::clock_gettime,
+                [CLOCK_MONOTONIC as usize, 0, 0, 0, 0, 0],
+            ),
+        );
+        assert_eq!(r, Ok(0));
+        let mem = host.umem.borrow();
+        let sec = i64::from_le_bytes(mem[..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(mem[8..16].try_into().unwrap());
+        assert_eq!((sec, nsec), (5, 250));
+    }
+
+    #[test]
+    fn clock_gettime_rejects_unknown_clock() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![0u8; 16];
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::clock_gettime, [99, 0, 0, 0, 0, 0])),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn nanosleep_reads_request_and_sleeps() {
+        let host = Host::default();
+        // A timespec of { 2s, 3ns } at user address 0.
+        *host.umem.borrow_mut() = pack_time_pair(2, 3).to_vec();
+        let r = dispatch(&host, &Trap::new(Sysno::nanosleep, [0, 0, 0, 0, 0, 0]));
+        assert_eq!(r, Ok(0));
+        assert_eq!(*host.slept.borrow(), 2 * NS_PER_SEC + 3);
     }
 
     #[test]

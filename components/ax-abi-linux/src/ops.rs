@@ -23,6 +23,8 @@ pub type SysResult = Result<isize, i32>;
 pub const ENOSYS: i32 = 38;
 /// `EFAULT` - a user pointer was not accessible.
 pub const EFAULT: i32 = 14;
+/// `EINVAL` - an argument was invalid.
+pub const EINVAL: i32 = 22;
 
 /// The minimal arch/memory platform, à la gVisor's `Platform`: move bytes across
 /// the user/kernel boundary. Everything a personality needs from the CPU/MMU
@@ -90,6 +92,17 @@ pub trait Mem: Sync {
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
 }
 
+/// Clocks and sleeping, in nanoseconds. The domain packs the `timespec`/
+/// `timeval` structs itself; this port only supplies the raw counters.
+pub trait Clock: Sync {
+    /// Monotonic time since boot, in nanoseconds (`CLOCK_MONOTONIC`).
+    fn monotonic_ns(&self) -> u64;
+    /// Wall-clock time since the Unix epoch, in nanoseconds (`CLOCK_REALTIME`).
+    fn wall_ns(&self) -> u64;
+    /// Sleep for `ns` nanoseconds.
+    fn sleep_ns(&self, ns: u64) -> SysResult;
+}
+
 /// The bundle of ports a hosting OS registers for the Linux personality.
 pub trait LinuxHost: Sync {
     /// Arch/memory platform.
@@ -100,4 +113,6 @@ pub trait LinuxHost: Sync {
     fn files(&self) -> &dyn Files;
     /// Address-space service.
     fn mem(&self) -> &dyn Mem;
+    /// Clocks and sleeping.
+    fn clock(&self) -> &dyn Clock;
 }
