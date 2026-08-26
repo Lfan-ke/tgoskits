@@ -24,7 +24,9 @@ pub use ax_abi_driver;
 pub use ax_abi_path;
 #[cfg(feature = "win")]
 pub use ax_abi_windows::{self, WindowsAbi};
-pub use ax_binfmt::{self, Abi, AbiError, AbiResult, Personality, detect};
+pub use ax_binfmt::{
+    self, Abi, AbiError, AbiResult, CustomHandler, Dispatch, Personality, detect, dispatch_trap,
+};
 
 // Each compiled-in personality is a zero-sized handler with a `'static` address,
 // so the assembled set holds `'static` references without allocation of the

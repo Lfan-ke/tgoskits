@@ -22,13 +22,9 @@ pub mod teb_peb;
 use alloc::{vec, vec::Vec};
 
 use ax_binfmt::{
-    Abi, AbiError, AbiResult, LoadEnv, LoadRequest, Loaded, Personality, Prot, TrapEnv,
+    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Personality, Prot, TrapEnv,
     pe::{self, PeInfo, Reloc, Section},
 };
-
-/// NTSTATUS returned for any NT syscall until dispatch is implemented
-/// (`STATUS_NOT_IMPLEMENTED`).
-const STATUS_NOT_IMPLEMENTED: usize = 0xC000_0002;
 
 /// The Windows NT personality: recognizes PE images and loads them.
 #[derive(Debug, Clone, Copy, Default)]
@@ -59,10 +55,11 @@ impl Personality for WindowsAbi {
         })
     }
 
-    fn handle_syscall(&self, env: &mut dyn TrapEnv) {
-        // Real NT syscall dispatch is a later phase; fail the call explicitly
-        // rather than silently returning success.
-        env.set_result(STATUS_NOT_IMPLEMENTED);
+    fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
+        // NT syscall dispatch (see the `nt` module) is wired on-target in a later
+        // phase; until then no index is serviced, so pass through to any custom
+        // handler or the caller's default.
+        Dispatch::Passthrough
     }
 }
 

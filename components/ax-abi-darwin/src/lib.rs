@@ -16,13 +16,9 @@ extern crate alloc;
 use alloc::vec;
 
 use ax_binfmt::{
-    Abi, AbiError, AbiResult, LoadEnv, LoadRequest, Loaded, Personality, Prot, TrapEnv,
+    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Personality, Prot, TrapEnv,
     macho::{self, Segment},
 };
-
-/// Darwin BSD/Mach syscall not yet implemented; a placeholder result until the
-/// syscall phase lands.
-const ENOSYS: usize = 38;
 
 /// The Darwin personality: recognizes Mach-O images and loads them.
 #[derive(Debug, Clone, Copy, Default)]
@@ -58,9 +54,10 @@ impl Personality for DarwinAbi {
         Ok(Loaded { entry, stack: 0 })
     }
 
-    fn handle_syscall(&self, env: &mut dyn TrapEnv) {
-        // Darwin BSD/Mach syscall dispatch is a later phase; fail explicitly.
-        env.set_result(ENOSYS);
+    fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
+        // Darwin BSD/Mach syscall dispatch is a later phase; until then no index
+        // is serviced, so pass through to a custom handler or the caller default.
+        Dispatch::Passthrough
     }
 }
 
