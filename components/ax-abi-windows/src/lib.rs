@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod handle;
+pub mod teb_peb;
 
 use alloc::{vec, vec::Vec};
 
