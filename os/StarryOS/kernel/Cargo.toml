@@ -162,6 +162,7 @@ usb-serial.workspace = true
 rdrive.workspace = true
 
 axbacktrace = { workspace = true }
+ax-binfmt = { workspace = true }
 ax-cgroup = { workspace = true }
 axfs-ng-vfs = { workspace = true }
 rdif-block = { workspace = true }
