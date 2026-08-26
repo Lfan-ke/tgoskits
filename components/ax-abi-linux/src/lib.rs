@@ -1,44 +1,32 @@
 //! Linux personality for ArceOS/StarryOS.
 //!
-//! StarryOS is natively a Linux ABI, but its syscall table is woven directly
-//! into the kernel. This crate re-expresses that ABI through dependency
-//! inversion: the Linux syscall logic here depends only on the OS-service
-//! *ports* in [`ops`] plus [`ax_binfmt`], never on `axtask`/`axfs`/`axmm`. A
-//! hosting OS implements those ports over its concrete managers and registers
-//! one [`ops::LinuxServices`] bundle via [`register`] - the same inversion a
-//! program uses to plug a concrete allocator into `GlobalAlloc`. That keeps this
-//! crate free of kernel-runtime dependencies and unit-testable with mock
-//! providers, and lets any ArceOS-derived OS reuse the Linux personality.
+//! StarryOS is natively a Linux ABI, but its syscall table is woven into the
+//! kernel. This crate re-expresses that ABI through dependency inversion: the
+//! syscall logic here depends only on the [`ops`] ports plus [`ax_binfmt`],
+//! never on `axtask`/`axfs`/`axmm`. It implements every syscall itself - reading
+//! and validating arguments, copying user memory through the [`ops::Platform`]
+//! port, and driving the [`ops::Files`]/[`ops::Tasks`]/[`ops::Mem`] services -
+//! and never forwards a syscall to the host (the zero-passthrough rule gVisor's
+//! Sentry follows). A hosting OS registers one [`ops::LinuxHost`] over its
+//! concrete managers, so the crate stays kernel-runtime-free and unit-testable
+//! with mock ports, and any ArceOS-derived OS can reuse the Linux personality.
 //!
-//! Migration is incremental: syscalls move behind these ports one family at a
-//! time, the host implements each port over its existing code, and Linux
-//! behavior stays byte-for-byte identical.
+//! `dispatch` takes the host by reference so its logic is testable; the kernel
+//! binds the registered host to a parameter-less entry at integration time.
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod ops;
 
 use ax_binfmt::{Abi, TrapEnv};
-use ax_lazyinit::LazyInit;
-use ops::{ENOSYS, LinuxServices, SysResult};
+use ops::{ENOSYS, LinuxHost, SysResult};
 use syscalls::Sysno;
 
-// The hosting OS registers its service bundle once at boot; every syscall reads
-// it. Set-once (`LazyInit`) mirrors the global-allocator contract: exactly one
-// provider, installed before the first user program runs.
-static SERVICES: LazyInit<&'static dyn LinuxServices> = LazyInit::new();
+/// Bounce-buffer size for user-memory copies; larger transfers loop.
+const CHUNK: usize = 256;
 
-/// Install the hosting OS's service implementation. Call once during boot,
-/// before the first user thread traps.
-pub fn register(services: &'static dyn LinuxServices) {
-    SERVICES.init_once(services);
-}
-
-fn services() -> &'static dyn LinuxServices {
-    *SERVICES
-}
-
-/// The Linux personality: recognizes ELF images and dispatches Linux syscalls.
+/// The Linux personality: recognizes ELF images and services Linux syscalls
+/// against a host's ports.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxAbi;
 
@@ -53,41 +41,42 @@ impl LinuxAbi {
         ax_binfmt::detect(image) == Some(Abi::Linux)
     }
 
-    /// Dispatch one trapped Linux syscall, writing the result into `uctx`.
-    pub fn handle_syscall(uctx: &mut dyn TrapEnv) {
-        let result = dispatch(services(), uctx);
+    /// Service one trapped syscall against `host`, writing the result into `uctx`.
+    pub fn handle_syscall(host: &dyn LinuxHost, uctx: &mut dyn TrapEnv) {
+        let result = dispatch(host, uctx);
         uctx.set_result(encode(result));
     }
 }
 
-/// Route one syscall to the registered services. Separated from the trap-frame
-/// write so it can be unit-tested with mock services and a mock [`TrapEnv`].
-fn dispatch(svc: &dyn LinuxServices, uctx: &dyn TrapEnv) -> SysResult {
+/// Route one syscall to its handler. Kept free of the trap-frame write so it can
+/// be unit-tested with mock ports and a mock [`TrapEnv`].
+fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
     let Some(sysno) = Sysno::new(uctx.nr()) else {
         return Err(ENOSYS);
     };
     let arg = |i| uctx.arg(i);
-    let (task, file, mem) = (svc.task(), svc.file(), svc.mem());
     match sysno {
-        // File-descriptor I/O.
-        Sysno::read => file.read(arg(0) as i32, arg(1), arg(2)),
-        Sysno::write => file.write(arg(0) as i32, arg(1), arg(2)),
-        Sysno::close => file.close(arg(0) as i32),
-        Sysno::dup => file.dup(arg(0) as i32),
-        Sysno::lseek => file.lseek(arg(0) as i32, arg(1) as isize, arg(2) as i32),
+        // fd I/O - the domain copies user memory itself, then drives Files.
+        Sysno::read => sys_read(host, arg(0) as i32, arg(1), arg(2)),
+        Sysno::write => sys_write(host, arg(0) as i32, arg(1), arg(2)),
+        Sysno::close => host.files().close(arg(0) as i32),
+        Sysno::dup => host.files().dup(arg(0) as i32),
+        Sysno::lseek => host
+            .files()
+            .lseek(arg(0) as i32, arg(1) as isize, arg(2) as i32),
 
         // Process and thread control.
-        Sysno::getpid => Ok(task.getpid() as isize),
-        Sysno::getppid => Ok(task.getppid() as isize),
-        Sysno::gettid => Ok(task.gettid() as isize),
-        Sysno::set_tid_address => task.set_tid_address(arg(0)),
-        Sysno::sched_yield => task.sched_yield(),
-        Sysno::exit => task.exit(arg(0) as i32),
-        Sysno::exit_group => task.exit_group(arg(0) as i32),
+        Sysno::getpid => Ok(host.tasks().getpid() as isize),
+        Sysno::getppid => Ok(host.tasks().getppid() as isize),
+        Sysno::gettid => Ok(host.tasks().gettid() as isize),
+        Sysno::set_tid_address => host.tasks().set_tid_address(arg(0)),
+        Sysno::sched_yield => host.tasks().sched_yield(),
+        Sysno::exit => host.tasks().exit(arg(0) as i32),
+        Sysno::exit_group => host.tasks().exit_group(arg(0) as i32),
 
-        // Address-space management.
-        Sysno::brk => mem.brk(arg(0)),
-        Sysno::mmap => mem.mmap(
+        // Address space.
+        Sysno::brk => host.mem().brk(arg(0)),
+        Sysno::mmap => host.mem().mmap(
             arg(0),
             arg(1),
             arg(2) as i32,
@@ -95,15 +84,54 @@ fn dispatch(svc: &dyn LinuxServices, uctx: &dyn TrapEnv) -> SysResult {
             arg(4) as i32,
             arg(5),
         ),
-        Sysno::munmap => mem.munmap(arg(0), arg(1)),
-        Sysno::mprotect => mem.mprotect(arg(0), arg(1), arg(2) as i32),
+        Sysno::munmap => host.mem().munmap(arg(0), arg(1)),
+        Sysno::mprotect => host.mem().mprotect(arg(0), arg(1), arg(2) as i32),
 
         _ => Err(ENOSYS),
     }
 }
 
+/// `write(fd, ubuf, len)`: copy from user in bounded chunks and write each to
+/// `fd`, honoring short writes - the domain owns the transfer, not the host.
+fn sys_write(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize) -> SysResult {
+    let (platform, files) = (host.platform(), host.files());
+    let mut buf = [0u8; CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        platform.read_user(ubuf + done, &mut buf[..n])?;
+        let written = files.write(fd, &buf[..n])? as usize;
+        done += written;
+        if written < n {
+            break;
+        }
+    }
+    Ok(done as isize)
+}
+
+/// `read(fd, ubuf, len)`: read from `fd` in bounded chunks and copy each to
+/// user, stopping at EOF or a short read.
+fn sys_read(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize) -> SysResult {
+    let (platform, files) = (host.platform(), host.files());
+    let mut buf = [0u8; CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        let got = files.read(fd, &mut buf[..n])? as usize;
+        if got == 0 {
+            break;
+        }
+        platform.write_user(ubuf + done, &buf[..got])?;
+        done += got;
+        if got < n {
+            break;
+        }
+    }
+    Ok(done as isize)
+}
+
 /// Encode a [`SysResult`] the Linux way: the value on success, `-errno` on
-/// failure (both as the raw register-width bits).
+/// failure (both as raw register-width bits).
 fn encode(result: SysResult) -> usize {
     match result {
         Ok(value) => value as usize,
@@ -116,7 +144,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{FileOps, MemOps, TaskOps},
+        ops::{EFAULT, Files, Mem, Platform, Tasks},
         *,
     };
 
@@ -124,14 +152,12 @@ mod tests {
     struct Trap {
         nr: usize,
         args: [usize; 6],
-        result: Option<usize>,
     }
     impl Trap {
         fn new(nr: Sysno, args: [usize; 6]) -> Self {
             Self {
                 nr: nr as usize,
                 args,
-                result: None,
             }
         }
     }
@@ -142,26 +168,60 @@ mod tests {
         fn arg(&self, i: usize) -> usize {
             self.args[i]
         }
-        fn set_result(&mut self, value: usize) {
-            self.result = Some(value);
-        }
+        fn set_result(&mut self, _value: usize) {}
     }
 
-    // Mock services recording the last routed call, so dispatch is observable.
+    // A host whose "user memory" is a byte vector at base 0, whose Files echoes
+    // writes into a log and serves reads from a queue - enough to exercise the
+    // real copy orchestration.
     #[derive(Default)]
-    struct Mock {
-        last: RefCell<Option<(&'static str, [usize; 6])>>,
+    struct Host {
+        umem: RefCell<Vec<u8>>,
+        written: RefCell<Vec<u8>>,
+        to_read: RefCell<Vec<u8>>,
     }
-    impl Mock {
-        fn note(&self, name: &'static str, a: [usize; 6]) {
-            *self.last.borrow_mut() = Some((name, a));
+    // Single-threaded test only; the ports need Sync for the real 'static host.
+    unsafe impl Sync for Host {}
+
+    impl Platform for Host {
+        fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
+            let mem = self.umem.borrow();
+            let end = uaddr.checked_add(out.len()).ok_or(EFAULT)?;
+            let src = mem.get(uaddr..end).ok_or(EFAULT)?;
+            out.copy_from_slice(src);
+            Ok(0)
+        }
+        fn write_user(&self, uaddr: usize, data: &[u8]) -> SysResult {
+            let mut mem = self.umem.borrow_mut();
+            let end = uaddr.checked_add(data.len()).ok_or(EFAULT)?;
+            let dst = mem.get_mut(uaddr..end).ok_or(EFAULT)?;
+            dst.copy_from_slice(data);
+            Ok(0)
         }
     }
-    // RefCell is not Sync; the trait needs Sync only for the real 'static
-    // provider, so wrap it for the single-threaded test.
-    unsafe impl Sync for Mock {}
-
-    impl TaskOps for Mock {
+    impl Files for Host {
+        fn read(&self, _fd: i32, buf: &mut [u8]) -> SysResult {
+            let mut src = self.to_read.borrow_mut();
+            let n = buf.len().min(src.len());
+            buf[..n].copy_from_slice(&src[..n]);
+            src.drain(..n);
+            Ok(n as isize)
+        }
+        fn write(&self, _fd: i32, buf: &[u8]) -> SysResult {
+            self.written.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len() as isize)
+        }
+        fn close(&self, _fd: i32) -> SysResult {
+            Ok(0)
+        }
+        fn dup(&self, _fd: i32) -> SysResult {
+            Ok(9)
+        }
+        fn lseek(&self, _fd: i32, offset: isize, _whence: i32) -> SysResult {
+            Ok(offset)
+        }
+    }
+    impl Tasks for Host {
         fn getpid(&self) -> u32 {
             42
         }
@@ -171,12 +231,10 @@ mod tests {
         fn gettid(&self) -> u32 {
             7
         }
-        fn set_tid_address(&self, tidptr: usize) -> SysResult {
-            self.note("set_tid_address", [tidptr, 0, 0, 0, 0, 0]);
+        fn set_tid_address(&self, _tidptr: usize) -> SysResult {
             Ok(7)
         }
         fn sched_yield(&self) -> SysResult {
-            self.note("sched_yield", [0; 6]);
             Ok(0)
         }
         fn exit(&self, code: i32) -> ! {
@@ -186,111 +244,83 @@ mod tests {
             panic!("exit_group {code}")
         }
     }
-    impl FileOps for Mock {
-        fn read(&self, fd: i32, buf: usize, len: usize) -> SysResult {
-            self.note("read", [fd as usize, buf, len, 0, 0, 0]);
-            Ok(len as isize)
-        }
-        fn write(&self, fd: i32, buf: usize, len: usize) -> SysResult {
-            self.note("write", [fd as usize, buf, len, 0, 0, 0]);
-            Ok(len as isize)
-        }
-        fn close(&self, fd: i32) -> SysResult {
-            self.note("close", [fd as usize, 0, 0, 0, 0, 0]);
-            Ok(0)
-        }
-        fn dup(&self, fd: i32) -> SysResult {
-            self.note("dup", [fd as usize, 0, 0, 0, 0, 0]);
-            Ok(9)
-        }
-        fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult {
-            self.note(
-                "lseek",
-                [fd as usize, offset as usize, whence as usize, 0, 0, 0],
-            );
-            Ok(offset)
-        }
-    }
-    impl MemOps for Mock {
+    impl Mem for Host {
         fn brk(&self, addr: usize) -> SysResult {
-            self.note("brk", [addr, 0, 0, 0, 0, 0]);
             Ok(addr as isize)
         }
-        fn mmap(
-            &self,
-            addr: usize,
-            len: usize,
-            prot: i32,
-            flags: i32,
-            fd: i32,
-            offset: usize,
-        ) -> SysResult {
-            self.note(
-                "mmap",
-                [
-                    addr,
-                    len,
-                    prot as usize,
-                    flags as usize,
-                    fd as usize,
-                    offset,
-                ],
-            );
+        fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
             Ok(0x1000)
         }
-        fn munmap(&self, addr: usize, len: usize) -> SysResult {
-            self.note("munmap", [addr, len, 0, 0, 0, 0]);
+        fn munmap(&self, _a: usize, _l: usize) -> SysResult {
             Ok(0)
         }
-        fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult {
-            self.note("mprotect", [addr, len, prot as usize, 0, 0, 0]);
+        fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
             Ok(0)
         }
     }
-    impl LinuxServices for Mock {
-        fn task(&self) -> &dyn TaskOps {
+    impl LinuxHost for Host {
+        fn platform(&self) -> &dyn Platform {
             self
         }
-        fn file(&self) -> &dyn FileOps {
+        fn tasks(&self) -> &dyn Tasks {
             self
         }
-        fn mem(&self) -> &dyn MemOps {
+        fn files(&self) -> &dyn Files {
+            self
+        }
+        fn mem(&self) -> &dyn Mem {
             self
         }
     }
 
     #[test]
-    fn routes_file_syscalls_with_correct_args() {
-        let m = Mock::default();
-        assert_eq!(
-            dispatch(&m, &Trap::new(Sysno::write, [1, 0xdead, 16, 0, 0, 0])),
-            Ok(16)
-        );
-        assert_eq!(*m.last.borrow(), Some(("write", [1, 0xdead, 16, 0, 0, 0])));
-        assert_eq!(
-            dispatch(&m, &Trap::new(Sysno::read, [3, 0xbeef, 8, 0, 0, 0])),
-            Ok(8)
-        );
-        assert_eq!(m.last.borrow().unwrap().0, "read");
+    fn write_copies_from_user_then_drives_files() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![b'h', b'i', b'!', 0, 0];
+        // write(fd=1, ubuf=0, len=3): the domain copies "hi!" out of user memory
+        // and hands it to Files - no passthrough.
+        let r = dispatch(&host, &Trap::new(Sysno::write, [1, 0, 3, 0, 0, 0]));
+        assert_eq!(r, Ok(3));
+        assert_eq!(&*host.written.borrow(), b"hi!");
     }
 
     #[test]
-    fn routes_task_and_mem_syscalls() {
-        let m = Mock::default();
-        assert_eq!(dispatch(&m, &Trap::new(Sysno::getpid, [0; 6])), Ok(42));
+    fn read_reads_files_then_copies_to_user() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![0u8; 4];
+        *host.to_read.borrow_mut() = vec![9, 8, 7];
+        let r = dispatch(&host, &Trap::new(Sysno::read, [0, 0, 4, 0, 0, 0]));
+        assert_eq!(r, Ok(3)); // short read at EOF
+        assert_eq!(&host.umem.borrow()[..3], &[9, 8, 7]);
+    }
+
+    #[test]
+    fn write_past_user_memory_faults() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![1, 2];
+        let r = dispatch(&host, &Trap::new(Sysno::write, [1, 0, 8, 0, 0, 0]));
+        assert_eq!(r, Err(EFAULT));
+    }
+
+    #[test]
+    fn routes_primitive_syscalls() {
+        let host = Host::default();
+        assert_eq!(dispatch(&host, &Trap::new(Sysno::getpid, [0; 6])), Ok(42));
         assert_eq!(
-            dispatch(&m, &Trap::new(Sysno::brk, [0x8000, 0, 0, 0, 0, 0])),
+            dispatch(&host, &Trap::new(Sysno::brk, [0x8000, 0, 0, 0, 0, 0])),
             Ok(0x8000)
         );
-        assert_eq!(m.last.borrow().unwrap(), ("brk", [0x8000, 0, 0, 0, 0, 0]));
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::dup, [3, 0, 0, 0, 0, 0])),
+            Ok(9)
+        );
     }
 
     #[test]
     fn unknown_syscall_is_enosys() {
-        let m = Mock::default();
-        // Sysno::gettimeofday is not in the first migrated slice.
+        let host = Host::default();
         assert_eq!(
-            dispatch(&m, &Trap::new(Sysno::gettimeofday, [0; 6])),
+            dispatch(&host, &Trap::new(Sysno::gettimeofday, [0; 6])),
             Err(ENOSYS)
         );
     }
@@ -299,12 +329,5 @@ mod tests {
     fn encode_follows_linux_convention() {
         assert_eq!(encode(Ok(16)), 16);
         assert_eq!(encode(Err(ENOSYS)), (-(ENOSYS as isize)) as usize);
-    }
-
-    #[test]
-    #[should_panic(expected = "exit_group 0")]
-    fn exit_group_is_routed() {
-        let m = Mock::default();
-        let _ = dispatch(&m, &Trap::new(Sysno::exit_group, [0; 6]));
     }
 }
