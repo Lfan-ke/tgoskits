@@ -7971,6 +7971,7 @@ name = "starry-kernel"
 version = "0.8.3"
 dependencies = [
  "ax-alloc",
+ "ax-binfmt",
  "ax-cgroup",
  "ax-cpu",
  "ax-crate-interface",
