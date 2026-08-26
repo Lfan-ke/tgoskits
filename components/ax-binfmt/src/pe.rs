@@ -12,6 +12,11 @@ pub const DIR_BASERELOC: usize = 5;
 /// Data-directory index of the import table (`IMAGE_DIRECTORY_ENTRY_IMPORT`).
 pub const DIR_IMPORT: usize = 1;
 
+/// Base-relocation padding entry, ignored (`IMAGE_REL_BASED_ABSOLUTE`).
+pub const REL_ABSOLUTE: u16 = 0;
+/// 64-bit base relocation for PE32+ (`IMAGE_REL_BASED_DIR64`): patch a `u64`.
+pub const REL_DIR64: u16 = 10;
+
 // Section `Characteristics` access flags (PE/COFF spec IMAGE_SCN_MEM_*).
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
@@ -84,6 +89,32 @@ impl PeInfo {
         let rva = read_u32(image, base)?;
         let size = read_u32(image, base + 4)?;
         (rva != 0).then_some(DataDir { rva, size })
+    }
+
+    /// Translate an RVA to a file offset by finding the section that contains it,
+    /// mirroring `RtlImageRvaToVa`. Returns `None` when no section covers `rva`.
+    pub fn rva_to_file(&self, image: &[u8], rva: u32) -> Option<usize> {
+        self.sections(image)
+            .find(|s| rva >= s.rva && rva < s.rva + s.raw_size)
+            .map(|s| (s.raw_ptr + (rva - s.rva)) as usize)
+    }
+
+    /// Iterate the base-relocation table, yielding one [`Reloc`] per fixup.
+    /// Returns `None` when the image has no relocation directory (e.g. a
+    /// fixed-base image); an empty iterator means the directory is present but
+    /// carries no fixups. Mirrors the block walk in ReactOS
+    /// `LdrRelocateImageWithBias`.
+    pub fn relocations<'a>(&self, image: &'a [u8]) -> Option<Relocations<'a>> {
+        let dir = self.data_dir(image, DIR_BASERELOC)?;
+        let start = self.rva_to_file(image, dir.rva)?;
+        Some(Relocations {
+            image,
+            block: start,
+            end: start + dir.size as usize,
+            entry: 0,
+            entry_end: 0,
+            page_rva: 0,
+        })
     }
 }
 
@@ -162,6 +193,62 @@ impl Iterator for Sections<'_> {
         self.next = off + 40;
         self.remaining -= 1;
         Some(section)
+    }
+}
+
+/// One base-relocation fixup: the RVA to patch and its kind (`REL_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reloc {
+    /// RVA of the value to fix up (`block page RVA + entry offset`).
+    pub rva: u32,
+    /// Relocation kind (`IMAGE_REL_BASED_*`); [`REL_DIR64`] is the PE32+ case.
+    pub kind: u16,
+}
+
+/// Iterator over base-relocation fixups across all blocks. `IMAGE_REL_BASED_ABSOLUTE`
+/// padding entries are skipped; a truncated table ends iteration.
+pub struct Relocations<'a> {
+    image: &'a [u8],
+    block: usize,
+    end: usize,
+    entry: usize,
+    entry_end: usize,
+    page_rva: u32,
+}
+
+impl Iterator for Relocations<'_> {
+    type Item = Reloc;
+
+    fn next(&mut self) -> Option<Reloc> {
+        loop {
+            // Advance across empty/exhausted blocks. Each block is an 8-byte
+            // header (page RVA, SizeOfBlock) followed by 2-byte type/offset entries.
+            while self.entry >= self.entry_end {
+                if self.block + 8 > self.end {
+                    return None;
+                }
+                let page_rva = read_u32(self.image, self.block)?;
+                let size = read_u32(self.image, self.block + 4)? as usize;
+                if size < 8 {
+                    return None;
+                }
+                self.page_rva = page_rva;
+                self.entry = self.block + 8;
+                self.entry_end = (self.block + size).min(self.end);
+                self.block += size;
+            }
+            let word = read_u16(self.image, self.entry)?;
+            self.entry += 2;
+            let kind = word >> 12;
+            let offset = (word & 0xFFF) as u32;
+            if kind == REL_ABSOLUTE {
+                continue;
+            }
+            return Some(Reloc {
+                rva: self.page_rva + offset,
+                kind,
+            });
+        }
     }
 }
 
@@ -332,6 +419,54 @@ mod tests {
         );
         // An untouched (zero-VA) directory reads as absent.
         assert_eq!(pe.data_dir(&b, DIR_IMPORT), None);
+    }
+
+    #[test]
+    fn iterates_base_relocations() {
+        let mut b = synth(0x1_4000_0000, 0x1000, 3, 1);
+        // A single `.reloc` section maps RVA 0x4000 to file offset 0x400.
+        put_section(
+            &mut b,
+            0,
+            Section {
+                rva: 0x4000,
+                vsize: 0x1000,
+                raw_size: 0x100,
+                raw_ptr: 0x400,
+                characteristics: SCN_MEM_READ,
+            },
+        );
+        // One block for page 0x1000: two DIR64 fixups plus an ABSOLUTE pad.
+        let block = 0x400;
+        b[block..block + 4].copy_from_slice(&0x1000u32.to_le_bytes()); // page RVA
+        b[block + 4..block + 8].copy_from_slice(&(8u32 + 6).to_le_bytes()); // SizeOfBlock
+        let entry = |kind: u16, off: u16| (kind << 12 | off).to_le_bytes();
+        b[block + 8..block + 10].copy_from_slice(&entry(REL_DIR64, 0x010));
+        b[block + 10..block + 12].copy_from_slice(&entry(REL_DIR64, 0x020));
+        b[block + 12..block + 14].copy_from_slice(&entry(REL_ABSOLUTE, 0));
+        put_data_dir(&mut b, DIR_BASERELOC, 0x4000, 8 + 6);
+
+        let pe = parse(&b).unwrap();
+        let relocs: Vec<Reloc> = pe.relocations(&b).unwrap().collect();
+        assert_eq!(
+            relocs,
+            [
+                Reloc {
+                    rva: 0x1010,
+                    kind: REL_DIR64
+                },
+                Reloc {
+                    rva: 0x1020,
+                    kind: REL_DIR64
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_reloc_directory_is_none() {
+        let b = synth(0x1_4000_0000, 0x1000, 3, 1);
+        assert!(parse(&b).unwrap().relocations(&b).is_none());
     }
 
     #[test]
