@@ -5,6 +5,7 @@ arm_vgic
 axaddrspace
 axbacktrace
 ax-binfmt
+ax-abi-windows
 axdevice
 axdevice_base
 axfs-ng-vfs

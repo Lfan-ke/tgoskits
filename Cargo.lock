@@ -695,6 +695,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ax-abi-windows"
+version = "0.1.0"
+dependencies = [
+ "ax-binfmt",
+]
+
+[[package]]
 name = "ax-alloc"
 version = "0.8.16"
 dependencies = [
