@@ -12,19 +12,20 @@ license = "Apache-2.0"
 [dependencies]
 ax-binfmt = { workspace = true }
 ax-abi-windows = { workspace = true, optional = true }
+ax-abi-darwin = { workspace = true, optional = true }
 ax-abi-path = { workspace = true, optional = true }
 ax-abi-driver = { workspace = true, optional = true }
 
 [features]
 # Default wires in every personality whose crate exists today plus automatic
 # magic dispatch, so a "lazy" dependant gets a working multi-personality build.
-# `linux`/`mac` join the default once ax-abi-linux/ax-abi-darwin land.
-default = ["win", "auto-dispatch"]
+# `linux` joins the default once ax-abi-linux lands.
+default = ["win", "mac", "auto-dispatch"]
 
 # Select which syscall personalities are compiled in (one or more).
 linux = []
 win = ["dep:ax-abi-windows"]
-mac = []
+mac = ["dep:ax-abi-darwin"]
 
 # Route each executed image to a personality by its magic bytes.
 auto-dispatch = []

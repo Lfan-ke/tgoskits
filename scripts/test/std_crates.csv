@@ -7,6 +7,7 @@ axbacktrace
 ax-binfmt
 ax-abi
 ax-abi-windows
+ax-abi-darwin
 ax-abi-path
 ax-abi-driver
 axdevice
