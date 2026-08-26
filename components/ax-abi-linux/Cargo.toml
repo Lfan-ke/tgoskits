@@ -1,0 +1,15 @@
+[package]
+name = "ax-abi-linux"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+description = "Linux personality for ArceOS: the Linux syscall ABI expressed against registered OS-service ports, independent of any concrete kernel runtime."
+keywords = ["linux", "syscall", "personality", "no-std"]
+categories = ["no-std", "os"]
+license = "Apache-2.0"
+
+[dependencies]
+ax-binfmt = { workspace = true }
+ax-lazyinit = { workspace = true }
+syscalls = { workspace = true }
