@@ -92,6 +92,18 @@ pub trait Mem: Sync {
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
 }
 
+/// Signal delivery and the blocked-signal mask. The domain reads/writes the
+/// user `sigset_t` itself; this port takes and returns the mask as a `u64`.
+pub trait Signals: Sync {
+    /// `kill` - send `sig` to process `pid`.
+    fn kill(&self, pid: i32, sig: i32) -> SysResult;
+    /// `tgkill` - send `sig` to thread `tid` in thread-group `tgid`.
+    fn tgkill(&self, tgid: i32, tid: i32, sig: i32) -> SysResult;
+    /// Apply `new` to the blocked-signal mask per `how` (`SIG_BLOCK`/`UNBLOCK`/
+    /// `SETMASK`, already validated), returning the previous mask. `None` queries.
+    fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32>;
+}
+
 /// Clocks and sleeping, in nanoseconds. The domain packs the `timespec`/
 /// `timeval` structs itself; this port only supplies the raw counters.
 pub trait Clock: Sync {
@@ -113,6 +125,8 @@ pub trait LinuxHost: Sync {
     fn files(&self) -> &dyn Files;
     /// Address-space service.
     fn mem(&self) -> &dyn Mem;
+    /// Signal delivery and masking.
+    fn signals(&self) -> &dyn Signals;
     /// Clocks and sleeping.
     fn clock(&self) -> &dyn Clock;
 }

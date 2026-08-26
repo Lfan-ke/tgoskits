@@ -30,6 +30,8 @@ const NS_PER_SEC: u64 = 1_000_000_000;
 const CLOCK_REALTIME: i32 = 0;
 /// `CLOCK_MONOTONIC` - time since an arbitrary fixed point.
 const CLOCK_MONOTONIC: i32 = 1;
+/// The kernel `sigset_t` the syscall ABI expects is exactly 8 bytes.
+const SIGSET_SIZE: usize = 8;
 
 /// The Linux personality: recognizes ELF images and services Linux syscalls
 /// against a host's ports.
@@ -97,6 +99,13 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         Sysno::clock_gettime => sys_clock_gettime(host, arg(0) as i32, arg(1)),
         Sysno::gettimeofday => sys_gettimeofday(host, arg(0)),
         Sysno::nanosleep => sys_nanosleep(host, arg(0), arg(1)),
+
+        // Signals - the domain moves the sigset; the port carries a u64 mask.
+        Sysno::kill => host.signals().kill(arg(0) as i32, arg(1) as i32),
+        Sysno::tgkill => host
+            .signals()
+            .tgkill(arg(0) as i32, arg(1) as i32, arg(2) as i32),
+        Sysno::rt_sigprocmask => sys_rt_sigprocmask(host, arg(0) as i32, arg(1), arg(2), arg(3)),
 
         _ => Err(ENOSYS),
     }
@@ -183,6 +192,36 @@ fn sys_nanosleep(host: &dyn LinuxHost, req: usize, rem: usize) -> SysResult {
     Ok(0)
 }
 
+/// `rt_sigprocmask(how, set, old, sigsetsize)`: move the user `sigset_t` itself
+/// (carried through the port as a `u64`), validating the ABI's fixed size and
+/// the `how` selector.
+fn sys_rt_sigprocmask(
+    host: &dyn LinuxHost,
+    how: i32,
+    set: usize,
+    old: usize,
+    sigsetsize: usize,
+) -> SysResult {
+    if sigsetsize != SIGSET_SIZE {
+        return Err(EINVAL);
+    }
+    let new = if set != 0 {
+        if !(0..=2).contains(&how) {
+            return Err(EINVAL);
+        }
+        let mut buf = [0u8; SIGSET_SIZE];
+        host.platform().read_user(set, &mut buf)?;
+        Some(u64::from_le_bytes(buf))
+    } else {
+        None
+    };
+    let previous = host.signals().sigprocmask(how, new)?;
+    if old != 0 {
+        host.platform().write_user(old, &previous.to_le_bytes())?;
+    }
+    Ok(0)
+}
+
 /// Pack two 64-bit little-endian words - the shared layout of `timespec` and
 /// `timeval` on 64-bit Linux.
 fn pack_time_pair(hi: i64, lo: i64) -> [u8; 16] {
@@ -206,7 +245,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{Clock, EFAULT, Files, Mem, Platform, Tasks},
+        ops::{Clock, EFAULT, Files, Mem, Platform, Signals, Tasks},
         *,
     };
 
@@ -242,6 +281,8 @@ mod tests {
         written: RefCell<Vec<u8>>,
         to_read: RefCell<Vec<u8>>,
         slept: RefCell<u64>,
+        mask: RefCell<u64>,
+        killed: RefCell<Option<(i32, i32)>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Host {}
@@ -321,6 +362,28 @@ mod tests {
             Ok(0)
         }
     }
+    impl Signals for Host {
+        fn kill(&self, pid: i32, sig: i32) -> SysResult {
+            *self.killed.borrow_mut() = Some((pid, sig));
+            Ok(0)
+        }
+        fn tgkill(&self, _tgid: i32, tid: i32, sig: i32) -> SysResult {
+            *self.killed.borrow_mut() = Some((tid, sig));
+            Ok(0)
+        }
+        fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32> {
+            let old = *self.mask.borrow();
+            if let Some(m) = new {
+                let mut mask = self.mask.borrow_mut();
+                *mask = match how {
+                    0 => *mask | m,  // SIG_BLOCK
+                    1 => *mask & !m, // SIG_UNBLOCK
+                    _ => m,          // SIG_SETMASK
+                };
+            }
+            Ok(old)
+        }
+    }
     impl Clock for Host {
         fn monotonic_ns(&self) -> u64 {
             5 * NS_PER_SEC + 250
@@ -338,6 +401,9 @@ mod tests {
             self
         }
         fn tasks(&self) -> &dyn Tasks {
+            self
+        }
+        fn signals(&self) -> &dyn Signals {
             self
         }
         fn clock(&self) -> &dyn Clock {
@@ -439,6 +505,43 @@ mod tests {
         let r = dispatch(&host, &Trap::new(Sysno::nanosleep, [0, 0, 0, 0, 0, 0]));
         assert_eq!(r, Ok(0));
         assert_eq!(*host.slept.borrow(), 2 * NS_PER_SEC + 3);
+    }
+
+    #[test]
+    fn rt_sigprocmask_moves_the_mask() {
+        let host = Host::default();
+        *host.mask.borrow_mut() = 0b0100;
+        // Non-zero user addresses: address 0 is NULL, meaning "no set/old".
+        *host.umem.borrow_mut() = vec![0u8; 24];
+        host.umem.borrow_mut()[8..16].copy_from_slice(&0b1010u64.to_le_bytes());
+        // SIG_SETMASK=2, new at uaddr 8, old written to uaddr 16.
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::rt_sigprocmask, [2, 8, 16, SIGSET_SIZE, 0, 0]),
+        );
+        assert_eq!(r, Ok(0));
+        let old = u64::from_le_bytes(host.umem.borrow()[16..24].try_into().unwrap());
+        assert_eq!(old, 0b0100);
+        assert_eq!(*host.mask.borrow(), 0b1010);
+    }
+
+    #[test]
+    fn rt_sigprocmask_rejects_bad_sigsetsize() {
+        let host = Host::default();
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::rt_sigprocmask, [2, 0, 0, 4, 0, 0])),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn kill_routes_to_signals() {
+        let host = Host::default();
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::kill, [1234, 9, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(*host.killed.borrow(), Some((1234, 9)));
     }
 
     #[test]
