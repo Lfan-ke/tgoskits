@@ -1,0 +1,12 @@
+[package]
+name = "ax-abi-path"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+description = "Path and symbol compatibility for foreign personalities: translate Windows/NT paths to the POSIX form ax-fs expects."
+keywords = ["path", "windows", "compat", "no-std"]
+categories = ["no-std", "os"]
+license = "Apache-2.0"
+
+[dependencies]
