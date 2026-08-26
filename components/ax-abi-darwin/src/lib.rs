@@ -156,6 +156,75 @@ mod tests {
         assert_eq!(loaded.entry, 0x1_0000_0200);
     }
 
+    // Write a segment_command_64 at `off`.
+    fn put_segment(
+        b: &mut [u8],
+        off: usize,
+        vmaddr: u64,
+        vmsize: u64,
+        fileoff: u64,
+        filesize: u64,
+        initprot: u32,
+    ) {
+        b[off..off + 4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        b[off + 4..off + 8].copy_from_slice(&72u32.to_le_bytes());
+        b[off + 24..off + 32].copy_from_slice(&vmaddr.to_le_bytes());
+        b[off + 32..off + 40].copy_from_slice(&vmsize.to_le_bytes());
+        b[off + 40..off + 48].copy_from_slice(&fileoff.to_le_bytes());
+        b[off + 48..off + 56].copy_from_slice(&filesize.to_le_bytes());
+        b[off + 60..off + 64].copy_from_slice(&initprot.to_le_bytes());
+    }
+
+    #[test]
+    fn loads_a_realistic_clang_layout() {
+        // A typical clang x64 executable: __PAGEZERO guard, __TEXT (RX),
+        // __DATA (RW), __LINKEDIT (R), plus LC_MAIN.
+        let seg = 72usize;
+        let main = 24usize;
+        let sizeofcmds = seg * 4 + main;
+        let mut b = vec![0u8; HEADER_LEN + sizeofcmds + 0x100];
+        b[0..4].copy_from_slice(&macho::MH_MAGIC_64.to_le_bytes());
+        b[16..20].copy_from_slice(&5u32.to_le_bytes()); // ncmds
+        b[20..24].copy_from_slice(&(sizeofcmds as u32).to_le_bytes());
+
+        let mut off = HEADER_LEN;
+        put_segment(&mut b, off, 0, 0x1_0000_0000, 0, 0, 0); // __PAGEZERO
+        off += seg;
+        put_segment(&mut b, off, 0x1_0000_0000, 0x1000, 0, 0x400, 0x5); // __TEXT RX
+        off += seg;
+        put_segment(&mut b, off, 0x1_0000_1000, 0x1000, 0x400, 0x200, 0x3); // __DATA RW
+        off += seg;
+        put_segment(&mut b, off, 0x1_0000_2000, 0x1000, 0x600, 0x100, 0x1); // __LINKEDIT R
+        off += seg;
+        b[off..off + 4].copy_from_slice(&LC_MAIN.to_le_bytes());
+        b[off + 4..off + 8].copy_from_slice(&(main as u32).to_le_bytes());
+        b[off + 8..off + 16].copy_from_slice(&0x100u64.to_le_bytes()); // entryoff in __TEXT
+
+        let mut env = RecordingEnv::default();
+        let loaded = DarwinAbi
+            .load(
+                &LoadRequest {
+                    image: &b,
+                    args: &[],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .expect("load");
+        // __PAGEZERO skipped; __TEXT/__DATA/__LINKEDIT mapped with their prots.
+        assert_eq!(env.maps.len(), 3);
+        assert_eq!(
+            env.maps[0],
+            (0x1_0000_0000, Prot::READ | Prot::EXEC, 0x1000)
+        );
+        assert_eq!(
+            env.maps[1],
+            (0x1_0000_1000, Prot::READ | Prot::WRITE, 0x1000)
+        );
+        assert_eq!(env.maps[2], (0x1_0000_2000, Prot::READ, 0x1000));
+        assert_eq!(loaded.entry, 0x1_0000_0100);
+    }
+
     #[test]
     fn recognizes_only_mach_o() {
         assert!(DarwinAbi.recognizes(&[0xFE, 0xED, 0xFA, 0xCF]));

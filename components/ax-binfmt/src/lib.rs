@@ -205,6 +205,44 @@ mod tests {
         assert_eq!(detect(b"MZ\x00\x00"), None);
     }
 
+    // A PE stub whose PE signature sits at `pe_off`, modeling the gap (Rich
+    // header, larger DOS stub) different linkers leave before it.
+    fn pe_stub(pe_off: usize) -> Vec<u8> {
+        let mut b = vec![0u8; pe_off + 4];
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3C..0x40].copy_from_slice(&(pe_off as u32).to_le_bytes());
+        b[pe_off..pe_off + 4].copy_from_slice(b"PE\0\0");
+        b
+    }
+
+    #[test]
+    fn detect_is_libc_and_toolchain_agnostic() {
+        // Every libc/target ELF shares the magic, so all route to Linux: glibc
+        // dynamic, musl static, newlib 32-bit, and a big-endian image differ
+        // only past the first four bytes.
+        for ident in [
+            b"\x7fELF\x02\x01\x01\x00", // 64-bit LE (glibc/musl)
+            b"\x7fELF\x01\x01\x01\x00", // 32-bit LE (newlib)
+            b"\x7fELF\x02\x02\x01\x00", // 64-bit BE
+        ] {
+            assert_eq!(detect(ident), Some(Abi::Linux));
+        }
+
+        // MinGW (GNU) and MSVC both emit PE/COFF; MSVC usually leaves a Rich
+        // header before the PE signature. Both must route to Windows.
+        assert_eq!(detect(&pe_stub(0x80)), Some(Abi::Windows)); // compact (MinGW)
+        assert_eq!(detect(&pe_stub(0x120)), Some(Abi::Windows)); // Rich-header gap (MSVC)
+
+        // clang Mach-O: thin 64/32-bit and a fat/universal archive.
+        for magic in [
+            [0xFE, 0xED, 0xFA, 0xCF],
+            [0xFE, 0xED, 0xFA, 0xCE],
+            [0xCA, 0xFE, 0xBA, 0xBE],
+        ] {
+            assert_eq!(detect(&magic), Some(Abi::Darwin));
+        }
+    }
+
     // A handler that claims any image whose magic maps to its ABI, so the
     // dispatch tests exercise real routing rather than a constant.
     struct MagicHandler(Abi);
