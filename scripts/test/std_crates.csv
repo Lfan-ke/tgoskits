@@ -4,6 +4,7 @@ ax-arm-pl031
 arm_vgic
 axaddrspace
 axbacktrace
+ax-binfmt
 axdevice
 axdevice_base
 axfs-ng-vfs

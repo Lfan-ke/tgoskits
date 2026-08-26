@@ -20,6 +20,7 @@ members = [
     "components/axtest/axtest",
     "components/axtest/axtest_macros",
     "components/cpu-local",
+    "components/ax-binfmt",
     "components/ax-cgroup",
     "components/ax-lazyinit",
     "components/axbacktrace",
