@@ -695,6 +695,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ax-abi"
+version = "0.1.0"
+dependencies = [
+ "ax-abi-driver",
+ "ax-abi-path",
+ "ax-abi-windows",
+ "ax-binfmt",
+]
+
+[[package]]
 name = "ax-abi-driver"
 version = "0.1.0"
 

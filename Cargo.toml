@@ -21,6 +21,7 @@ members = [
     "components/axtest/axtest_macros",
     "components/cpu-local",
     "components/ax-binfmt",
+    "components/ax-abi",
     "components/ax-abi-windows",
     "components/ax-abi-path",
     "components/ax-abi-driver",
@@ -136,6 +137,7 @@ ax-alloc = { version = "0.8", path = "memory/ax-alloc", default-features = false
 ax-api = { version = "0.7", path = "os/arceos/api/arceos_api" }
 ax-arm-pl031 = { version = "0.4", path = "drivers/rtc/arm_pl031" }
 ax-binfmt = { version = "0.1", path = "components/ax-binfmt" }
+ax-abi = { version = "0.1", path = "components/ax-abi" }
 ax-abi-windows = { version = "0.1", path = "components/ax-abi-windows" }
 ax-abi-path = { version = "0.1", path = "components/ax-abi-path" }
 ax-abi-driver = { version = "0.1", path = "components/ax-abi-driver" }
