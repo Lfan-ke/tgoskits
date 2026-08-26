@@ -15,6 +15,8 @@
 
 extern crate alloc;
 
+pub mod handle;
+
 use alloc::{vec, vec::Vec};
 
 use ax_binfmt::{
