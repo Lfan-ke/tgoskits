@@ -11,5 +11,4 @@ license = "Apache-2.0"
 
 [dependencies]
 ax-binfmt = { workspace = true }
-ax-lazyinit = { workspace = true }
 syscalls = { workspace = true }

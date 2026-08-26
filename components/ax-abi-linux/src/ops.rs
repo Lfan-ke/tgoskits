@@ -1,25 +1,43 @@
-//! OS-service provider traits - the "ports" a hosting OS registers.
+//! The ports the Linux personality is written against - dependency inversion so
+//! the domain never touches `axtask`/`axfs`/`axmm` directly.
 //!
-//! The Linux personality is expressed against these capability boundaries, not
-//! against `axtask`/`axfs`/`axmm` directly. A hosting OS (StarryOS) implements
-//! them over its concrete managers and registers one [`LinuxServices`] bundle,
-//! exactly as a program plugs a concrete allocator into `GlobalAlloc`. This
-//! keeps `ax-abi-linux` free of kernel-runtime dependencies and unit-testable
-//! with mock providers, and lets any ArceOS-derived OS reuse the personality by
-//! registering its own managers.
+//! Two layers, mirroring gVisor's split of a swappable `Platform` from the
+//! Sentry's service subsystems:
 //!
-//! Pointer arguments are raw user virtual addresses; the provider reads or
-//! writes user memory through the address space it owns.
+//! - [`Platform`] - the minimal arch/memory primitives (copy user memory). A
+//!   hosting OS backs it with `axhal`/`axmm`.
+//! - [`Tasks`]/[`Files`]/[`Mem`] - domain services the syscall logic calls,
+//!   backed by `axtask`/`axfs-ng`/`axmm`.
+//!
+//! The domain implements every syscall itself (zero passthrough): it reads and
+//! validates arguments, copies user memory through [`Platform`], and drives the
+//! services - it never forwards a syscall to the host. A hosting OS registers
+//! one [`LinuxHost`] bundle, exactly as a program plugs an allocator into
+//! `GlobalAlloc`, and everything here unit-tests with mock ports.
 
 /// A syscall outcome: `Ok(return value)` or `Err(positive errno)`. The dispatch
 /// layer encodes it into the trap frame the Linux way (`-errno` on failure).
 pub type SysResult = Result<isize, i32>;
 
-/// `ENOSYS` - returned for a syscall no provider handles yet.
+/// `ENOSYS` - no handler for this syscall (yet).
 pub const ENOSYS: i32 = 38;
+/// `EFAULT` - a user pointer was not accessible.
+pub const EFAULT: i32 = 14;
 
-/// Process and thread control.
-pub trait TaskOps: Sync {
+/// The minimal arch/memory platform, à la gVisor's `Platform`: move bytes across
+/// the user/kernel boundary. Everything a personality needs from the CPU/MMU
+/// that is not a higher-level service goes here.
+pub trait Platform: Sync {
+    /// Copy `out.len()` bytes from user virtual address `uaddr` into `out`,
+    /// faulting with `EFAULT` if the range is not readable.
+    fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult;
+    /// Copy `data` to user virtual address `uaddr`, faulting with `EFAULT` if
+    /// the range is not writable.
+    fn write_user(&self, uaddr: usize, data: &[u8]) -> SysResult;
+}
+
+/// Process and thread service.
+pub trait Tasks: Sync {
     /// `getpid` - thread-group id.
     fn getpid(&self) -> u32;
     /// `getppid` - parent's thread-group id.
@@ -32,26 +50,28 @@ pub trait TaskOps: Sync {
     fn sched_yield(&self) -> SysResult;
     /// `exit` - terminate the calling thread.
     fn exit(&self, code: i32) -> !;
-    /// `exit_group` - terminate all threads in the process.
+    /// `exit_group` - terminate every thread in the process.
     fn exit_group(&self, code: i32) -> !;
 }
 
-/// File-descriptor I/O.
-pub trait FileOps: Sync {
-    /// `read` up to `len` bytes from `fd` into user buffer `buf`.
-    fn read(&self, fd: i32, buf: usize, len: usize) -> SysResult;
-    /// `write` up to `len` bytes from user buffer `buf` to `fd`.
-    fn write(&self, fd: i32, buf: usize, len: usize) -> SysResult;
+/// File-descriptor service. Buffers are kernel-side; the domain does the user
+/// copy through [`Platform`], keeping this port free of user-memory concerns.
+pub trait Files: Sync {
+    /// Read up to `buf.len()` bytes from `fd` into the kernel buffer `buf`,
+    /// returning the count read.
+    fn read(&self, fd: i32, buf: &mut [u8]) -> SysResult;
+    /// Write the kernel buffer `buf` to `fd`, returning the count written.
+    fn write(&self, fd: i32, buf: &[u8]) -> SysResult;
     /// `close` a descriptor.
     fn close(&self, fd: i32) -> SysResult;
-    /// `dup` a descriptor, returning the new lowest-available number.
+    /// `dup` a descriptor to the lowest free number.
     fn dup(&self, fd: i32) -> SysResult;
     /// `lseek` - reposition `fd`'s offset (`whence` is `SEEK_*`).
     fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult;
 }
 
-/// User address-space management.
-pub trait MemOps: Sync {
+/// Address-space service.
+pub trait Mem: Sync {
     /// `brk` - move the program break to `addr` (0 queries), returning the break.
     fn brk(&self, addr: usize) -> SysResult;
     /// `mmap` - map memory, returning the mapped address.
@@ -70,14 +90,14 @@ pub trait MemOps: Sync {
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
 }
 
-/// The bundle of OS services the Linux personality needs. A hosting OS
-/// implements this over its concrete managers and registers it once via
-/// [`crate::register`].
-pub trait LinuxServices: Sync {
-    /// Process/thread control.
-    fn task(&self) -> &dyn TaskOps;
-    /// File-descriptor I/O.
-    fn file(&self) -> &dyn FileOps;
-    /// Address-space management.
-    fn mem(&self) -> &dyn MemOps;
+/// The bundle of ports a hosting OS registers for the Linux personality.
+pub trait LinuxHost: Sync {
+    /// Arch/memory platform.
+    fn platform(&self) -> &dyn Platform;
+    /// Process/thread service.
+    fn tasks(&self) -> &dyn Tasks;
+    /// File-descriptor service.
+    fn files(&self) -> &dyn Files;
+    /// Address-space service.
+    fn mem(&self) -> &dyn Mem;
 }
