@@ -11,4 +11,5 @@ license = "Apache-2.0"
 
 [dependencies]
 ax-binfmt = { workspace = true }
+ax-crate-interface = { workspace = true }
 syscalls = { workspace = true }

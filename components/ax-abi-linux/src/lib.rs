@@ -19,8 +19,19 @@
 pub mod ops;
 
 use ax_binfmt::{Abi, TrapEnv};
+use ax_crate_interface::{call_interface, def_interface};
 use ops::{EINVAL, ENOSYS, LinuxHost, SysResult};
 use syscalls::Sysno;
+
+/// The global binding a hosting OS provides so the trap path can reach its
+/// registered [`LinuxHost`] without a parameter - ArceOS's native way to invert
+/// the dependency (the kernel `#[impl_interface]`s this, we `call_interface!` it),
+/// keeping this crate free of a hand-rolled registry.
+#[def_interface]
+pub trait CurrentHost {
+    /// The `LinuxHost` the kernel registered for the current context.
+    fn current() -> &'static dyn LinuxHost;
+}
 
 /// Bounce-buffer size for user-memory copies; larger transfers loop.
 const CHUNK: usize = 256;
@@ -53,6 +64,13 @@ impl LinuxAbi {
     pub fn handle_syscall(host: &dyn LinuxHost, uctx: &mut dyn TrapEnv) {
         let result = dispatch(host, uctx);
         uctx.set_result(encode(result));
+    }
+
+    /// The parameter-less entry the kernel trap path calls: it resolves the
+    /// registered host through [`CurrentHost`], then services the syscall. The
+    /// kernel binds the host with `#[impl_interface]`.
+    pub fn handle_trapped_syscall(uctx: &mut dyn TrapEnv) {
+        Self::handle_syscall(call_interface!(CurrentHost::current), uctx);
     }
 }
 
@@ -273,16 +291,19 @@ mod tests {
         *,
     };
 
-    // A trap frame with a preset syscall number and arguments.
+    // A trap frame with a preset syscall number and arguments, recording the
+    // result so the parameter-less entry can be observed end to end.
     struct Trap {
         nr: usize,
         args: [usize; 6],
+        result: Option<usize>,
     }
     impl Trap {
         fn new(nr: Sysno, args: [usize; 6]) -> Self {
             Self {
                 nr: nr as usize,
                 args,
+                result: None,
             }
         }
     }
@@ -293,7 +314,143 @@ mod tests {
         fn arg(&self, i: usize) -> usize {
             self.args[i]
         }
-        fn set_result(&mut self, _value: usize) {}
+        fn set_result(&mut self, value: usize) {
+            self.result = Some(value);
+        }
+    }
+
+    // A trivial `'static` host for exercising the crate_interface global binding.
+    struct FixedHost;
+    impl Platform for FixedHost {
+        fn read_user(&self, _u: usize, _o: &mut [u8]) -> SysResult {
+            Ok(0)
+        }
+        fn write_user(&self, _u: usize, _d: &[u8]) -> SysResult {
+            Ok(0)
+        }
+    }
+    impl Tasks for FixedHost {
+        fn getpid(&self) -> u32 {
+            1
+        }
+        fn getppid(&self) -> u32 {
+            0
+        }
+        fn gettid(&self) -> u32 {
+            1
+        }
+        fn set_tid_address(&self, _t: usize) -> SysResult {
+            Ok(1)
+        }
+        fn sched_yield(&self) -> SysResult {
+            Ok(0)
+        }
+        fn exit(&self, _c: i32) -> ! {
+            panic!("exit")
+        }
+        fn exit_group(&self, _c: i32) -> ! {
+            panic!("exit_group")
+        }
+    }
+    impl Files for FixedHost {
+        fn read(&self, _fd: i32, _b: &mut [u8]) -> SysResult {
+            Ok(0)
+        }
+        fn write(&self, _fd: i32, b: &[u8]) -> SysResult {
+            Ok(b.len() as isize)
+        }
+        fn close(&self, _fd: i32) -> SysResult {
+            Ok(0)
+        }
+        fn dup(&self, _fd: i32) -> SysResult {
+            Ok(0)
+        }
+        fn lseek(&self, _fd: i32, o: isize, _w: i32) -> SysResult {
+            Ok(o)
+        }
+    }
+    impl Mem for FixedHost {
+        fn brk(&self, a: usize) -> SysResult {
+            Ok(a as isize)
+        }
+        fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
+            Ok(0)
+        }
+        fn munmap(&self, _a: usize, _l: usize) -> SysResult {
+            Ok(0)
+        }
+        fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
+            Ok(0)
+        }
+    }
+    impl Signals for FixedHost {
+        fn kill(&self, _p: i32, _s: i32) -> SysResult {
+            Ok(0)
+        }
+        fn tgkill(&self, _t: i32, _i: i32, _s: i32) -> SysResult {
+            Ok(0)
+        }
+        fn sigprocmask(&self, _h: i32, _n: Option<u64>) -> Result<u64, i32> {
+            Ok(0)
+        }
+    }
+    impl Clock for FixedHost {
+        fn monotonic_ns(&self) -> u64 {
+            0
+        }
+        fn wall_ns(&self) -> u64 {
+            0
+        }
+        fn sleep_ns(&self, _n: u64) -> SysResult {
+            Ok(0)
+        }
+    }
+    impl Random for FixedHost {
+        fn fill(&self, b: &mut [u8]) -> SysResult {
+            Ok(b.len() as isize)
+        }
+    }
+    impl LinuxHost for FixedHost {
+        fn platform(&self) -> &dyn Platform {
+            self
+        }
+        fn tasks(&self) -> &dyn Tasks {
+            self
+        }
+        fn files(&self) -> &dyn Files {
+            self
+        }
+        fn mem(&self) -> &dyn Mem {
+            self
+        }
+        fn signals(&self) -> &dyn Signals {
+            self
+        }
+        fn clock(&self) -> &dyn Clock {
+            self
+        }
+        fn random(&self) -> &dyn Random {
+            self
+        }
+    }
+
+    // Bind the global CurrentHost port to the fixed host, as the kernel would.
+    struct Binding;
+    #[ax_crate_interface::impl_interface]
+    impl CurrentHost for Binding {
+        fn current() -> &'static dyn LinuxHost {
+            static HOST: FixedHost = FixedHost;
+            &HOST
+        }
+    }
+
+    #[test]
+    fn parameter_less_entry_resolves_the_bound_host() {
+        // handle_trapped_syscall resolves the registered host via crate_interface
+        // and services the syscall; getpid comes from FixedHost (1).
+        let mut trap = Trap::new(Sysno::getpid, [0; 6]);
+        LinuxAbi::handle_trapped_syscall(&mut trap);
+        assert_eq!(trap.result, Some(1));
     }
 
     // A host whose "user memory" is a byte vector at base 0, whose Files echoes
