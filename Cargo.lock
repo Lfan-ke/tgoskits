@@ -698,9 +698,17 @@ dependencies = [
 name = "ax-abi"
 version = "0.1.0"
 dependencies = [
+ "ax-abi-darwin",
  "ax-abi-driver",
  "ax-abi-path",
  "ax-abi-windows",
+ "ax-binfmt",
+]
+
+[[package]]
+name = "ax-abi-darwin"
+version = "0.1.0"
+dependencies = [
  "ax-binfmt",
 ]
 

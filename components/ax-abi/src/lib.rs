@@ -16,6 +16,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "mac")]
+pub use ax_abi_darwin::{self, DarwinAbi};
 #[cfg(feature = "driver-compat")]
 pub use ax_abi_driver;
 #[cfg(feature = "path-compat")]
@@ -29,6 +31,8 @@ pub use ax_binfmt::{self, Abi, AbiError, AbiResult, Personality, detect};
 // handlers themselves.
 #[cfg(feature = "win")]
 static WINDOWS: WindowsAbi = WindowsAbi;
+#[cfg(feature = "mac")]
+static DARWIN: DarwinAbi = DarwinAbi;
 
 /// The personalities compiled into this build, in dispatch-priority order.
 ///
@@ -47,7 +51,17 @@ pub fn personalities() -> Vec<&'static dyn Personality> {
             None
         }
     };
-    [win].into_iter().flatten().collect()
+    let mac: Option<&'static dyn Personality> = {
+        #[cfg(feature = "mac")]
+        {
+            Some(&DARWIN)
+        }
+        #[cfg(not(feature = "mac"))]
+        {
+            None
+        }
+    };
+    [win, mac].into_iter().flatten().collect()
 }
 
 /// Route `image` to the first compiled-in personality that recognizes it.

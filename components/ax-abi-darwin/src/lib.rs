@@ -1,0 +1,176 @@
+//! Darwin (macOS) personality for ArceOS/StarryOS.
+//!
+//! Teaches ArceOS to load Mach-O (`.macho`) executables as a `Personality`,
+//! mapping Darwin execution onto the shared `ax_*` primitives just as
+//! `ax-abi-windows` does for PE. This is the loader half: map `LC_SEGMENT_64`
+//! segments and find the `LC_MAIN` entry point, transcribed from
+//! `<mach-o/loader.h>` atop [`ax_binfmt::macho`]. Darwin binaries are dyld-based
+//! and position-independent; dyld and chained fixups (the Mach-O analogue of PE
+//! imports/relocations) arrive in a later phase, as does BSD/Mach syscall
+//! dispatch.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::vec;
+
+use ax_binfmt::{
+    Abi, AbiError, AbiResult, LoadEnv, LoadRequest, Loaded, Personality, Prot, TrapEnv,
+    macho::{self, Segment},
+};
+
+/// Darwin BSD/Mach syscall not yet implemented; a placeholder result until the
+/// syscall phase lands.
+const ENOSYS: usize = 38;
+
+/// The Darwin personality: recognizes Mach-O images and loads them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DarwinAbi;
+
+impl Personality for DarwinAbi {
+    fn abi(&self) -> Abi {
+        Abi::Darwin
+    }
+
+    fn recognizes(&self, image: &[u8]) -> bool {
+        ax_binfmt::detect(image) == Some(Abi::Darwin)
+    }
+
+    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
+        let macho = macho::parse(req.image).ok_or(AbiError::MalformedImage)?;
+        // No LC_MAIN means a legacy LC_UNIXTHREAD entry, which is out of scope.
+        let entry = macho.entry(req.image).ok_or(AbiError::Unsupported)?;
+
+        for seg in macho.segments(req.image) {
+            // __PAGEZERO and other no-access reservations are address-space
+            // guards, not backed by pages; skip them rather than map gigabytes.
+            if seg.initprot == 0 || seg.vmsize == 0 {
+                continue;
+            }
+            let mut page = vec![0u8; seg.vmsize as usize];
+            if let Some(data) = seg.file_data(req.image) {
+                let n = data.len().min(page.len());
+                page[..n].copy_from_slice(&data[..n]);
+            }
+            env.map_region(seg.vmaddr, seg.vmsize, segment_prot(&seg), Some(&page))?;
+        }
+        Ok(Loaded { entry, stack: 0 })
+    }
+
+    fn handle_syscall(&self, env: &mut dyn TrapEnv) {
+        // Darwin BSD/Mach syscall dispatch is a later phase; fail explicitly.
+        env.set_result(ENOSYS);
+    }
+}
+
+/// Translate a segment's `initprot` bits into a mapping protection.
+fn segment_prot(seg: &Segment) -> Prot {
+    let mut prot = Prot::empty();
+    prot.set(Prot::READ, seg.readable());
+    prot.set(Prot::WRITE, seg.writable());
+    prot.set(Prot::EXEC, seg.executable());
+    prot
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingEnv {
+        maps: Vec<(u64, Prot, usize)>,
+    }
+
+    impl LoadEnv for RecordingEnv {
+        fn map_region(
+            &mut self,
+            va: u64,
+            len: u64,
+            prot: Prot,
+            _init: Option<&[u8]>,
+        ) -> AbiResult<()> {
+            self.maps.push((va, prot, len as usize));
+            Ok(())
+        }
+    }
+
+    const HEADER_LEN: usize = 32;
+    const LC_SEGMENT_64: u32 = 0x19;
+    const LC_MAIN: u32 = 0x8000_0028;
+
+    // Build a Mach-O with __PAGEZERO, a __TEXT (RX) segment, and LC_MAIN.
+    fn synth() -> Vec<u8> {
+        let seg = 72usize;
+        let main = 24usize;
+        let sizeofcmds = seg * 2 + main;
+        let mut b = vec![0u8; HEADER_LEN + sizeofcmds + 0x100];
+        b[0..4].copy_from_slice(&macho::MH_MAGIC_64.to_le_bytes());
+        b[16..20].copy_from_slice(&3u32.to_le_bytes()); // ncmds
+        b[20..24].copy_from_slice(&(sizeofcmds as u32).to_le_bytes());
+
+        // __PAGEZERO: vmaddr 0, 4 GiB, no access - must be skipped.
+        let pz = HEADER_LEN;
+        b[pz..pz + 4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        b[pz + 4..pz + 8].copy_from_slice(&(seg as u32).to_le_bytes());
+        b[pz + 32..pz + 40].copy_from_slice(&0x1_0000_0000u64.to_le_bytes()); // vmsize
+        b[pz + 60..pz + 64].copy_from_slice(&0u32.to_le_bytes()); // initprot none
+
+        // __TEXT: RX, vmaddr 0x1_0000_0000.
+        let tx = pz + seg;
+        b[tx..tx + 4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        b[tx + 4..tx + 8].copy_from_slice(&(seg as u32).to_le_bytes());
+        b[tx + 24..tx + 32].copy_from_slice(&0x1_0000_0000u64.to_le_bytes()); // vmaddr
+        b[tx + 32..tx + 40].copy_from_slice(&0x1000u64.to_le_bytes()); // vmsize
+        b[tx + 48..tx + 56].copy_from_slice(&0x400u64.to_le_bytes()); // filesize
+        b[tx + 60..tx + 64].copy_from_slice(&0x5u32.to_le_bytes()); // RX
+
+        let m = tx + seg;
+        b[m..m + 4].copy_from_slice(&LC_MAIN.to_le_bytes());
+        b[m + 4..m + 8].copy_from_slice(&(main as u32).to_le_bytes());
+        // entryoff must fall within __TEXT's file range [0, filesize=0x400).
+        b[m + 8..m + 16].copy_from_slice(&0x200u64.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn loads_segments_skipping_pagezero() {
+        let img = synth();
+        let mut env = RecordingEnv::default();
+        let loaded = DarwinAbi
+            .load(
+                &LoadRequest {
+                    image: &img,
+                    args: &[],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .expect("load");
+        // Only __TEXT is mapped; __PAGEZERO is skipped.
+        assert_eq!(env.maps.len(), 1);
+        assert_eq!(env.maps[0].0, 0x1_0000_0000);
+        assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
+        assert_eq!(loaded.entry, 0x1_0000_0200);
+    }
+
+    #[test]
+    fn recognizes_only_mach_o() {
+        assert!(DarwinAbi.recognizes(&[0xFE, 0xED, 0xFA, 0xCF]));
+        assert!(!DarwinAbi.recognizes(b"MZ"));
+        let mut env = RecordingEnv::default();
+        assert_eq!(
+            DarwinAbi.load(
+                &LoadRequest {
+                    image: b"\x7fELF",
+                    args: &[],
+                    envs: &[]
+                },
+                &mut env
+            ),
+            Err(AbiError::MalformedImage)
+        );
+    }
+}

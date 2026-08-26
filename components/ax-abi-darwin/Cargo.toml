@@ -1,0 +1,13 @@
+[package]
+name = "ax-abi-darwin"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+description = "Darwin (macOS) personality for ArceOS: a Mach-O image loader that maps onto the shared ax-* primitives."
+keywords = ["macos", "darwin", "mach-o", "no-std"]
+categories = ["no-std", "os"]
+license = "Apache-2.0"
+
+[dependencies]
+ax-binfmt = { workspace = true }

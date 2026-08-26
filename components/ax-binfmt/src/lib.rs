@@ -15,6 +15,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod macho;
 pub mod pe;
 
 use bitflags::bitflags;
