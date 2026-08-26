@@ -721,7 +721,7 @@ name = "ax-abi-linux"
 version = "0.1.0"
 dependencies = [
  "ax-binfmt",
- "ax-lazyinit",
+ "ax-crate-interface",
  "syscalls",
 ]
 
