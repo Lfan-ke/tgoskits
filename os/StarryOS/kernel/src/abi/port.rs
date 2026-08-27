@@ -9,8 +9,10 @@
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
-    Clock, Creds, Files, Mem, Platform, Random, Signals, SysResult, System, Tasks, UtsField,
+    Clock, Creds, Files, Mem, Platform, Random, SeekFrom, Signals, SysResult, System, Tasks,
+    UtsField,
 };
+use ax_io::SeekFrom as IoSeek;
 use ax_runtime::hal;
 use ax_task::{
     current,
@@ -28,9 +30,6 @@ use crate::{
     syscall,
     task::{AsThread, current_pid_view, do_exit},
 };
-
-/// `O_CLOEXEC` as the generic ABI defines it, the only flag `dup3` accepts.
-const O_CLOEXEC: i32 = 0o2000000;
 
 impl Platform for KernelHost {
     fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
@@ -131,38 +130,34 @@ impl Files for KernelHost {
         Ok(written as isize)
     }
 
-    // The remaining transfers still need their primitive lifted out of the
-    // kernel's own syscall entry (the write path carries the file-object write
-    // hook and the memfd seal checks; lseek, fsync and ftruncate carry the
-    // per-file-kind dispatch). Until then the domain does not claim them, so
-    // nothing routes through a port that would only forward a syscall.
     fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult {
-        port_result(syscall::sys_write(fd, uaddr as *mut u8, len))
+        port_result(syscall::write_file(fd, uaddr as *const u8, len))
     }
 
-    fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult {
-        port_result(syscall::sys_lseek(fd, offset as _, whence))
+    fn seek(&self, fd: i32, offset: isize, from: SeekFrom) -> SysResult {
+        let pos = match from {
+            SeekFrom::Start => IoSeek::Start(offset as u64),
+            SeekFrom::Current => IoSeek::Current(offset as i64),
+            SeekFrom::End => IoSeek::End(offset as i64),
+        };
+        port_result(syscall::seek_file(fd, pos))
     }
 
-    fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
-        #[cfg(target_arch = "x86_64")]
-        if !cloexec {
-            return port_result(syscall::sys_dup2(oldfd, newfd));
-        }
-        let flags = if cloexec { O_CLOEXEC } else { 0 };
-        port_result(syscall::sys_dup3(oldfd, newfd, flags))
+    fn validate(&self, fd: i32) -> SysResult {
+        get_file_like(fd).map_err(errno)?;
+        Ok(0)
+    }
+
+    fn dup_onto(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
+        port_result(syscall::dup_onto(oldfd, newfd, cloexec))
     }
 
     fn fsync(&self, fd: i32, datasync: bool) -> SysResult {
-        port_result(if datasync {
-            syscall::sys_fdatasync(fd)
-        } else {
-            syscall::sys_fsync(fd)
-        })
+        port_result(syscall::sync_file(fd, datasync))
     }
 
     fn ftruncate(&self, fd: i32, len: u64) -> SysResult {
-        port_result(syscall::sys_ftruncate(fd, len as _))
+        port_result(syscall::truncate_file(fd, len))
     }
 }
 
