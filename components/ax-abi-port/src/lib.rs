@@ -41,26 +41,16 @@ pub const EINVAL: i32 = 22;
 /// the user/kernel boundary. Everything a personality needs from the CPU/MMU
 /// that is not a higher-level service goes here.
 pub trait Platform: Sync {
-    /// Copy `out.len()` bytes from user virtual address `uaddr` into `out`,
-    /// faulting with `EFAULT` if the range is not readable.
     fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult;
-    /// Copy `data` to user virtual address `uaddr`, faulting with `EFAULT` if
-    /// the range is not writable.
     fn write_user(&self, uaddr: usize, data: &[u8]) -> SysResult;
 }
 
-/// Process and thread service.
 #[cfg(feature = "task")]
 pub trait Tasks: Sync {
-    /// Thread-group id of the caller.
     fn getpid(&self) -> u32;
-    /// Thread-group id of the caller's parent.
     fn getppid(&self) -> u32;
-    /// Id of the calling thread.
     fn gettid(&self) -> u32;
-    /// Record the clear-child-tid pointer, returning the caller's tid.
     fn set_tid_address(&self, tidptr: usize) -> SysResult;
-    /// Relinquish the CPU.
     fn sched_yield(&self) -> SysResult;
     /// Terminate the calling thread. A host whose exit path returns - marking
     /// the thread and letting the trap return handle it - reports that outcome
@@ -85,11 +75,8 @@ pub trait Files: Sync {
     fn read(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
     /// Write the user range at `uaddr` to `fd`, returning the count written.
     fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
-    /// Close a descriptor.
     fn close(&self, fd: i32) -> SysResult;
-    /// Duplicate a descriptor to the lowest free number.
     fn dup(&self, fd: i32) -> SysResult;
-    /// Reposition `fd`'s offset (`whence` is `SEEK_*`).
     fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult;
     /// Read from `fd` at absolute `offset` into the user range at `uaddr`,
     /// leaving the file position unchanged.
@@ -107,12 +94,9 @@ pub trait Files: Sync {
     fn ftruncate(&self, fd: i32, len: u64) -> SysResult;
 }
 
-/// Address-space service.
 #[cfg(feature = "mm")]
 pub trait Mem: Sync {
-    /// Move the program break to `addr` (0 queries), returning the break.
     fn brk(&self, addr: usize) -> SysResult;
-    /// Map memory, returning the mapped address.
     fn mmap(
         &self,
         addr: usize,
@@ -122,9 +106,7 @@ pub trait Mem: Sync {
         fd: i32,
         offset: usize,
     ) -> SysResult;
-    /// Unmap `[addr, addr+len)`.
     fn munmap(&self, addr: usize, len: usize) -> SysResult;
-    /// Change protection of `[addr, addr+len)`.
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
     /// Advise usage of `[addr, addr+len)`. The host validates `advice`, since
     /// which hints it honours is its own property, as is page alignment.
@@ -137,7 +119,6 @@ pub trait Mem: Sync {
 /// memory. Every modern libc draws from it at startup.
 #[cfg(feature = "random")]
 pub trait Random: Sync {
-    /// Fill `buf` with random bytes, returning the count produced.
     fn fill(&self, buf: &mut [u8]) -> SysResult;
 }
 
@@ -145,9 +126,7 @@ pub trait Random: Sync {
 /// `sigset_t` itself; this port carries the mask as a `u64`.
 #[cfg(feature = "signal")]
 pub trait Signals: Sync {
-    /// Send `sig` to process `pid`.
     fn kill(&self, pid: i32, sig: i32) -> SysResult;
-    /// Send `sig` to thread `tid` in thread-group `tgid`.
     fn tgkill(&self, tgid: i32, tid: i32, sig: i32) -> SysResult;
     /// Apply `new` to the blocked-signal mask per `how` (`SIG_BLOCK`/`UNBLOCK`/
     /// `SETMASK`, already validated), returning the previous mask. `None` queries.
@@ -158,11 +137,8 @@ pub trait Signals: Sync {
 /// structs itself; this port only supplies the raw counters.
 #[cfg(feature = "time")]
 pub trait Clock: Sync {
-    /// Monotonic time since boot.
     fn monotonic_ns(&self) -> u64;
-    /// Wall-clock time since the Unix epoch.
     fn wall_ns(&self) -> u64;
-    /// Sleep for `ns` nanoseconds.
     fn sleep_ns(&self, ns: u64) -> SysResult;
 }
 
@@ -170,21 +146,14 @@ pub trait Clock: Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(feature = "system")]
 pub enum UtsField {
-    /// OS name, e.g. `"Linux"`.
     SysName,
-    /// Host name on the network.
     NodeName,
-    /// OS release.
     Release,
-    /// OS version.
     Version,
-    /// Hardware identifier, e.g. `"x86_64"`.
     Machine,
-    /// NIS/YP domain name.
     DomainName,
 }
 
-/// System identity.
 #[cfg(feature = "system")]
 pub trait System: Sync {
     /// Report the system identity, calling `put` once per [`UtsField`].
@@ -200,9 +169,7 @@ pub trait System: Sync {
 /// triple; a domain projects the single ids it needs from it.
 #[cfg(feature = "creds")]
 pub trait Creds: Sync {
-    /// Real, effective and saved user IDs.
     fn uids(&self) -> (u32, u32, u32);
-    /// Real, effective and saved group IDs.
     fn gids(&self) -> (u32, u32, u32);
 }
 
@@ -218,44 +185,35 @@ pub trait Creds: Sync {
 /// That is the same composition the rest of the system uses - a capability is a
 /// part you fit, not a slot you must fill.
 pub trait Host: Sync {
-    /// Arch/memory platform. Required.
     fn platform(&self) -> &dyn Platform;
-    /// Process/thread service.
     #[cfg(feature = "task")]
     fn tasks(&self) -> Option<&dyn Tasks> {
         None
     }
-    /// File-descriptor service.
     #[cfg(feature = "fs")]
     fn files(&self) -> Option<&dyn Files> {
         None
     }
-    /// Address-space service.
     #[cfg(feature = "mm")]
     fn mem(&self) -> Option<&dyn Mem> {
         None
     }
-    /// Signal delivery and masking.
     #[cfg(feature = "signal")]
     fn signals(&self) -> Option<&dyn Signals> {
         None
     }
-    /// Clocks and sleeping.
     #[cfg(feature = "time")]
     fn clock(&self) -> Option<&dyn Clock> {
         None
     }
-    /// Randomness.
     #[cfg(feature = "random")]
     fn random(&self) -> Option<&dyn Random> {
         None
     }
-    /// System identity.
     #[cfg(feature = "system")]
     fn system(&self) -> Option<&dyn System> {
         None
     }
-    /// Process credentials.
     #[cfg(feature = "creds")]
     fn creds(&self) -> Option<&dyn Creds> {
         None
@@ -268,6 +226,5 @@ pub trait Host: Sync {
 /// it), which keeps this layer free of a hand-rolled registry.
 #[def_interface]
 pub trait CurrentHost {
-    /// The `Host` the kernel registered for the current context.
     fn current() -> &'static dyn Host;
 }
