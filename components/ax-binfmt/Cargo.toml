@@ -10,5 +10,6 @@ categories = ["no-std", "os"]
 license.workspace = true
 
 [dependencies]
+ax-crate-interface = { workspace = true }
 bitflags = { workspace = true }
 thiserror = { workspace = true }

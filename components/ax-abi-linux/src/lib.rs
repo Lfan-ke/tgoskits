@@ -16,34 +16,43 @@
 
 #![cfg_attr(not(test), no_std)]
 
+#[cfg(not(any(
+    feature = "fs",
+    feature = "mm",
+    feature = "task",
+    feature = "signal",
+    feature = "time",
+    feature = "system",
+    feature = "creds"
+)))]
+compile_error!("ax-abi-linux needs at least one syscall family enabled");
+
 pub use ax_abi_port as ops;
 use ax_binfmt::{Abi, Dispatch, TrapEnv};
 use ax_crate_interface::call_interface;
-use ops::{EINVAL, ENOSYS, Host, SysResult, UtsField};
+use ops::{ENOSYS, Host, SysResult};
 use syscalls::Sysno;
 
-/// Bounce-buffer size for user-memory copies; larger transfers loop.
-const CHUNK: usize = 256;
-/// Maximum `iovcnt` for scatter/gather I/O (`UIO_MAXIOV`).
-const IOV_MAX: usize = 1024;
-/// Size of one 64-bit `struct iovec` (an 8-byte base pointer and 8-byte length).
-const IOVEC_SIZE: usize = 16;
 /// `O_CLOEXEC` (generic ABI, all four targets) - the only flag `dup3` accepts.
+#[cfg(feature = "fs")]
 const O_CLOEXEC: i32 = 0o2000000;
 /// One `new_utsname` field width (arch-independent), and the packed struct length.
+#[cfg(feature = "system")]
 const UTS_FIELD: usize = 65;
+#[cfg(feature = "system")]
 const UTS_LEN: usize = 6 * UTS_FIELD;
 /// Nanoseconds per second, for packing `timespec`/`timeval`.
+#[cfg(feature = "time")]
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// `CLOCK_REALTIME` - wall-clock time since the Unix epoch.
+#[cfg(feature = "time")]
 const CLOCK_REALTIME: i32 = 0;
 /// `CLOCK_MONOTONIC` - time since an arbitrary fixed point.
+#[cfg(feature = "time")]
 const CLOCK_MONOTONIC: i32 = 1;
 /// The kernel `sigset_t` the syscall ABI expects is exactly 8 bytes.
+#[cfg(feature = "signal")]
 const SIGSET_SIZE: usize = 8;
-/// Advice values `madvise` accepts (generic ABI: NORMAL/RANDOM/SEQUENTIAL/
-/// WILLNEED/DONTNEED/FREE/REMOVE/DONTFORK/DOFORK).
-const MADV_KNOWN: &[i32] = &[0, 1, 2, 3, 4, 8, 9, 10, 11];
 
 /// The Linux personality: recognizes ELF images and services Linux syscalls
 /// against a host's ports.
@@ -94,6 +103,20 @@ impl LinuxAbi {
     pub fn try_handle_trapped_syscall(uctx: &mut dyn TrapEnv) -> Dispatch {
         Self::try_handle_syscall(call_interface!(ax_abi_port::CurrentHost::current), uctx)
     }
+
+    /// Route a trapped syscall against `host` without touching the trap frame:
+    /// `Some(outcome)` when this domain owns the call, `None` to leave it to the
+    /// caller. A kernel that still carries its own table uses this, so that its
+    /// own epilogue - signal-redirect check, tracing, retval encoding - keeps
+    /// running for migrated and unmigrated calls alike.
+    pub fn route_syscall(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
+        route(host, uctx)
+    }
+
+    /// The parameter-less form of [`route_syscall`](Self::route_syscall).
+    pub fn route_trapped_syscall(uctx: &dyn TrapEnv) -> Option<SysResult> {
+        route(call_interface!(ax_abi_port::CurrentHost::current), uctx)
+    }
 }
 
 /// Route one syscall to its handler, or `None` when the trapped number is not one
@@ -104,37 +127,58 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
     let arg = |i| uctx.arg(i);
     Some(match sysno {
         // fd I/O - the domain copies user memory itself, then drives Files.
-        Sysno::read => sys_read(host, arg(0) as i32, arg(1), arg(2)),
-        Sysno::write => sys_write(host, arg(0) as i32, arg(1), arg(2)),
-        Sysno::close => host.files().close(arg(0) as i32),
-        Sysno::dup => host.files().dup(arg(0) as i32),
+        #[cfg(feature = "fs")]
+        Sysno::read => host.files()?.read(arg(0) as i32, arg(1), arg(2)),
+        #[cfg(feature = "fs")]
+        Sysno::write => host.files()?.write(arg(0) as i32, arg(1), arg(2)),
+        #[cfg(feature = "fs")]
+        Sysno::close => host.files()?.close(arg(0) as i32),
+        #[cfg(feature = "fs")]
+        Sysno::dup => host.files()?.dup(arg(0) as i32),
         // Only the x86_64 table carries dup2; the generic ABI has dup3 alone.
-        #[cfg(target_arch = "x86_64")]
-        Sysno::dup2 => host.files().dup2(arg(0) as i32, arg(1) as i32, false),
-        Sysno::dup3 => sys_dup3(host, arg(0) as i32, arg(1) as i32, arg(2) as i32),
+        #[cfg(all(feature = "fs", target_arch = "x86_64"))]
+        Sysno::dup2 => host.files()?.dup2(arg(0) as i32, arg(1) as i32, false),
+        #[cfg(feature = "fs")]
+        Sysno::dup3 => sys_dup3(host.files()?, arg(0) as i32, arg(1) as i32, arg(2) as i32),
+        #[cfg(feature = "fs")]
         Sysno::lseek => host
-            .files()
+            .files()?
             .lseek(arg(0) as i32, arg(1) as isize, arg(2) as i32),
-        Sysno::writev => sys_writev(host, arg(0) as i32, arg(1), arg(2) as i32),
-        Sysno::readv => sys_readv(host, arg(0) as i32, arg(1), arg(2) as i32),
-        Sysno::pread64 => sys_pread64(host, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
-        Sysno::pwrite64 => sys_pwrite64(host, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
-        Sysno::fsync => host.files().fsync(arg(0) as i32, false),
-        Sysno::fdatasync => host.files().fsync(arg(0) as i32, true),
-        Sysno::ftruncate => sys_ftruncate(host, arg(0) as i32, arg(1) as i64),
+        #[cfg(feature = "fs")]
+        Sysno::pread64 => sys_pread64(host.files()?, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
+        #[cfg(feature = "fs")]
+        Sysno::pwrite64 => {
+            sys_pwrite64(host.files()?, arg(0) as i32, arg(1), arg(2), arg(3) as i64)
+        }
+        #[cfg(feature = "fs")]
+        Sysno::fsync => host.files()?.fsync(arg(0) as i32, false),
+        #[cfg(feature = "fs")]
+        Sysno::fdatasync => host.files()?.fsync(arg(0) as i32, true),
+        #[cfg(feature = "fs")]
+        Sysno::ftruncate => sys_ftruncate(host.files()?, arg(0) as i32, arg(1) as i64),
 
         // Process and thread control.
-        Sysno::getpid => Ok(host.tasks().getpid() as isize),
-        Sysno::getppid => Ok(host.tasks().getppid() as isize),
-        Sysno::gettid => Ok(host.tasks().gettid() as isize),
-        Sysno::set_tid_address => host.tasks().set_tid_address(arg(0)),
-        Sysno::sched_yield => host.tasks().sched_yield(),
-        Sysno::exit => host.tasks().exit(arg(0) as i32),
-        Sysno::exit_group => host.tasks().exit_group(arg(0) as i32),
+        #[cfg(feature = "task")]
+        Sysno::getpid => Ok(host.tasks()?.getpid() as isize),
+        #[cfg(feature = "task")]
+        Sysno::getppid => Ok(host.tasks()?.getppid() as isize),
+        #[cfg(feature = "task")]
+        Sysno::gettid => Ok(host.tasks()?.gettid() as isize),
+        #[cfg(feature = "task")]
+        Sysno::set_tid_address => host.tasks()?.set_tid_address(arg(0)),
+        #[cfg(feature = "task")]
+        Sysno::sched_yield => host.tasks()?.sched_yield(),
+        // The wait-status encoding is the ABI's, so the domain applies it.
+        #[cfg(feature = "task")]
+        Sysno::exit => host.tasks()?.exit((arg(0) as i32) << 8),
+        #[cfg(feature = "task")]
+        Sysno::exit_group => host.tasks()?.exit_group((arg(0) as i32) << 8),
 
         // Address space.
-        Sysno::brk => host.mem().brk(arg(0)),
-        Sysno::mmap => host.mem().mmap(
+        #[cfg(feature = "mm")]
+        Sysno::brk => host.mem()?.brk(arg(0)),
+        #[cfg(feature = "mm")]
+        Sysno::mmap => host.mem()?.mmap(
             arg(0),
             arg(1),
             arg(2) as i32,
@@ -142,37 +186,71 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
             arg(4) as i32,
             arg(5),
         ),
-        Sysno::munmap => host.mem().munmap(arg(0), arg(1)),
-        Sysno::mprotect => host.mem().mprotect(arg(0), arg(1), arg(2) as i32),
-        Sysno::madvise => sys_madvise(host, arg(0), arg(1), arg(2) as i32),
-        Sysno::msync => sys_msync(host, arg(0), arg(1), arg(2) as i32),
+        #[cfg(feature = "mm")]
+        Sysno::munmap => host.mem()?.munmap(arg(0), arg(1)),
+        #[cfg(feature = "mm")]
+        Sysno::mprotect => host.mem()?.mprotect(arg(0), arg(1), arg(2) as i32),
+        #[cfg(feature = "mm")]
+        Sysno::madvise => host.mem()?.madvise(arg(0), arg(1), arg(2) as i32),
+        #[cfg(feature = "mm")]
+        Sysno::msync => sys_msync(host.mem()?, arg(0), arg(1), arg(2) as i32),
 
         // Clocks - the domain packs the timespec/timeval itself.
-        Sysno::clock_gettime => sys_clock_gettime(host, arg(0) as i32, arg(1)),
-        Sysno::clock_getres => sys_clock_getres(host, arg(0) as i32, arg(1)),
-        Sysno::gettimeofday => sys_gettimeofday(host, arg(0)),
-        Sysno::nanosleep => sys_nanosleep(host, arg(0), arg(1)),
+        #[cfg(feature = "time")]
+        Sysno::clock_gettime => {
+            sys_clock_gettime(host.platform(), host.clock()?, arg(0) as i32, arg(1))?
+        }
+        #[cfg(feature = "time")]
+        Sysno::clock_getres => sys_clock_getres(host.platform(), arg(0) as i32, arg(1))?,
+        #[cfg(feature = "time")]
+        Sysno::gettimeofday => sys_gettimeofday(host.platform(), host.clock()?, arg(0), arg(1))?,
 
         // Signals - the domain moves the sigset; the port carries a u64 mask.
-        Sysno::kill => host.signals().kill(arg(0) as i32, arg(1) as i32),
+        #[cfg(feature = "signal")]
+        Sysno::kill => host.signals()?.kill(arg(0) as i32, arg(1) as i32),
+        #[cfg(feature = "signal")]
         Sysno::tgkill => host
-            .signals()
+            .signals()?
             .tgkill(arg(0) as i32, arg(1) as i32, arg(2) as i32),
-        Sysno::rt_sigprocmask => sys_rt_sigprocmask(host, arg(0) as i32, arg(1), arg(2), arg(3)),
-
-        // Randomness - the domain fills user memory from the Random port.
-        Sysno::getrandom => sys_getrandom(host, arg(0), arg(1)),
+        #[cfg(feature = "signal")]
+        Sysno::rt_sigprocmask => sys_rt_sigprocmask(
+            host.platform(),
+            host.signals()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2),
+            arg(3),
+        ),
 
         // System identity - the domain packs the utsname struct itself.
-        Sysno::uname => sys_uname(host, arg(0)),
+        #[cfg(feature = "system")]
+        Sysno::uname => sys_uname(host.platform(), host.system()?, arg(0)),
 
         // Credentials - identity getters project from the (real, eff, saved) triple.
-        Sysno::getuid => Ok(host.creds().uids().0 as isize),
-        Sysno::geteuid => Ok(host.creds().uids().1 as isize),
-        Sysno::getgid => Ok(host.creds().gids().0 as isize),
-        Sysno::getegid => Ok(host.creds().gids().1 as isize),
-        Sysno::getresuid => sys_getres(host, host.creds().uids(), arg(0), arg(1), arg(2)),
-        Sysno::getresgid => sys_getres(host, host.creds().gids(), arg(0), arg(1), arg(2)),
+        #[cfg(feature = "creds")]
+        Sysno::getuid => Ok(host.creds()?.uids().0 as isize),
+        #[cfg(feature = "creds")]
+        Sysno::geteuid => Ok(host.creds()?.uids().1 as isize),
+        #[cfg(feature = "creds")]
+        Sysno::getgid => Ok(host.creds()?.gids().0 as isize),
+        #[cfg(feature = "creds")]
+        Sysno::getegid => Ok(host.creds()?.gids().1 as isize),
+        #[cfg(feature = "creds")]
+        Sysno::getresuid => sys_getres(
+            host.platform(),
+            host.creds()?.uids(),
+            arg(0),
+            arg(1),
+            arg(2),
+        ),
+        #[cfg(feature = "creds")]
+        Sysno::getresgid => sys_getres(
+            host.platform(),
+            host.creds()?.gids(),
+            arg(0),
+            arg(1),
+            arg(2),
+        ),
 
         _ => return None,
     })
@@ -184,346 +262,191 @@ fn dispatch(host: &dyn Host, uctx: &dyn TrapEnv) -> SysResult {
     route(host, uctx).unwrap_or(Err(ENOSYS))
 }
 
-/// `write(fd, ubuf, len)`: copy from user in bounded chunks and write each to
-/// `fd`, honoring short writes - the domain owns the transfer, not the host.
-fn sys_write(host: &dyn Host, fd: i32, ubuf: usize, len: usize) -> SysResult {
-    let (platform, files) = (host.platform(), host.files());
-    let mut buf = [0u8; CHUNK];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(CHUNK);
-        platform.read_user(ubuf + done, &mut buf[..n])?;
-        let written = files.write(fd, &buf[..n])? as usize;
-        done += written;
-        if written < n {
-            break;
-        }
-    }
-    Ok(done as isize)
-}
-
-/// `read(fd, ubuf, len)`: read from `fd` in bounded chunks and copy each to
-/// user, stopping at EOF or a short read.
-fn sys_read(host: &dyn Host, fd: i32, ubuf: usize, len: usize) -> SysResult {
-    let (platform, files) = (host.platform(), host.files());
-    let mut buf = [0u8; CHUNK];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(CHUNK);
-        let got = files.read(fd, &mut buf[..n])? as usize;
-        if got == 0 {
-            break;
-        }
-        platform.write_user(ubuf + done, &buf[..got])?;
-        done += got;
-        if got < n {
-            break;
-        }
-    }
-    Ok(done as isize)
-}
-
-/// `writev(fd, iov, iovcnt)`: gather-write. The domain reads the `iovec` array
-/// from user memory itself, then writes each segment through Files by reusing
-/// [`sys_write`], honoring a short write. The array is validated up front (count
-/// and the summed-length overflow Linux checks), so a bad `iov` faults before
-/// any data is written.
-fn sys_writev(host: &dyn Host, fd: i32, iov: usize, iovcnt: i32) -> SysResult {
-    let count = check_iovcnt(iovcnt)?;
-    total_iov_len(host, iov, count)?;
-    let mut done = 0;
-    for i in 0..count {
-        let (base, len) = read_iovec(host, iov, i)?;
-        let written = sys_write(host, fd, base, len)? as usize;
-        done += written;
-        if written < len {
-            break;
-        }
-    }
-    Ok(done as isize)
-}
-
-/// `readv(fd, iov, iovcnt)`: scatter-read. Reads into each user segment through
-/// [`sys_read`], stopping at EOF or a short read, after validating the array.
-fn sys_readv(host: &dyn Host, fd: i32, iov: usize, iovcnt: i32) -> SysResult {
-    let count = check_iovcnt(iovcnt)?;
-    total_iov_len(host, iov, count)?;
-    let mut done = 0;
-    for i in 0..count {
-        let (base, len) = read_iovec(host, iov, i)?;
-        let got = sys_read(host, fd, base, len)? as usize;
-        done += got;
-        if got < len {
-            break;
-        }
-    }
-    Ok(done as isize)
-}
-
-/// Validate an `iovcnt`: Linux rejects a negative count or one past `IOV_MAX`.
-fn check_iovcnt(iovcnt: i32) -> Result<usize, i32> {
-    if iovcnt < 0 || iovcnt as usize > IOV_MAX {
-        return Err(EINVAL);
-    }
-    Ok(iovcnt as usize)
-}
-
-/// Read `iovec[i]` from the user array at `iov`, returning `(base, len)`.
-fn read_iovec(host: &dyn Host, iov: usize, i: usize) -> Result<(usize, usize), i32> {
-    let mut entry = [0u8; IOVEC_SIZE];
-    host.platform()
-        .read_user(iov + i * IOVEC_SIZE, &mut entry)?;
-    let base = usize::from_le_bytes(entry[..8].try_into().unwrap());
-    let len = usize::from_le_bytes(entry[8..].try_into().unwrap());
-    Ok((base, len))
-}
-
-/// Sum the segment lengths, faulting if the array is unreadable and returning
-/// `EINVAL` if the total would overflow `ssize_t` - the up-front import Linux
-/// does before transferring any bytes.
-fn total_iov_len(host: &dyn Host, iov: usize, count: usize) -> SysResult {
-    let mut total: usize = 0;
-    for i in 0..count {
-        let (_, len) = read_iovec(host, iov, i)?;
-        total = total
-            .checked_add(len)
-            .filter(|&t| t <= isize::MAX as usize)
-            .ok_or(EINVAL)?;
-    }
-    Ok(total as isize)
-}
-
-/// `pread64(fd, ubuf, len, offset)`: positioned read - like [`sys_read`] but at
-/// an absolute `offset` that advances per chunk, leaving the file position
-/// untouched. A negative offset is `EINVAL`.
-fn sys_pread64(host: &dyn Host, fd: i32, ubuf: usize, len: usize, offset: i64) -> SysResult {
+/// `pread64(fd, ubuf, len, offset)`: positioned read of the user range. A
+/// negative offset is `EINVAL`.
+#[cfg(feature = "fs")]
+fn sys_pread64(files: &dyn ops::Files, fd: i32, ubuf: usize, len: usize, offset: i64) -> SysResult {
     if offset < 0 {
-        return Err(EINVAL);
+        return Err(ops::EINVAL);
     }
-    let (platform, files) = (host.platform(), host.files());
-    let mut buf = [0u8; CHUNK];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(CHUNK);
-        let got = files.pread(fd, &mut buf[..n], offset as u64 + done as u64)? as usize;
-        if got == 0 {
-            break;
-        }
-        platform.write_user(ubuf + done, &buf[..got])?;
-        done += got;
-        if got < n {
-            break;
-        }
-    }
-    Ok(done as isize)
+    files.pread(fd, ubuf, len, offset as u64)
 }
 
-/// `pwrite64(fd, ubuf, len, offset)`: positioned write - like [`sys_write`] but
-/// at an absolute `offset` that advances per chunk. A negative offset is `EINVAL`.
-fn sys_pwrite64(host: &dyn Host, fd: i32, ubuf: usize, len: usize, offset: i64) -> SysResult {
+/// `pwrite64(fd, ubuf, len, offset)`: positioned write of the user range.
+#[cfg(feature = "fs")]
+fn sys_pwrite64(
+    files: &dyn ops::Files,
+    fd: i32,
+    ubuf: usize,
+    len: usize,
+    offset: i64,
+) -> SysResult {
     if offset < 0 {
-        return Err(EINVAL);
+        return Err(ops::EINVAL);
     }
-    let (platform, files) = (host.platform(), host.files());
-    let mut buf = [0u8; CHUNK];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(CHUNK);
-        platform.read_user(ubuf + done, &mut buf[..n])?;
-        let written = files.pwrite(fd, &buf[..n], offset as u64 + done as u64)? as usize;
-        done += written;
-        if written < n {
-            break;
-        }
-    }
-    Ok(done as isize)
+    files.pwrite(fd, ubuf, len, offset as u64)
 }
 
 /// `ftruncate(fd, len)`: resize `fd`. A negative length is `EINVAL`; the port
 /// zero-extends the file on growth.
-fn sys_ftruncate(host: &dyn Host, fd: i32, len: i64) -> SysResult {
+#[cfg(feature = "fs")]
+fn sys_ftruncate(files: &dyn ops::Files, fd: i32, len: i64) -> SysResult {
     if len < 0 {
-        return Err(EINVAL);
+        return Err(ops::EINVAL);
     }
-    host.files().ftruncate(fd, len as u64)
+    files.ftruncate(fd, len as u64)
 }
 
 /// `dup3(oldfd, newfd, flags)`: duplicate onto a specific fd like `dup2`, but
 /// equal fds are `EINVAL` (not the `dup2` no-op) and the only accepted flag is
 /// `O_CLOEXEC`. The port performs the fd-table replacement.
-fn sys_dup3(host: &dyn Host, oldfd: i32, newfd: i32, flags: i32) -> SysResult {
+#[cfg(feature = "fs")]
+fn sys_dup3(files: &dyn ops::Files, oldfd: i32, newfd: i32, flags: i32) -> SysResult {
     if oldfd == newfd || (flags & !O_CLOEXEC) != 0 {
-        return Err(EINVAL);
+        return Err(ops::EINVAL);
     }
-    host.files().dup2(oldfd, newfd, flags & O_CLOEXEC != 0)
-}
-
-/// `madvise(addr, len, advice)`: validate the advice is one the kernel knows,
-/// then hand the region to the Mem port. Unknown advice is `EINVAL`.
-fn sys_madvise(host: &dyn Host, addr: usize, len: usize, advice: i32) -> SysResult {
-    if !MADV_KNOWN.contains(&advice) {
-        return Err(EINVAL);
-    }
-    host.mem().madvise(addr, len, advice)
+    files.dup2(oldfd, newfd, flags & O_CLOEXEC != 0)
 }
 
 /// `msync(addr, len, flags)`: reject unknown flag bits and the mutually exclusive
 /// `MS_SYNC`+`MS_ASYNC` pair, then flush through the Mem port.
-fn sys_msync(host: &dyn Host, addr: usize, len: usize, flags: i32) -> SysResult {
+#[cfg(feature = "mm")]
+fn sys_msync(mem: &dyn ops::Mem, addr: usize, len: usize, flags: i32) -> SysResult {
     const MS_ASYNC: i32 = 1;
     const MS_INVALIDATE: i32 = 2;
     const MS_SYNC: i32 = 4;
     let known = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
     if flags & !known != 0 || flags & (MS_ASYNC | MS_SYNC) == (MS_ASYNC | MS_SYNC) {
-        return Err(EINVAL);
+        return Err(ops::EINVAL);
     }
-    host.mem().msync(addr, len, flags)
-}
-
-/// `getrandom(ubuf, len)`: fill user memory from the Random port in bounded
-/// chunks. Flags (GRND_NONBLOCK/RANDOM) do not change behavior for this backend.
-fn sys_getrandom(host: &dyn Host, ubuf: usize, len: usize) -> SysResult {
-    let (platform, random) = (host.platform(), host.random());
-    let mut buf = [0u8; CHUNK];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(CHUNK);
-        let got = random.fill(&mut buf[..n])? as usize;
-        if got == 0 {
-            break;
-        }
-        platform.write_user(ubuf + done, &buf[..got])?;
-        done += got;
-        if got < n {
-            break;
-        }
-    }
-    Ok(done as isize)
+    mem.msync(addr, len, flags)
 }
 
 /// `uname(buf)`: report system identity. The domain packs the six `utsname`
 /// fields, each NUL-padded to 65 bytes, and writes the 390-byte struct to user.
-fn sys_uname(host: &dyn Host, buf: usize) -> SysResult {
+#[cfg(feature = "system")]
+fn sys_uname(platform: &dyn ops::Platform, system: &dyn ops::System, buf: usize) -> SysResult {
     let mut out = [0u8; UTS_LEN];
-    host.system().uname(&mut |field, value| {
+    system.uname(&mut |field, value| {
         let slot = match field {
-            UtsField::SysName => 0,
-            UtsField::NodeName => 1,
-            UtsField::Release => 2,
-            UtsField::Version => 3,
-            UtsField::Machine => 4,
-            UtsField::DomainName => 5,
+            ops::UtsField::SysName => 0,
+            ops::UtsField::NodeName => 1,
+            ops::UtsField::Release => 2,
+            ops::UtsField::Version => 3,
+            ops::UtsField::Machine => 4,
+            ops::UtsField::DomainName => 5,
         } * UTS_FIELD;
         let src = value.as_bytes();
         let n = src.len().min(UTS_FIELD - 1); // keep the trailing NUL
         out[slot..slot + n].copy_from_slice(&src[..n]);
     });
-    host.platform().write_user(buf, &out)?;
+    platform.write_user(buf, &out)?;
     Ok(0)
 }
 
 /// `getresuid`/`getresgid`: write a `(real, effective, saved)` id triple to three
 /// user pointers, each a 32-bit id.
+#[cfg(feature = "creds")]
 fn sys_getres(
-    host: &dyn Host,
+    platform: &dyn ops::Platform,
     ids: (u32, u32, u32),
     real: usize,
     eff: usize,
     saved: usize,
 ) -> SysResult {
-    let platform = host.platform();
     platform.write_user(real, &ids.0.to_le_bytes())?;
     platform.write_user(eff, &ids.1.to_le_bytes())?;
     platform.write_user(saved, &ids.2.to_le_bytes())?;
     Ok(0)
 }
 
-/// `clock_gettime(clockid, ts)`: read the requested clock and pack a `timespec`
-/// (two 64-bit words) into user memory.
-fn sys_clock_gettime(host: &dyn Host, clockid: i32, ts: usize) -> SysResult {
+/// `clock_gettime(clockid, ts)`: pack a `timespec` for the clocks this domain
+/// reads through the port; any other clock goes back to the caller's table.
+#[cfg(feature = "time")]
+fn sys_clock_gettime(
+    platform: &dyn ops::Platform,
+    clock: &dyn ops::Clock,
+    clockid: i32,
+    ts: usize,
+) -> Option<SysResult> {
     let ns = match clockid {
-        CLOCK_REALTIME => host.clock().wall_ns(),
-        CLOCK_MONOTONIC => host.clock().monotonic_ns(),
-        _ => return Err(EINVAL),
+        CLOCK_REALTIME => clock.wall_ns(),
+        CLOCK_MONOTONIC => clock.monotonic_ns(),
+        _ => return None,
     };
     let packed = pack_time_pair((ns / NS_PER_SEC) as i64, (ns % NS_PER_SEC) as i64);
-    host.platform().write_user(ts, &packed)?;
-    Ok(0)
+    Some(platform.write_user(ts, &packed).map(|_| 0))
 }
 
-/// `clock_getres(clockid, res)`: report a clock's resolution. Both supported
-/// clocks are nanosecond-resolution; a null `res` is a valid clock-liveness query.
-fn sys_clock_getres(host: &dyn Host, clockid: i32, res: usize) -> SysResult {
+/// `clock_getres(clockid, res)`: both clocks this domain serves are
+/// nanosecond-resolution; a null `res` is a valid clock-liveness query.
+#[cfg(feature = "time")]
+fn sys_clock_getres(platform: &dyn ops::Platform, clockid: i32, res: usize) -> Option<SysResult> {
     if !matches!(clockid, CLOCK_REALTIME | CLOCK_MONOTONIC) {
-        return Err(EINVAL);
+        return None;
     }
-    if res != 0 {
-        host.platform().write_user(res, &pack_time_pair(0, 1))?;
+    if res == 0 {
+        return Some(Ok(0));
     }
-    Ok(0)
+    Some(platform.write_user(res, &pack_time_pair(0, 1)).map(|_| 0))
 }
 
-/// `gettimeofday(tv)`: pack the wall clock as a `timeval` (seconds + microseconds).
-fn sys_gettimeofday(host: &dyn Host, tv: usize) -> SysResult {
+/// `gettimeofday(tv, tz)`: pack the wall clock as a `timeval`. The obsolete
+/// timezone argument is not this domain's to fill, so a caller that passes one
+/// goes back to the table that still implements it.
+#[cfg(feature = "time")]
+fn sys_gettimeofday(
+    platform: &dyn ops::Platform,
+    clock: &dyn ops::Clock,
+    tv: usize,
+    tz: usize,
+) -> Option<SysResult> {
+    if tz != 0 {
+        return None;
+    }
     if tv == 0 {
-        return Ok(0);
+        return Some(Ok(0));
     }
-    let ns = host.clock().wall_ns();
+    let ns = clock.wall_ns();
     let packed = pack_time_pair((ns / NS_PER_SEC) as i64, (ns % NS_PER_SEC / 1_000) as i64);
-    host.platform().write_user(tv, &packed)?;
-    Ok(0)
+    Some(platform.write_user(tv, &packed).map(|_| 0))
 }
 
-/// `nanosleep(req, rem)`: read the requested `timespec`, sleep, and clear `rem`
-/// (this personality does not interrupt sleeps yet, so no time ever remains).
-fn sys_nanosleep(host: &dyn Host, req: usize, rem: usize) -> SysResult {
-    let mut buf = [0u8; 16];
-    host.platform().read_user(req, &mut buf)?;
-    let sec = i64::from_le_bytes(buf[..8].try_into().unwrap());
-    let nsec = i64::from_le_bytes(buf[8..].try_into().unwrap());
-    if sec < 0 || !(0..NS_PER_SEC as i64).contains(&nsec) {
-        return Err(EINVAL);
-    }
-    host.clock()
-        .sleep_ns(sec as u64 * NS_PER_SEC + nsec as u64)?;
-    if rem != 0 {
-        host.platform().write_user(rem, &[0u8; 16])?;
-    }
-    Ok(0)
-}
-
-/// `rt_sigprocmask(how, set, old, sigsetsize)`: move the user `sigset_t` itself
-/// (carried through the port as a `u64`), validating the ABI's fixed size and
-/// the `how` selector.
+/// `rt_sigprocmask(how, set, old, sigsetsize)`: move the user `sigset_t`, which
+/// the ABI fixes at eight bytes.
+///
+/// The previous mask is reported before the new one is read, which is the order
+/// a caller passing both pointers observes today.
+#[cfg(feature = "signal")]
 fn sys_rt_sigprocmask(
-    host: &dyn Host,
+    platform: &dyn ops::Platform,
+    signals: &dyn ops::Signals,
     how: i32,
     set: usize,
     old: usize,
     sigsetsize: usize,
 ) -> SysResult {
     if sigsetsize != SIGSET_SIZE {
-        return Err(EINVAL);
+        return Err(ops::EINVAL);
     }
-    let new = if set != 0 {
+    let previous = signals.sigprocmask(how, None)?;
+    if old != 0 {
+        platform.write_user(old, &previous.to_le_bytes())?;
+    }
+    if set != 0 {
         if !(0..=2).contains(&how) {
-            return Err(EINVAL);
+            return Err(ops::EINVAL);
         }
         let mut buf = [0u8; SIGSET_SIZE];
-        host.platform().read_user(set, &mut buf)?;
-        Some(u64::from_le_bytes(buf))
-    } else {
-        None
-    };
-    let previous = host.signals().sigprocmask(how, new)?;
-    if old != 0 {
-        host.platform().write_user(old, &previous.to_le_bytes())?;
+        platform.read_user(set, &mut buf)?;
+        signals.sigprocmask(how, Some(u64::from_le_bytes(buf)))?;
     }
     Ok(0)
 }
 
 /// Pack two 64-bit little-endian words - the shared layout of `timespec` and
 /// `timeval` on 64-bit Linux.
+#[cfg(feature = "time")]
 fn pack_time_pair(hi: i64, lo: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&hi.to_le_bytes());
@@ -605,19 +528,19 @@ mod tests {
         fn sched_yield(&self) -> SysResult {
             Ok(0)
         }
-        fn exit(&self, _c: i32) -> ! {
-            panic!("exit")
+        fn exit(&self, _c: i32) -> SysResult {
+            Ok(0)
         }
-        fn exit_group(&self, _c: i32) -> ! {
-            panic!("exit_group")
+        fn exit_group(&self, _c: i32) -> SysResult {
+            Ok(0)
         }
     }
     impl Files for FixedHost {
-        fn read(&self, _fd: i32, _b: &mut [u8]) -> SysResult {
+        fn read(&self, _fd: i32, _u: usize, _len: usize) -> SysResult {
             Ok(0)
         }
-        fn write(&self, _fd: i32, b: &[u8]) -> SysResult {
-            Ok(b.len() as isize)
+        fn write(&self, _fd: i32, _u: usize, len: usize) -> SysResult {
+            Ok(len as isize)
         }
         fn close(&self, _fd: i32) -> SysResult {
             Ok(0)
@@ -628,11 +551,11 @@ mod tests {
         fn lseek(&self, _fd: i32, o: isize, _w: i32) -> SysResult {
             Ok(o)
         }
-        fn pread(&self, _fd: i32, _b: &mut [u8], _o: u64) -> SysResult {
+        fn pread(&self, _fd: i32, _u: usize, _len: usize, _o: u64) -> SysResult {
             Ok(0)
         }
-        fn pwrite(&self, _fd: i32, b: &[u8], _o: u64) -> SysResult {
-            Ok(b.len() as isize)
+        fn pwrite(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> SysResult {
+            Ok(len as isize)
         }
         fn dup2(&self, _oldfd: i32, newfd: i32, _cloexec: bool) -> SysResult {
             Ok(newfd as isize)
@@ -692,13 +615,13 @@ mod tests {
         }
     }
     impl System for FixedHost {
-        fn uname(&self, put: &mut dyn FnMut(UtsField, &str)) {
-            put(UtsField::SysName, "Linux");
-            put(UtsField::NodeName, "starry");
-            put(UtsField::Release, "6.0.0");
-            put(UtsField::Version, "#1");
-            put(UtsField::Machine, "x86_64");
-            put(UtsField::DomainName, "(none)");
+        fn uname(&self, put: &mut dyn FnMut(ops::UtsField, &str)) {
+            put(ops::UtsField::SysName, "Linux");
+            put(ops::UtsField::NodeName, "starry");
+            put(ops::UtsField::Release, "6.0.0");
+            put(ops::UtsField::Version, "#1");
+            put(ops::UtsField::Machine, "x86_64");
+            put(ops::UtsField::DomainName, "(none)");
         }
     }
     impl Creds for FixedHost {
@@ -713,29 +636,29 @@ mod tests {
         fn platform(&self) -> &dyn Platform {
             self
         }
-        fn tasks(&self) -> &dyn Tasks {
-            self
+        fn tasks(&self) -> Option<&dyn Tasks> {
+            Some(self)
         }
-        fn files(&self) -> &dyn Files {
-            self
+        fn files(&self) -> Option<&dyn Files> {
+            Some(self)
         }
-        fn mem(&self) -> &dyn Mem {
-            self
+        fn mem(&self) -> Option<&dyn Mem> {
+            Some(self)
         }
-        fn signals(&self) -> &dyn Signals {
-            self
+        fn signals(&self) -> Option<&dyn Signals> {
+            Some(self)
         }
-        fn clock(&self) -> &dyn Clock {
-            self
+        fn clock(&self) -> Option<&dyn Clock> {
+            Some(self)
         }
-        fn random(&self) -> &dyn Random {
-            self
+        fn random(&self) -> Option<&dyn Random> {
+            Some(self)
         }
-        fn system(&self) -> &dyn System {
-            self
+        fn system(&self) -> Option<&dyn System> {
+            Some(self)
         }
-        fn creds(&self) -> &dyn Creds {
-            self
+        fn creds(&self) -> Option<&dyn Creds> {
+            Some(self)
         }
     }
 
@@ -771,6 +694,7 @@ mod tests {
         mask: RefCell<u64>,
         killed: RefCell<Option<(i32, i32)>>,
         duped: RefCell<Option<(i32, i32, bool)>>,
+        exited: RefCell<Option<(i32, bool)>>,
         synced: RefCell<Option<bool>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
@@ -793,16 +717,20 @@ mod tests {
         }
     }
     impl Files for Mock {
-        fn read(&self, _fd: i32, buf: &mut [u8]) -> SysResult {
-            let mut src = self.to_read.borrow_mut();
-            let n = buf.len().min(src.len());
-            buf[..n].copy_from_slice(&src[..n]);
-            src.drain(..n);
-            Ok(n as isize)
+        fn read(&self, _fd: i32, uaddr: usize, len: usize) -> SysResult {
+            let bytes: Vec<u8> = {
+                let mut src = self.to_read.borrow_mut();
+                let n = len.min(src.len());
+                src.drain(..n).collect()
+            };
+            self.write_user(uaddr, &bytes)?;
+            Ok(bytes.len() as isize)
         }
-        fn write(&self, _fd: i32, buf: &[u8]) -> SysResult {
-            self.written.borrow_mut().extend_from_slice(buf);
-            Ok(buf.len() as isize)
+        fn write(&self, _fd: i32, uaddr: usize, len: usize) -> SysResult {
+            let mut buf = vec![0u8; len];
+            self.read_user(uaddr, &mut buf)?;
+            self.written.borrow_mut().extend_from_slice(&buf);
+            Ok(len as isize)
         }
         fn close(&self, _fd: i32) -> SysResult {
             Ok(0)
@@ -813,21 +741,25 @@ mod tests {
         fn lseek(&self, _fd: i32, offset: isize, _whence: i32) -> SysResult {
             Ok(offset)
         }
-        fn pread(&self, _fd: i32, buf: &mut [u8], offset: u64) -> SysResult {
-            let file = self.file.borrow();
-            let start = (offset as usize).min(file.len());
-            let n = buf.len().min(file.len() - start);
-            buf[..n].copy_from_slice(&file[start..start + n]);
-            Ok(n as isize)
+        fn pread(&self, _fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
+            let bytes: Vec<u8> = {
+                let file = self.file.borrow();
+                let start = (offset as usize).min(file.len());
+                file[start..(start + len).min(file.len())].to_vec()
+            };
+            self.write_user(uaddr, &bytes)?;
+            Ok(bytes.len() as isize)
         }
-        fn pwrite(&self, _fd: i32, buf: &[u8], offset: u64) -> SysResult {
+        fn pwrite(&self, _fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
+            let mut buf = vec![0u8; len];
+            self.read_user(uaddr, &mut buf)?;
             let mut file = self.file.borrow_mut();
-            let end = offset as usize + buf.len();
+            let end = offset as usize + len;
             if file.len() < end {
                 file.resize(end, 0);
             }
-            file[offset as usize..end].copy_from_slice(buf);
-            Ok(buf.len() as isize)
+            file[offset as usize..end].copy_from_slice(&buf);
+            Ok(len as isize)
         }
         fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
             *self.duped.borrow_mut() = Some((oldfd, newfd, cloexec));
@@ -858,11 +790,13 @@ mod tests {
         fn sched_yield(&self) -> SysResult {
             Ok(0)
         }
-        fn exit(&self, code: i32) -> ! {
-            panic!("exit {code}")
+        fn exit(&self, code: i32) -> SysResult {
+            *self.exited.borrow_mut() = Some((code, false));
+            Ok(0)
         }
-        fn exit_group(&self, code: i32) -> ! {
-            panic!("exit_group {code}")
+        fn exit_group(&self, code: i32) -> SysResult {
+            *self.exited.borrow_mut() = Some((code, true));
+            Ok(0)
         }
     }
     impl Mem for Mock {
@@ -914,13 +848,13 @@ mod tests {
         }
     }
     impl System for Mock {
-        fn uname(&self, put: &mut dyn FnMut(UtsField, &str)) {
-            put(UtsField::SysName, "Linux");
-            put(UtsField::NodeName, "node");
-            put(UtsField::Release, "rel");
-            put(UtsField::Version, "ver");
-            put(UtsField::Machine, "riscv64");
-            put(UtsField::DomainName, "(none)");
+        fn uname(&self, put: &mut dyn FnMut(ops::UtsField, &str)) {
+            put(ops::UtsField::SysName, "Linux");
+            put(ops::UtsField::NodeName, "node");
+            put(ops::UtsField::Release, "rel");
+            put(ops::UtsField::Version, "ver");
+            put(ops::UtsField::Machine, "riscv64");
+            put(ops::UtsField::DomainName, "(none)");
         }
     }
     impl Creds for Mock {
@@ -947,29 +881,29 @@ mod tests {
         fn platform(&self) -> &dyn Platform {
             self
         }
-        fn tasks(&self) -> &dyn Tasks {
-            self
+        fn tasks(&self) -> Option<&dyn Tasks> {
+            Some(self)
         }
-        fn signals(&self) -> &dyn Signals {
-            self
+        fn files(&self) -> Option<&dyn Files> {
+            Some(self)
         }
-        fn clock(&self) -> &dyn Clock {
-            self
+        fn mem(&self) -> Option<&dyn Mem> {
+            Some(self)
         }
-        fn random(&self) -> &dyn Random {
-            self
+        fn signals(&self) -> Option<&dyn Signals> {
+            Some(self)
         }
-        fn files(&self) -> &dyn Files {
-            self
+        fn clock(&self) -> Option<&dyn Clock> {
+            Some(self)
         }
-        fn mem(&self) -> &dyn Mem {
-            self
+        fn random(&self) -> Option<&dyn Random> {
+            Some(self)
         }
-        fn system(&self) -> &dyn System {
-            self
+        fn system(&self) -> Option<&dyn System> {
+            Some(self)
         }
-        fn creds(&self) -> &dyn Creds {
-            self
+        fn creds(&self) -> Option<&dyn Creds> {
+            Some(self)
         }
     }
 
@@ -1002,63 +936,6 @@ mod tests {
         assert_eq!(r, Err(EFAULT));
     }
 
-    // Lay a 64-bit iovec { base, len } at `entry` (index) in `mem`.
-    fn put_iovec(mem: &mut [u8], index: usize, base: usize, len: usize) {
-        let off = index * 16;
-        mem[off..off + 8].copy_from_slice(&base.to_le_bytes());
-        mem[off + 8..off + 16].copy_from_slice(&len.to_le_bytes());
-    }
-
-    #[test]
-    fn writev_gathers_segments() {
-        let host = Mock::default();
-        let mut mem = vec![0u8; 0x100];
-        put_iovec(&mut mem, 0, 0x40, 3);
-        put_iovec(&mut mem, 1, 0x80, 2);
-        mem[0x40..0x43].copy_from_slice(b"abc");
-        mem[0x80..0x82].copy_from_slice(b"de");
-        *host.umem.borrow_mut() = mem;
-        // writev(fd=1, iov=0, iovcnt=2): the domain reads the iovec array itself
-        // and gathers both segments into Files in order - no passthrough.
-        let r = dispatch(&host, &Trap::new(Sysno::writev, [1, 0, 2, 0, 0, 0]));
-        assert_eq!(r, Ok(5));
-        assert_eq!(&*host.written.borrow(), b"abcde");
-    }
-
-    #[test]
-    fn readv_scatters_into_segments() {
-        let host = Mock::default();
-        let mut mem = vec![0u8; 0x100];
-        put_iovec(&mut mem, 0, 0x40, 2);
-        put_iovec(&mut mem, 1, 0x80, 3);
-        *host.umem.borrow_mut() = mem;
-        *host.to_read.borrow_mut() = vec![1, 2, 3, 4, 5];
-        let r = dispatch(&host, &Trap::new(Sysno::readv, [0, 0, 2, 0, 0, 0]));
-        assert_eq!(r, Ok(5));
-        assert_eq!(&host.umem.borrow()[0x40..0x42], &[1, 2]);
-        assert_eq!(&host.umem.borrow()[0x80..0x83], &[3, 4, 5]);
-    }
-
-    #[test]
-    fn writev_rejects_bad_iovcnt() {
-        let host = Mock::default();
-        // IOV_MAX + 1 segments is refused before any transfer.
-        let r = dispatch(&host, &Trap::new(Sysno::writev, [1, 0, 1025, 0, 0, 0]));
-        assert_eq!(r, Err(EINVAL));
-        assert!(host.written.borrow().is_empty());
-    }
-
-    #[test]
-    fn writev_faults_on_bad_iov_before_writing() {
-        let host = Mock::default();
-        // The iovec array itself is past the end of user memory: writev must
-        // fault during the up-front import, before any segment is written.
-        *host.umem.borrow_mut() = vec![0u8; 8];
-        let r = dispatch(&host, &Trap::new(Sysno::writev, [1, 0, 2, 0, 0, 0]));
-        assert_eq!(r, Err(EFAULT));
-        assert!(host.written.borrow().is_empty());
-    }
-
     #[test]
     fn pread_reads_at_offset() {
         let host = Mock::default();
@@ -1089,7 +966,7 @@ mod tests {
             &host,
             &Trap::new(Sysno::pread64, [3, 0, 3, (-1i64) as usize, 0, 0]),
         );
-        assert_eq!(r, Err(EINVAL));
+        assert_eq!(r, Err(ops::EINVAL));
     }
 
     #[test]
@@ -1116,7 +993,7 @@ mod tests {
         let host = Mock::default();
         // dup3 with oldfd == newfd is EINVAL, unlike the dup2 no-op.
         let r = dispatch(&host, &Trap::new(Sysno::dup3, [5, 5, 0, 0, 0, 0]));
-        assert_eq!(r, Err(EINVAL));
+        assert_eq!(r, Err(ops::EINVAL));
         assert!(host.duped.borrow().is_none());
     }
 
@@ -1124,7 +1001,7 @@ mod tests {
     fn dup3_rejects_unknown_flags() {
         let host = Mock::default();
         let r = dispatch(&host, &Trap::new(Sysno::dup3, [3, 7, 0x1, 0, 0, 0]));
-        assert_eq!(r, Err(EINVAL));
+        assert_eq!(r, Err(ops::EINVAL));
         assert!(host.duped.borrow().is_none());
     }
 
@@ -1184,7 +1061,7 @@ mod tests {
             &host,
             &Trap::new(Sysno::ftruncate, [3, (-1i64) as usize, 0, 0, 0, 0]),
         );
-        assert_eq!(r, Err(EINVAL));
+        assert_eq!(r, Err(ops::EINVAL));
     }
 
     #[test]
@@ -1236,16 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn madvise_rejects_unknown_advice() {
-        let host = Mock::default();
-        let r = dispatch(
-            &host,
-            &Trap::new(Sysno::madvise, [0x1000, 0x2000, 999, 0, 0, 0]),
-        );
-        assert_eq!(r, Err(EINVAL));
-    }
-
-    #[test]
     fn msync_rejects_sync_and_async_together() {
         let host = Mock::default();
         // MS_ASYNC(1) | MS_SYNC(4) is a mutually exclusive combination.
@@ -1253,7 +1120,7 @@ mod tests {
             &host,
             &Trap::new(Sysno::msync, [0x1000, 0x1000, 5, 0, 0, 0]),
         );
-        assert_eq!(r, Err(EINVAL));
+        assert_eq!(r, Err(ops::EINVAL));
     }
 
     #[test]
@@ -1278,6 +1145,43 @@ mod tests {
         assert_eq!(
             dispatch(&host, &Trap::new(Sysno::dup, [3, 0, 0, 0, 0, 0])),
             Ok(9)
+        );
+    }
+
+    // A host with nothing but the platform port: the parts a domain needs are
+    // fitted, not assumed.
+    struct BarePlatform;
+    impl Platform for BarePlatform {
+        fn read_user(&self, _u: usize, _o: &mut [u8]) -> SysResult {
+            Ok(0)
+        }
+        fn write_user(&self, _u: usize, _d: &[u8]) -> SysResult {
+            Ok(0)
+        }
+    }
+    impl Host for BarePlatform {
+        fn platform(&self) -> &dyn Platform {
+            self
+        }
+    }
+
+    #[test]
+    fn a_syscall_needs_its_capability_fitted() {
+        let bare = BarePlatform;
+        // No file capability, so the domain does not claim the file syscalls and
+        // the caller keeps whatever it does with an unclaimed call.
+        assert!(route(&bare, &Trap::new(Sysno::read, [0, 0, 8, 0, 0, 0])).is_none());
+        assert!(route(&bare, &Trap::new(Sysno::close, [3, 0, 0, 0, 0, 0])).is_none());
+        // Nor the task, memory or credential ones.
+        assert!(route(&bare, &Trap::new(Sysno::getpid, [0; 6])).is_none());
+        assert!(route(&bare, &Trap::new(Sysno::brk, [0, 0, 0, 0, 0, 0])).is_none());
+        assert!(route(&bare, &Trap::new(Sysno::getuid, [0; 6])).is_none());
+
+        // The same domain, given a host that fits those parts, serves them.
+        let full = Mock::default();
+        assert_eq!(
+            route(&full, &Trap::new(Sysno::getpid, [0; 6])),
+            Some(Ok(42))
         );
     }
 
@@ -1330,13 +1234,10 @@ mod tests {
     }
 
     #[test]
-    fn clock_gettime_rejects_unknown_clock() {
+    fn clock_gettime_hands_back_an_unknown_clock() {
         let host = Mock::default();
-        *host.umem.borrow_mut() = vec![0u8; 16];
-        assert_eq!(
-            dispatch(&host, &Trap::new(Sysno::clock_gettime, [99, 0, 0, 0, 0, 0])),
-            Err(EINVAL)
-        );
+        // The domain serves two clocks; the rest stay with the caller's table.
+        assert!(route(&host, &Trap::new(Sysno::clock_gettime, [99, 0, 0, 0, 0, 0])).is_none());
     }
 
     #[test]
@@ -1372,22 +1273,9 @@ mod tests {
     }
 
     #[test]
-    fn clock_getres_rejects_unknown_clock() {
+    fn clock_getres_hands_back_an_unknown_clock() {
         let host = Mock::default();
-        assert_eq!(
-            dispatch(&host, &Trap::new(Sysno::clock_getres, [99, 0, 0, 0, 0, 0])),
-            Err(EINVAL)
-        );
-    }
-
-    #[test]
-    fn nanosleep_reads_request_and_sleeps() {
-        let host = Mock::default();
-        // A timespec of { 2s, 3ns } at user address 0.
-        *host.umem.borrow_mut() = pack_time_pair(2, 3).to_vec();
-        let r = dispatch(&host, &Trap::new(Sysno::nanosleep, [0, 0, 0, 0, 0, 0]));
-        assert_eq!(r, Ok(0));
-        assert_eq!(*host.slept.borrow(), 2 * NS_PER_SEC + 3);
+        assert!(route(&host, &Trap::new(Sysno::clock_getres, [99, 0, 0, 0, 0, 0])).is_none());
     }
 
     #[test]
@@ -1413,17 +1301,24 @@ mod tests {
         let host = Mock::default();
         assert_eq!(
             dispatch(&host, &Trap::new(Sysno::rt_sigprocmask, [2, 0, 0, 4, 0, 0])),
-            Err(EINVAL)
+            Err(ops::EINVAL)
         );
     }
 
     #[test]
-    fn getrandom_fills_user_memory() {
+    fn exit_routes_to_tasks() {
         let host = Mock::default();
-        *host.umem.borrow_mut() = vec![0u8; 5];
-        let r = dispatch(&host, &Trap::new(Sysno::getrandom, [0, 5, 0, 0, 0, 0]));
-        assert_eq!(r, Ok(5));
-        assert_eq!(&*host.umem.borrow(), &[0xAB; 5]);
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::exit, [3, 0, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        // The wait status carries the exit code in its upper byte.
+        assert_eq!(*host.exited.borrow(), Some((3 << 8, false)));
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::exit_group, [4, 0, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(*host.exited.borrow(), Some((4 << 8, true)));
     }
 
     #[test]

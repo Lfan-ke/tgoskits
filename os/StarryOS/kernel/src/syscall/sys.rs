@@ -204,7 +204,7 @@ fn commit_cred_with_id_rules(thread: &crate::task::Thread, new: crate::task::Cre
     });
 }
 
-fn user_ns_overflow_uid() -> u32 {
+pub(crate) fn user_ns_overflow_uid() -> u32 {
     let curr = current();
     let nsproxy = curr.as_thread().proc_data.nsproxy.lock();
     let ns = nsproxy.user_ns.lock();
@@ -214,7 +214,7 @@ fn user_ns_overflow_uid() -> u32 {
     65534
 }
 
-fn user_ns_overflow_gid() -> u32 {
+pub(crate) fn user_ns_overflow_gid() -> u32 {
     let curr = current();
     let nsproxy = curr.as_thread().proc_data.nsproxy.lock();
     let ns = nsproxy.user_ns.lock();

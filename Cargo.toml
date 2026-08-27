@@ -150,7 +150,7 @@ ax-abi-path = { version = "0.1", path = "components/ax-abi-path" }
 ax-abi-driver = { version = "0.1", path = "components/ax-abi-driver" }
 ax-abi-embedded = { version = "0.1", path = "components/ax-abi-embedded" }
 ax-abi-custom = { version = "0.1", path = "components/ax-abi-custom" }
-ax-abi-port = { version = "0.1", path = "components/ax-abi-port" }
+ax-abi-port = { version = "0.1", path = "components/ax-abi-port", default-features = false }
 cpu-local = { version = "0.2", path = "components/cpu-local" }
 ax-cpu = { version = "0.8", path = "components/axcpu" }
 ax-cpumask = { version = "0.4", path = "components/cpumask" }

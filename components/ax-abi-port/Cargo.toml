@@ -9,5 +9,18 @@ keywords.workspace = true
 categories = ["os", "no-std"]
 license.workspace = true
 
+[features]
+# Each capability is a part the build can leave out. A host that has no
+# filesystem drops `fs`, and the file ports stop existing at all.
+default = ["fs", "mm", "task", "signal", "time", "random", "system", "creds"]
+fs = []
+mm = []
+task = []
+signal = []
+time = []
+random = []
+system = []
+creds = []
+
 [dependencies]
 ax-crate-interface = { workspace = true }

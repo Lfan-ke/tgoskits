@@ -6,9 +6,13 @@
 //! build's volatile SSDT. [`dispatch`] reads the trapped register file, routes
 //! the call number to a method of the [`NtApi`] capability, and writes back the
 //! NTSTATUS - mirroring how the Linux personality turns a `Sysno` into a `sys_*`
-//! call. The [`NtApi`] implementation (which actually touches files and memory
-//! through the `ax-*` primitives) lives in the kernel; this module is the pure,
-//! testable routing layer.
+//! call. This module is the pure, testable routing layer.
+//!
+//! [`NtApi`] is where an NT call reaches the machine, and it is meant to become
+//! a thin translation over the shared `ax-abi-port` capabilities rather than a
+//! second host interface: a handle resolves to a descriptor here, in the domain,
+//! and the transfer itself uses the same file and memory ports the Linux domain
+//! drives. That keeps one set of adapters in the hosting kernel.
 //!
 //! Argument positions follow the NT syscall signatures (`ntdll` prototypes /
 //! ReactOS `ntoskrnl/io`,`mm`), read via the ABI-neutral [`TrapEnv`].
