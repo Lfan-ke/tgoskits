@@ -600,12 +600,8 @@ pub fn sys_mmap(
     Ok(start.as_usize() as _)
 }
 
-pub fn sys_munmap(addr: usize, length: usize) -> StarryResult<isize> {
-    // man 2 munmap: "length was 0" → EINVAL (since Linux 2.6.12).
-    if length == 0 {
-        return Err(StarryError::InvalidInput);
-    }
-    debug!("sys_munmap <= addr: {addr:#x}, length: {length:x}");
+/// Unmap `[addr, addr+length)`, rounding the length up to whole pages.
+pub(crate) fn unmap_range(addr: usize, length: usize) -> StarryResult<isize> {
     let curr = current();
     let aspace_arc = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_arc.lock();
@@ -613,6 +609,15 @@ pub fn sys_munmap(addr: usize, length: usize) -> StarryResult<isize> {
     let start_addr = VirtAddr::from(addr);
     aspace.unmap(start_addr, length)?;
     Ok(0)
+}
+
+pub fn sys_munmap(addr: usize, length: usize) -> StarryResult<isize> {
+    // man 2 munmap: "length was 0" → EINVAL (since Linux 2.6.12).
+    if length == 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    debug!("sys_munmap <= addr: {addr:#x}, length: {length:x}");
+    unmap_range(addr, length)
 }
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> StarryResult<isize> {

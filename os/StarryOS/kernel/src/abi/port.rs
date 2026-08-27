@@ -183,8 +183,8 @@ impl Mem for KernelHost {
         port_result(syscall::sys_mmap(addr, len, prot as u32, flags as u32, fd, offset as _))
     }
 
-    fn munmap(&self, addr: usize, len: usize) -> SysResult {
-        port_result(syscall::sys_munmap(addr, len))
+    fn unmap(&self, addr: usize, len: usize) -> SysResult {
+        port_result(syscall::unmap_range(addr, len))
     }
 
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult {

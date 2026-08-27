@@ -128,7 +128,9 @@ pub trait Mem: Sync {
         fd: i32,
         offset: usize,
     ) -> SysResult;
-    fn munmap(&self, addr: usize, len: usize) -> SysResult;
+    /// Unmap `[addr, addr+len)`. The length is rounded up to whole pages here,
+    /// since the page size is the host's to know.
+    fn unmap(&self, addr: usize, len: usize) -> SysResult;
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
     /// Advise usage of `[addr, addr+len)`. The host validates `advice`, since
     /// which hints it honours is its own property, as is page alignment.

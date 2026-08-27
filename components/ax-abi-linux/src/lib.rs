@@ -185,7 +185,7 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
             arg(5),
         ),
         #[cfg(feature = "mm")]
-        Sysno::munmap => host.mem()?.munmap(arg(0), arg(1)),
+        Sysno::munmap => sys_munmap(host.mem()?, arg(0), arg(1)),
         #[cfg(feature = "mm")]
         Sysno::mprotect => host.mem()?.mprotect(arg(0), arg(1), arg(2) as i32),
         #[cfg(feature = "mm")]
@@ -283,6 +283,16 @@ fn sys_pwrite64(
         return Err(ops::EINVAL);
     }
     files.pwrite(fd, ubuf, len, offset as u64)
+}
+
+/// `munmap(addr, len)`: a zero length is `EINVAL`, which is the ABI's rule
+/// rather than the host's.
+#[cfg(feature = "mm")]
+fn sys_munmap(mem: &dyn ops::Mem, addr: usize, len: usize) -> SysResult {
+    if len == 0 {
+        return Err(ops::EINVAL);
+    }
+    mem.unmap(addr, len)
 }
 
 /// `brk(addr)`: query with zero, otherwise move the break. Linux answers a
@@ -612,7 +622,7 @@ mod tests {
         fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
             Ok(0)
         }
-        fn munmap(&self, _a: usize, _l: usize) -> SysResult {
+        fn unmap(&self, _a: usize, _l: usize) -> SysResult {
             Ok(0)
         }
         fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
@@ -848,7 +858,7 @@ mod tests {
         fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
             Ok(0x1000)
         }
-        fn munmap(&self, _a: usize, _l: usize) -> SysResult {
+        fn unmap(&self, _a: usize, _l: usize) -> SysResult {
             Ok(0)
         }
         fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
