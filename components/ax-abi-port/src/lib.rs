@@ -134,7 +134,10 @@ pub trait Mem: Sync {
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
     /// Advise usage of `[addr, addr+len)`. The host validates `advice`, since
     /// which hints it honours is its own property, as is page alignment.
-    fn madvise(&self, addr: usize, len: usize, advice: i32) -> SysResult;
+    /// Apply `advice` to `[addr, addr+len)`. The caller has already checked the
+    /// advice is one its ABI defines; whether this host acts on it is its own
+    /// business.
+    fn advise(&self, addr: usize, len: usize, advice: i32) -> SysResult;
     /// Flush `[addr, addr+len)` of a file mapping. A domain validates `flags`.
     fn msync(&self, addr: usize, len: usize, flags: i32) -> SysResult;
 }

@@ -33,9 +33,10 @@ use ax_crate_interface::call_interface;
 use ops::{ENOSYS, Host, SysResult};
 use syscalls::Sysno;
 
-/// `O_CLOEXEC` (generic ABI, all four targets) - the only flag `dup3` accepts.
-#[cfg(feature = "fs")]
-const O_CLOEXEC: i32 = 0o2000000;
+/// The page size every supported target agrees on, which the ABI's alignment
+/// rules are written against.
+#[cfg(feature = "mm")]
+const PAGE_SIZE: usize = 4096;
 /// One `new_utsname` field width (arch-independent), and the packed struct length.
 #[cfg(feature = "system")]
 const UTS_FIELD: usize = 65;
@@ -44,12 +45,6 @@ const UTS_LEN: usize = 6 * UTS_FIELD;
 /// Nanoseconds per second, for packing `timespec`/`timeval`.
 #[cfg(feature = "time")]
 const NS_PER_SEC: u64 = 1_000_000_000;
-/// `CLOCK_REALTIME` - wall-clock time since the Unix epoch.
-#[cfg(feature = "time")]
-const CLOCK_REALTIME: i32 = 0;
-/// `CLOCK_MONOTONIC` - time since an arbitrary fixed point.
-#[cfg(feature = "time")]
-const CLOCK_MONOTONIC: i32 = 1;
 /// The kernel `sigset_t` the syscall ABI expects is exactly 8 bytes.
 #[cfg(feature = "signal")]
 const SIGSET_SIZE: usize = 8;
@@ -189,7 +184,7 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         #[cfg(feature = "mm")]
         Sysno::mprotect => host.mem()?.mprotect(arg(0), arg(1), arg(2) as i32),
         #[cfg(feature = "mm")]
-        Sysno::madvise => host.mem()?.madvise(arg(0), arg(1), arg(2) as i32),
+        Sysno::madvise => sys_madvise(host.mem()?, arg(0), arg(1), arg(2) as i32),
         #[cfg(feature = "mm")]
         Sysno::msync => sys_msync(host.mem()?, arg(0), arg(1), arg(2) as i32),
 
@@ -285,6 +280,28 @@ fn sys_pwrite64(
     files.pwrite(fd, ubuf, len, offset as u64)
 }
 
+/// `madvise(addr, len, advice)`: the advice must be one the ABI defines and the
+/// address page-aligned; a zero length is a no-op success.
+#[cfg(feature = "mm")]
+fn sys_madvise(mem: &dyn ops::Mem, addr: usize, len: usize, advice: i32) -> SysResult {
+    use linux_raw_sys::general::*;
+    match advice as u32 {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
+        | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
+        | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK
+        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE
+        | MADV_DONTNEED_LOCKED | MADV_COLLAPSE | MADV_HWPOISON | MADV_SOFT_OFFLINE => {}
+        _ => return Err(ops::EINVAL),
+    }
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(ops::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    mem.advise(addr, len, advice)
+}
+
 /// `munmap(addr, len)`: a zero length is `EINVAL`, which is the ABI's rule
 /// rather than the host's.
 #[cfg(feature = "mm")]
@@ -346,10 +363,14 @@ fn sys_dup2(files: &dyn ops::Files, oldfd: i32, newfd: i32) -> SysResult {
 /// `O_CLOEXEC`. The port performs the fd-table replacement.
 #[cfg(feature = "fs")]
 fn sys_dup3(files: &dyn ops::Files, oldfd: i32, newfd: i32, flags: i32) -> SysResult {
-    if oldfd == newfd || (flags & !O_CLOEXEC) != 0 {
+    if oldfd == newfd || (flags & !(linux_raw_sys::general::O_CLOEXEC as i32)) != 0 {
         return Err(ops::EINVAL);
     }
-    files.dup_onto(oldfd, newfd, flags & O_CLOEXEC != 0)
+    files.dup_onto(
+        oldfd,
+        newfd,
+        flags & linux_raw_sys::general::O_CLOEXEC as i32 != 0,
+    )
 }
 
 /// `msync(addr, len, flags)`: reject unknown flag bits and the mutually exclusive
@@ -414,8 +435,8 @@ fn sys_clock_gettime(
     ts: usize,
 ) -> Option<SysResult> {
     let ns = match clockid {
-        CLOCK_REALTIME => clock.wall_ns(),
-        CLOCK_MONOTONIC => clock.monotonic_ns(),
+        c if c == linux_raw_sys::general::CLOCK_REALTIME as i32 => clock.wall_ns(),
+        c if c == linux_raw_sys::general::CLOCK_MONOTONIC as i32 => clock.monotonic_ns(),
         _ => return None,
     };
     let packed = pack_time_pair((ns / NS_PER_SEC) as i64, (ns % NS_PER_SEC) as i64);
@@ -426,7 +447,10 @@ fn sys_clock_gettime(
 /// nanosecond-resolution; a null `res` is a valid clock-liveness query.
 #[cfg(feature = "time")]
 fn sys_clock_getres(platform: &dyn ops::Platform, clockid: i32, res: usize) -> Option<SysResult> {
-    if !matches!(clockid, CLOCK_REALTIME | CLOCK_MONOTONIC) {
+    if !matches!(
+        clockid as u32,
+        linux_raw_sys::general::CLOCK_REALTIME | linux_raw_sys::general::CLOCK_MONOTONIC
+    ) {
         return None;
     }
     if res == 0 {
@@ -628,7 +652,7 @@ mod tests {
         fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
             Ok(0)
         }
-        fn madvise(&self, _a: usize, _l: usize, _adv: i32) -> SysResult {
+        fn advise(&self, _a: usize, _l: usize, _adv: i32) -> SysResult {
             Ok(0)
         }
         fn msync(&self, _a: usize, _l: usize, _f: i32) -> SysResult {
@@ -864,7 +888,7 @@ mod tests {
         fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
             Ok(0)
         }
-        fn madvise(&self, _a: usize, _l: usize, advice: i32) -> SysResult {
+        fn advise(&self, _a: usize, _l: usize, advice: i32) -> SysResult {
             Ok(advice as isize) // echo so the test sees the delegated advice
         }
         fn msync(&self, _a: usize, _l: usize, flags: i32) -> SysResult {
@@ -1044,7 +1068,10 @@ mod tests {
         let host = Mock::default();
         let r = dispatch(
             &host,
-            &Trap::new(Sysno::dup3, [3, 7, O_CLOEXEC as usize, 0, 0, 0]),
+            &Trap::new(
+                Sysno::dup3,
+                [3, 7, linux_raw_sys::general::O_CLOEXEC as usize, 0, 0, 0],
+            ),
         );
         assert_eq!(r, Ok(7));
         assert_eq!(*host.duped.borrow(), Some((3, 7, true)));
@@ -1306,7 +1333,14 @@ mod tests {
             &host,
             &Trap::new(
                 Sysno::clock_gettime,
-                [CLOCK_MONOTONIC as usize, 0, 0, 0, 0, 0],
+                [
+                    linux_raw_sys::general::CLOCK_MONOTONIC as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
             ),
         );
         assert_eq!(r, Ok(0));
@@ -1332,7 +1366,14 @@ mod tests {
             &host,
             &Trap::new(
                 Sysno::clock_getres,
-                [CLOCK_MONOTONIC as usize, 8, 0, 0, 0, 0],
+                [
+                    linux_raw_sys::general::CLOCK_MONOTONIC as usize,
+                    8,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
             ),
         );
         assert_eq!(r, Ok(0));
@@ -1349,7 +1390,14 @@ mod tests {
             &host,
             &Trap::new(
                 Sysno::clock_getres,
-                [CLOCK_REALTIME as usize, 0, 0, 0, 0, 0],
+                [
+                    linux_raw_sys::general::CLOCK_REALTIME as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
             ),
         );
         assert_eq!(r, Ok(0));
