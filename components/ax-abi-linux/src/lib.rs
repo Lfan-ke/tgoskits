@@ -105,6 +105,9 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         Sysno::readv => sys_readv(host, arg(0) as i32, arg(1), arg(2) as i32),
         Sysno::pread64 => sys_pread64(host, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
         Sysno::pwrite64 => sys_pwrite64(host, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
+        Sysno::fsync => host.files().fsync(arg(0) as i32, false),
+        Sysno::fdatasync => host.files().fsync(arg(0) as i32, true),
+        Sysno::ftruncate => sys_ftruncate(host, arg(0) as i32, arg(1) as i64),
 
         // Process and thread control.
         Sysno::getpid => Ok(host.tasks().getpid() as isize),
@@ -303,6 +306,15 @@ fn sys_pwrite64(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize, offset: 
         }
     }
     Ok(done as isize)
+}
+
+/// `ftruncate(fd, len)`: resize `fd`. A negative length is `EINVAL`; the port
+/// zero-extends the file on growth.
+fn sys_ftruncate(host: &dyn LinuxHost, fd: i32, len: i64) -> SysResult {
+    if len < 0 {
+        return Err(EINVAL);
+    }
+    host.files().ftruncate(fd, len as u64)
 }
 
 /// `dup3(oldfd, newfd, flags)`: duplicate onto a specific fd like `dup2`, but
@@ -543,6 +555,12 @@ mod tests {
         fn dup2(&self, _oldfd: i32, newfd: i32, _cloexec: bool) -> SysResult {
             Ok(newfd as isize)
         }
+        fn fsync(&self, _fd: i32, _datasync: bool) -> SysResult {
+            Ok(0)
+        }
+        fn ftruncate(&self, _fd: i32, _len: u64) -> SysResult {
+            Ok(0)
+        }
     }
     impl Mem for FixedHost {
         fn brk(&self, a: usize) -> SysResult {
@@ -656,6 +674,7 @@ mod tests {
         mask: RefCell<u64>,
         killed: RefCell<Option<(i32, i32)>>,
         duped: RefCell<Option<(i32, i32, bool)>>,
+        synced: RefCell<Option<bool>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Host {}
@@ -716,6 +735,14 @@ mod tests {
         fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
             *self.duped.borrow_mut() = Some((oldfd, newfd, cloexec));
             Ok(newfd as isize)
+        }
+        fn fsync(&self, _fd: i32, datasync: bool) -> SysResult {
+            *self.synced.borrow_mut() = Some(datasync);
+            Ok(0)
+        }
+        fn ftruncate(&self, _fd: i32, len: u64) -> SysResult {
+            self.file.borrow_mut().resize(len as usize, 0);
+            Ok(0)
         }
     }
     impl Tasks for Host {
@@ -1003,6 +1030,49 @@ mod tests {
         // Field 4 (machine) sits at offset 4*65 and reads "riscv64".
         assert_eq!(&mem[4 * 65..4 * 65 + 7], b"riscv64");
         assert_eq!(mem[4 * 65 + 7], 0);
+    }
+
+    #[test]
+    fn fsync_and_fdatasync_distinguish_datasync() {
+        let host = Host::default();
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::fsync, [3, 0, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(*host.synced.borrow(), Some(false));
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::fdatasync, [3, 0, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(*host.synced.borrow(), Some(true));
+    }
+
+    #[test]
+    fn ftruncate_grows_and_shrinks() {
+        let host = Host::default();
+        *host.file.borrow_mut() = vec![1, 2, 3, 4];
+        // Grow to 6: the new tail is zero-filled.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::ftruncate, [3, 6, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(&*host.file.borrow(), &[1, 2, 3, 4, 0, 0]);
+        // Shrink to 2.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::ftruncate, [3, 2, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(&*host.file.borrow(), &[1, 2]);
+    }
+
+    #[test]
+    fn ftruncate_rejects_negative_length() {
+        let host = Host::default();
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::ftruncate, [3, (-1i64) as usize, 0, 0, 0, 0]),
+        );
+        assert_eq!(r, Err(EINVAL));
     }
 
     #[test]
