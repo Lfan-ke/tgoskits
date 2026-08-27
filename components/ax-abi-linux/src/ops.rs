@@ -81,6 +81,11 @@ pub trait Files: Sync {
     /// the copy. Equal fds are a valid no-op for `dup2`; the domain forbids them
     /// for `dup3` before calling here.
     fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult;
+    /// `fsync`/`fdatasync` - flush `fd` to backing storage. `datasync` may skip
+    /// metadata not needed for data integrity.
+    fn fsync(&self, fd: i32, datasync: bool) -> SysResult;
+    /// `ftruncate` - set the size of `fd` to `len`, zero-extending on growth.
+    fn ftruncate(&self, fd: i32, len: u64) -> SysResult;
 }
 
 /// Address-space service.
