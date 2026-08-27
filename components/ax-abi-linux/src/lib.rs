@@ -35,6 +35,10 @@ pub trait CurrentHost {
 
 /// Bounce-buffer size for user-memory copies; larger transfers loop.
 const CHUNK: usize = 256;
+/// Maximum `iovcnt` for scatter/gather I/O (`UIO_MAXIOV`).
+const IOV_MAX: usize = 1024;
+/// Size of one 64-bit `struct iovec` (an 8-byte base pointer and 8-byte length).
+const IOVEC_SIZE: usize = 16;
 /// Nanoseconds per second, for packing `timespec`/`timeval`.
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// `CLOCK_REALTIME` - wall-clock time since the Unix epoch.
@@ -90,6 +94,8 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         Sysno::lseek => host
             .files()
             .lseek(arg(0) as i32, arg(1) as isize, arg(2) as i32),
+        Sysno::writev => sys_writev(host, arg(0) as i32, arg(1), arg(2) as i32),
+        Sysno::readv => sys_readv(host, arg(0) as i32, arg(1), arg(2) as i32),
 
         // Process and thread control.
         Sysno::getpid => Ok(host.tasks().getpid() as isize),
@@ -169,6 +175,76 @@ fn sys_read(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize) -> SysResult
         }
     }
     Ok(done as isize)
+}
+
+/// `writev(fd, iov, iovcnt)`: gather-write. The domain reads the `iovec` array
+/// from user memory itself, then writes each segment through Files by reusing
+/// [`sys_write`], honoring a short write. The array is validated up front (count
+/// and the summed-length overflow Linux checks), so a bad `iov` faults before
+/// any data is written.
+fn sys_writev(host: &dyn LinuxHost, fd: i32, iov: usize, iovcnt: i32) -> SysResult {
+    let count = check_iovcnt(iovcnt)?;
+    total_iov_len(host, iov, count)?;
+    let mut done = 0;
+    for i in 0..count {
+        let (base, len) = read_iovec(host, iov, i)?;
+        let written = sys_write(host, fd, base, len)? as usize;
+        done += written;
+        if written < len {
+            break;
+        }
+    }
+    Ok(done as isize)
+}
+
+/// `readv(fd, iov, iovcnt)`: scatter-read. Reads into each user segment through
+/// [`sys_read`], stopping at EOF or a short read, after validating the array.
+fn sys_readv(host: &dyn LinuxHost, fd: i32, iov: usize, iovcnt: i32) -> SysResult {
+    let count = check_iovcnt(iovcnt)?;
+    total_iov_len(host, iov, count)?;
+    let mut done = 0;
+    for i in 0..count {
+        let (base, len) = read_iovec(host, iov, i)?;
+        let got = sys_read(host, fd, base, len)? as usize;
+        done += got;
+        if got < len {
+            break;
+        }
+    }
+    Ok(done as isize)
+}
+
+/// Validate an `iovcnt`: Linux rejects a negative count or one past `IOV_MAX`.
+fn check_iovcnt(iovcnt: i32) -> Result<usize, i32> {
+    if iovcnt < 0 || iovcnt as usize > IOV_MAX {
+        return Err(EINVAL);
+    }
+    Ok(iovcnt as usize)
+}
+
+/// Read `iovec[i]` from the user array at `iov`, returning `(base, len)`.
+fn read_iovec(host: &dyn LinuxHost, iov: usize, i: usize) -> Result<(usize, usize), i32> {
+    let mut entry = [0u8; IOVEC_SIZE];
+    host.platform()
+        .read_user(iov + i * IOVEC_SIZE, &mut entry)?;
+    let base = usize::from_le_bytes(entry[..8].try_into().unwrap());
+    let len = usize::from_le_bytes(entry[8..].try_into().unwrap());
+    Ok((base, len))
+}
+
+/// Sum the segment lengths, faulting if the array is unreadable and returning
+/// `EINVAL` if the total would overflow `ssize_t` - the up-front import Linux
+/// does before transferring any bytes.
+fn total_iov_len(host: &dyn LinuxHost, iov: usize, count: usize) -> SysResult {
+    let mut total: usize = 0;
+    for i in 0..count {
+        let (_, len) = read_iovec(host, iov, i)?;
+        total = total
+            .checked_add(len)
+            .filter(|&t| t <= isize::MAX as usize)
+            .ok_or(EINVAL)?;
+    }
+    Ok(total as isize)
 }
 
 /// `getrandom(ubuf, len)`: fill user memory from the Random port in bounded
@@ -634,6 +710,63 @@ mod tests {
         *host.umem.borrow_mut() = vec![1, 2];
         let r = dispatch(&host, &Trap::new(Sysno::write, [1, 0, 8, 0, 0, 0]));
         assert_eq!(r, Err(EFAULT));
+    }
+
+    // Lay a 64-bit iovec { base, len } at `entry` (index) in `mem`.
+    fn put_iovec(mem: &mut [u8], index: usize, base: usize, len: usize) {
+        let off = index * 16;
+        mem[off..off + 8].copy_from_slice(&base.to_le_bytes());
+        mem[off + 8..off + 16].copy_from_slice(&len.to_le_bytes());
+    }
+
+    #[test]
+    fn writev_gathers_segments() {
+        let host = Host::default();
+        let mut mem = vec![0u8; 0x100];
+        put_iovec(&mut mem, 0, 0x40, 3);
+        put_iovec(&mut mem, 1, 0x80, 2);
+        mem[0x40..0x43].copy_from_slice(b"abc");
+        mem[0x80..0x82].copy_from_slice(b"de");
+        *host.umem.borrow_mut() = mem;
+        // writev(fd=1, iov=0, iovcnt=2): the domain reads the iovec array itself
+        // and gathers both segments into Files in order - no passthrough.
+        let r = dispatch(&host, &Trap::new(Sysno::writev, [1, 0, 2, 0, 0, 0]));
+        assert_eq!(r, Ok(5));
+        assert_eq!(&*host.written.borrow(), b"abcde");
+    }
+
+    #[test]
+    fn readv_scatters_into_segments() {
+        let host = Host::default();
+        let mut mem = vec![0u8; 0x100];
+        put_iovec(&mut mem, 0, 0x40, 2);
+        put_iovec(&mut mem, 1, 0x80, 3);
+        *host.umem.borrow_mut() = mem;
+        *host.to_read.borrow_mut() = vec![1, 2, 3, 4, 5];
+        let r = dispatch(&host, &Trap::new(Sysno::readv, [0, 0, 2, 0, 0, 0]));
+        assert_eq!(r, Ok(5));
+        assert_eq!(&host.umem.borrow()[0x40..0x42], &[1, 2]);
+        assert_eq!(&host.umem.borrow()[0x80..0x83], &[3, 4, 5]);
+    }
+
+    #[test]
+    fn writev_rejects_bad_iovcnt() {
+        let host = Host::default();
+        // IOV_MAX + 1 segments is refused before any transfer.
+        let r = dispatch(&host, &Trap::new(Sysno::writev, [1, 0, 1025, 0, 0, 0]));
+        assert_eq!(r, Err(EINVAL));
+        assert!(host.written.borrow().is_empty());
+    }
+
+    #[test]
+    fn writev_faults_on_bad_iov_before_writing() {
+        let host = Host::default();
+        // The iovec array itself is past the end of user memory: writev must
+        // fault during the up-front import, before any segment is written.
+        *host.umem.borrow_mut() = vec![0u8; 8];
+        let r = dispatch(&host, &Trap::new(Sysno::writev, [1, 0, 2, 0, 0, 0]));
+        assert_eq!(r, Err(EFAULT));
+        assert!(host.written.borrow().is_empty());
     }
 
     #[test]
