@@ -742,6 +742,7 @@ dependencies = [
  "ax-abi-port",
  "ax-binfmt",
  "ax-crate-interface",
+ "linux-raw-sys 0.12.1",
  "syscalls",
 ]
 

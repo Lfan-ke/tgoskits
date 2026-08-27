@@ -191,7 +191,7 @@ impl Mem for KernelHost {
         port_result(syscall::sys_mprotect(addr, len, prot as u32))
     }
 
-    fn madvise(&self, addr: usize, len: usize, advice: i32) -> SysResult {
+    fn advise(&self, addr: usize, len: usize, advice: i32) -> SysResult {
         port_result(syscall::sys_madvise(addr, len, advice))
     }
 

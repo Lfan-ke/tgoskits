@@ -331,6 +331,7 @@ toml = { version = "1", default-features = false }
 dma-api = { version = "0.10", path = "memory/dma-api" }
 mmio-api = { version = "0.3", path = "memory/mmio-api" }
 cvi-vdec-uapi = { version = "0.1", path = "drivers/interface/cvi-vdec-uapi" }
+linux-raw-sys = { version = "0.12", default-features = false }
 lock_api = { version = "0.4", default-features = false }
 log = "0.4"
 atomic-waker = { version = "1.1", default-features = false }
