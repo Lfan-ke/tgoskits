@@ -1,16 +1,17 @@
 [package]
 name = "ax-abi"
 version = "0.1.0"
-repository = "https://github.com/rcore-os/tgoskits"
+repository.workspace = true
 edition.workspace = true
-authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+authors.workspace = true
 description = "Umbrella crate for ArceOS personalities: pick Linux/Windows/Darwin ABIs by feature and dispatch a binary to the matching one."
 keywords = ["personality", "abi", "windows", "no-std"]
 categories = ["no-std", "os"]
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]
 ax-binfmt = { workspace = true }
+ax-abi-port = { workspace = true }
 ax-abi-windows = { workspace = true, optional = true }
 ax-abi-darwin = { workspace = true, optional = true }
 ax-abi-path = { workspace = true, optional = true }
