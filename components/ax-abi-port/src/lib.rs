@@ -36,6 +36,8 @@ pub const ENOSYS: i32 = 38;
 pub const EFAULT: i32 = 14;
 /// `EINVAL` - an argument was invalid.
 pub const EINVAL: i32 = 22;
+/// `EBADF` - not an open descriptor.
+pub const EBADF: i32 = 9;
 
 /// The minimal arch/memory platform, à la gVisor's `Platform`: move bytes across
 /// the user/kernel boundary. Everything a personality needs from the CPU/MMU
@@ -60,6 +62,18 @@ pub trait Tasks: Sync {
     fn exit_group(&self, code: i32) -> SysResult;
 }
 
+/// Where a seek measures from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "fs")]
+pub enum SeekFrom {
+    /// The start of the file.
+    Start,
+    /// The current position.
+    Current,
+    /// The end of the file.
+    End,
+}
+
 /// File-descriptor service.
 ///
 /// Bulk transfers name a user range rather than a kernel buffer, and each does
@@ -77,16 +91,19 @@ pub trait Files: Sync {
     fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
     fn close(&self, fd: i32) -> SysResult;
     fn dup(&self, fd: i32) -> SysResult;
-    fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult;
+    fn seek(&self, fd: i32, offset: isize, from: SeekFrom) -> SysResult;
+    /// Report whether `fd` is open, without touching it.
+    fn validate(&self, fd: i32) -> SysResult;
     /// Read from `fd` at absolute `offset` into the user range at `uaddr`,
     /// leaving the file position unchanged.
     fn pread(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult;
     /// Write the user range at `uaddr` to `fd` at absolute `offset`, leaving the
     /// file position unchanged.
     fn pwrite(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult;
-    /// Duplicate `oldfd` onto the specific `newfd`, closing `newfd` first if
-    /// open, and return `newfd`. `cloexec` sets close-on-exec on the copy.
-    fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult;
+    /// Duplicate `oldfd` onto `newfd`, closing what `newfd` held, and return
+    /// `newfd`. The two are never equal here: what that means is the ABI's call,
+    /// so a domain settles it before asking.
+    fn dup_onto(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult;
     /// Flush `fd` to backing storage. `datasync` may skip metadata not needed
     /// for data integrity.
     fn fsync(&self, fd: i32, datasync: bool) -> SysResult;

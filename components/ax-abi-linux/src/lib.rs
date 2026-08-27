@@ -137,13 +137,11 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         Sysno::dup => host.files()?.dup(arg(0) as i32),
         // Only the x86_64 table carries dup2; the generic ABI has dup3 alone.
         #[cfg(all(feature = "fs", target_arch = "x86_64"))]
-        Sysno::dup2 => host.files()?.dup2(arg(0) as i32, arg(1) as i32, false),
+        Sysno::dup2 => sys_dup2(host.files()?, arg(0) as i32, arg(1) as i32),
         #[cfg(feature = "fs")]
         Sysno::dup3 => sys_dup3(host.files()?, arg(0) as i32, arg(1) as i32, arg(2) as i32),
         #[cfg(feature = "fs")]
-        Sysno::lseek => host
-            .files()?
-            .lseek(arg(0) as i32, arg(1) as isize, arg(2) as i32),
+        Sysno::lseek => sys_lseek(host.files()?, arg(0) as i32, arg(1) as isize, arg(2) as i32),
         #[cfg(feature = "fs")]
         Sysno::pread64 => sys_pread64(host.files()?, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
         #[cfg(feature = "fs")]
@@ -297,6 +295,31 @@ fn sys_ftruncate(files: &dyn ops::Files, fd: i32, len: i64) -> SysResult {
     files.ftruncate(fd, len as u64)
 }
 
+/// `lseek(fd, offset, whence)`: translate the ABI's `whence` and refuse a
+/// negative absolute offset, then seek through the port.
+#[cfg(feature = "fs")]
+fn sys_lseek(files: &dyn ops::Files, fd: i32, offset: isize, whence: i32) -> SysResult {
+    let from = match whence {
+        0 if offset < 0 => return Err(ops::EINVAL),
+        0 => ops::SeekFrom::Start,
+        1 => ops::SeekFrom::Current,
+        2 => ops::SeekFrom::End,
+        _ => return Err(ops::EINVAL),
+    };
+    files.seek(fd, offset, from)
+}
+
+/// `dup2(oldfd, newfd)`: duplicating an fd onto itself is a no-op that still
+/// checks the fd, which is where it parts from `dup3`.
+#[cfg(feature = "fs")]
+fn sys_dup2(files: &dyn ops::Files, oldfd: i32, newfd: i32) -> SysResult {
+    if oldfd == newfd {
+        files.validate(oldfd)?;
+        return Ok(newfd as isize);
+    }
+    files.dup_onto(oldfd, newfd, false)
+}
+
 /// `dup3(oldfd, newfd, flags)`: duplicate onto a specific fd like `dup2`, but
 /// equal fds are `EINVAL` (not the `dup2` no-op) and the only accepted flag is
 /// `O_CLOEXEC`. The port performs the fd-table replacement.
@@ -305,7 +328,7 @@ fn sys_dup3(files: &dyn ops::Files, oldfd: i32, newfd: i32, flags: i32) -> SysRe
     if oldfd == newfd || (flags & !O_CLOEXEC) != 0 {
         return Err(ops::EINVAL);
     }
-    files.dup2(oldfd, newfd, flags & O_CLOEXEC != 0)
+    files.dup_onto(oldfd, newfd, flags & O_CLOEXEC != 0)
 }
 
 /// `msync(addr, len, flags)`: reject unknown flag bits and the mutually exclusive
@@ -468,9 +491,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{
-            Clock, Creds, CurrentHost, EFAULT, Files, Mem, Platform, Random, Signals, System, Tasks,
-        },
+        ops::{Clock, Creds, CurrentHost, EFAULT, Files, Mem, Platform, Signals, System, Tasks},
         *,
     };
 
@@ -548,8 +569,11 @@ mod tests {
         fn dup(&self, _fd: i32) -> SysResult {
             Ok(0)
         }
-        fn lseek(&self, _fd: i32, o: isize, _w: i32) -> SysResult {
+        fn seek(&self, _fd: i32, o: isize, _from: ops::SeekFrom) -> SysResult {
             Ok(o)
+        }
+        fn validate(&self, _fd: i32) -> SysResult {
+            Ok(0)
         }
         fn pread(&self, _fd: i32, _u: usize, _len: usize, _o: u64) -> SysResult {
             Ok(0)
@@ -557,7 +581,7 @@ mod tests {
         fn pwrite(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> SysResult {
             Ok(len as isize)
         }
-        fn dup2(&self, _oldfd: i32, newfd: i32, _cloexec: bool) -> SysResult {
+        fn dup_onto(&self, _oldfd: i32, newfd: i32, _cloexec: bool) -> SysResult {
             Ok(newfd as isize)
         }
         fn fsync(&self, _fd: i32, _datasync: bool) -> SysResult {
@@ -609,11 +633,6 @@ mod tests {
             Ok(0)
         }
     }
-    impl Random for FixedHost {
-        fn fill(&self, b: &mut [u8]) -> SysResult {
-            Ok(b.len() as isize)
-        }
-    }
     impl System for FixedHost {
         fn uname(&self, put: &mut dyn FnMut(ops::UtsField, &str)) {
             put(ops::UtsField::SysName, "Linux");
@@ -649,9 +668,6 @@ mod tests {
             Some(self)
         }
         fn clock(&self) -> Option<&dyn Clock> {
-            Some(self)
-        }
-        fn random(&self) -> Option<&dyn Random> {
             Some(self)
         }
         fn system(&self) -> Option<&dyn System> {
@@ -738,8 +754,11 @@ mod tests {
         fn dup(&self, _fd: i32) -> SysResult {
             Ok(9)
         }
-        fn lseek(&self, _fd: i32, offset: isize, _whence: i32) -> SysResult {
+        fn seek(&self, _fd: i32, offset: isize, _from: ops::SeekFrom) -> SysResult {
             Ok(offset)
+        }
+        fn validate(&self, fd: i32) -> SysResult {
+            if fd < 0 { Err(ops::EBADF) } else { Ok(0) }
         }
         fn pread(&self, _fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
             let bytes: Vec<u8> = {
@@ -761,7 +780,7 @@ mod tests {
             file[offset as usize..end].copy_from_slice(&buf);
             Ok(len as isize)
         }
-        fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
+        fn dup_onto(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
             *self.duped.borrow_mut() = Some((oldfd, newfd, cloexec));
             Ok(newfd as isize)
         }
@@ -841,12 +860,6 @@ mod tests {
             Ok(old)
         }
     }
-    impl Random for Mock {
-        fn fill(&self, buf: &mut [u8]) -> SysResult {
-            buf.fill(0xAB); // deterministic for the test
-            Ok(buf.len() as isize)
-        }
-    }
     impl System for Mock {
         fn uname(&self, put: &mut dyn FnMut(ops::UtsField, &str)) {
             put(ops::UtsField::SysName, "Linux");
@@ -894,9 +907,6 @@ mod tests {
             Some(self)
         }
         fn clock(&self) -> Option<&dyn Clock> {
-            Some(self)
-        }
-        fn random(&self) -> Option<&dyn Random> {
             Some(self)
         }
         fn system(&self) -> Option<&dyn System> {
@@ -975,6 +985,25 @@ mod tests {
         let r = dispatch(&host, &Trap::new(Sysno::dup2, [3, 7, 0, 0, 0, 0]));
         assert_eq!(r, Ok(7));
         assert_eq!(*host.duped.borrow(), Some((3, 7, false)));
+    }
+
+    #[test]
+    fn dup2_onto_itself_is_a_checked_no_op() {
+        let host = Mock::default();
+        // Same fd: dup2 keeps it and reports it, where dup3 refuses.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::dup2, [5, 5, 0, 0, 0, 0])),
+            Ok(5)
+        );
+        assert!(host.duped.borrow().is_none());
+        // A closed fd still fails the check.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::dup2, [-1i32 as usize, -1i32 as usize, 0, 0, 0, 0])
+            ),
+            Err(ops::EBADF)
+        );
     }
 
     #[test]

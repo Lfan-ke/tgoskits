@@ -759,21 +759,16 @@ bitflags::bitflags! {
     }
 }
 
-pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> StarryResult<isize> {
-    let flags = Dup3Flags::from_bits(flags).ok_or(StarryError::InvalidInput)?;
-    debug!("sys_dup3 <= old_fd: {old_fd}, new_fd: {new_fd}, flags: {flags:?}");
-
-    if old_fd == new_fd {
-        return Err(StarryError::InvalidInput);
-    }
-
+/// Put what `old_fd` holds onto `new_fd`, closing what was there. The caller
+/// has already settled what equal descriptors mean.
+pub(crate) fn dup_onto(old_fd: c_int, new_fd: c_int, cloexec: bool) -> StarryResult<isize> {
     let current_fd_table = crate::file::current_fd_table();
     let mut fd_table = current_fd_table.write();
     let mut f = fd_table
         .get(old_fd as _)
         .cloned()
         .ok_or(StarryError::BadFileDescriptor)?;
-    f.cloexec = flags.contains(Dup3Flags::O_CLOEXEC);
+    f.cloexec = cloexec;
 
     // Linux returns EBUSY when dup2/dup3 races an fd allocation that has
     // reserved this number but has not installed its file yet.
@@ -795,6 +790,16 @@ pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> StarryResult<isiz
     }
 
     Ok(new_fd as _)
+}
+
+pub fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> StarryResult<isize> {
+    let flags = Dup3Flags::from_bits(flags).ok_or(StarryError::InvalidInput)?;
+    debug!("sys_dup3 <= old_fd: {old_fd}, new_fd: {new_fd}, flags: {flags:?}");
+
+    if old_fd == new_fd {
+        return Err(StarryError::InvalidInput);
+    }
+    dup_onto(old_fd, new_fd, flags.contains(Dup3Flags::O_CLOEXEC))
 }
 
 pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> StarryResult<isize> {

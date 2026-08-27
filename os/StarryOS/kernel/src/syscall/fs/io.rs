@@ -139,8 +139,8 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> StarryResult<isiz
 /// Write data to the file indicated by `fd`.
 ///
 /// Return the written size if success.
-pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> StarryResult<isize> {
-    debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
+/// Write the user range `[buf, buf+len)` to `fd`, in one underlying write.
+pub(crate) fn write_file(fd: i32, buf: *const u8, len: usize) -> StarryResult<isize> {
     let file_like = get_file_like(fd)?;
     file_like.validate_write_len(len)?;
     // `copy_user_read_buf` validates the buffer itself (via `get_as_slice`), so a
@@ -150,9 +150,14 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> StarryResult<isize> {
     // (EPERM), matching Linux `generic_perform_write` (prefault precedes the
     // shmem seal check) and `sys_writev`, so a sealed memfd + bad buffer still
     // reports EFAULT, not EPERM.
-    let data = copy_user_read_buf(buf.cast_const(), len)?;
+    let data = copy_user_read_buf(buf, len)?;
     memfd_checks_before_stream_write(&file_like, len as u64)?;
     Ok(file_like.write(&mut data.as_slice())? as _)
+}
+
+pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> StarryResult<isize> {
+    debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
+    write_file(fd, buf.cast_const(), len)
 }
 
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> StarryResult<isize> {
@@ -168,19 +173,8 @@ pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> StarryResult<isi
     file_like.write(&mut data.as_slice()).map(|n| n as _)
 }
 
-pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> StarryResult<isize> {
-    debug!("sys_lseek <= {fd} {offset} {whence}");
-    let pos = match whence {
-        0 => {
-            if offset < 0 {
-                return Err(StarryError::InvalidInput);
-            }
-            SeekFrom::Start(offset as _)
-        }
-        1 => SeekFrom::Current(offset as _),
-        2 => SeekFrom::End(offset as _),
-        _ => return Err(StarryError::InvalidInput),
-    };
+/// Seek `fd` to `pos`, whichever kind of file it holds.
+pub(crate) fn seek_file(fd: c_int, pos: SeekFrom) -> StarryResult<isize> {
     let any_file = get_file_like(fd)?;
 
     // File::from_fd transparently unwraps Memfd onto its backing File, so
@@ -214,6 +208,22 @@ pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> StarryResu
     }
 
     Err(StarryError::from(Errno::ESPIPE))
+}
+
+pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> StarryResult<isize> {
+    debug!("sys_lseek <= {fd} {offset} {whence}");
+    let pos = match whence {
+        0 => {
+            if offset < 0 {
+                return Err(StarryError::InvalidInput);
+            }
+            SeekFrom::Start(offset as _)
+        }
+        1 => SeekFrom::Current(offset as _),
+        2 => SeekFrom::End(offset as _),
+        _ => return Err(StarryError::InvalidInput),
+    };
+    seek_file(fd, pos)
 }
 
 pub fn sys_truncate(path: *const c_char, length: __kernel_off_t) -> StarryResult<isize> {
@@ -253,13 +263,10 @@ pub fn sys_truncate(path: *const c_char, length: __kernel_off_t) -> StarryResult
     Ok(0)
 }
 
-pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> StarryResult<isize> {
-    debug!("sys_ftruncate <= {fd} {length}");
-    if length < 0 {
-        return Err(StarryError::InvalidInput);
-    }
+/// Resize `fd`, honouring memfd seals.
+pub(crate) fn truncate_file(fd: c_int, len: u64) -> StarryResult<isize> {
     if let Ok(memfd) = Memfd::from_fd(fd) {
-        memfd.set_len_sealed(length as u64)?;
+        memfd.set_len_sealed(len)?;
         return Ok(0);
     }
     let f = File::from_fd(fd).map_err(|e| {
@@ -269,11 +276,19 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> StarryResult<isize> {
             e
         }
     })?;
-    if (length as u64) > u32::MAX as u64 * 4096 {
+    if len > u32::MAX as u64 * 4096 {
         return Err(StarryError::from(Errno::EFBIG));
     }
-    f.inner().access(FileFlags::WRITE)?.set_len(length as _)?;
+    f.inner().access(FileFlags::WRITE)?.set_len(len as _)?;
     Ok(0)
+}
+
+pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> StarryResult<isize> {
+    debug!("sys_ftruncate <= {fd} {length}");
+    if length < 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    truncate_file(fd, length as u64)
 }
 
 pub fn sys_fallocate(
@@ -354,42 +369,35 @@ pub fn sys_fallocate(
     Ok(0)
 }
 
-pub fn sys_fsync(fd: c_int) -> StarryResult<isize> {
-    debug!("sys_fsync <= {fd}");
+/// Flush `fd` to backing storage. `datasync` skips metadata that data
+/// integrity does not need.
+pub(crate) fn sync_file(fd: c_int, datasync: bool) -> StarryResult<isize> {
     let any_file = get_file_like(fd)?;
     if let Ok(memfd) = any_file.clone().downcast_arc::<Memfd>() {
-        // Linux treats memfd as a regular file for fsync: a successful
-        // no-op (the contents are already in memory). Forward to the
-        // inner File so any future backing-store changes still hook
-        // through one path.
-        memfd.inner().inner().sync(false)?;
+        // Linux treats memfd as a regular file here: a successful no-op, since
+        // the contents are already in memory. Route it through the inner File
+        // so a future backing store still hooks one path.
+        memfd.inner().inner().sync(datasync)?;
         return Ok(0);
     }
     if let Ok(f) = any_file.clone().downcast_arc::<File>() {
-        f.inner().sync(false)?;
+        f.inner().sync(datasync)?;
         return Ok(0);
     } else if let Ok(d) = any_file.downcast_arc::<Directory>() {
-        d.inner().sync(false)?;
+        d.inner().sync(datasync)?;
         return Ok(0);
     }
     Err(StarryError::from(Errno::EINVAL))
 }
 
+pub fn sys_fsync(fd: c_int) -> StarryResult<isize> {
+    debug!("sys_fsync <= {fd}");
+    sync_file(fd, false)
+}
+
 pub fn sys_fdatasync(fd: c_int) -> StarryResult<isize> {
     debug!("sys_fdatasync <= {fd}");
-    let any_file = get_file_like(fd)?;
-    if let Ok(memfd) = any_file.clone().downcast_arc::<Memfd>() {
-        memfd.inner().inner().sync(true)?;
-        return Ok(0);
-    }
-    if let Ok(f) = any_file.clone().downcast_arc::<File>() {
-        f.inner().sync(true)?;
-        return Ok(0);
-    } else if let Ok(d) = any_file.downcast_arc::<Directory>() {
-        d.inner().sync(true)?;
-        return Ok(0);
-    }
-    Err(StarryError::from(Errno::EINVAL))
+    sync_file(fd, true)
 }
 
 pub fn sys_sync_file_range(fd: c_int, offset: i64, nbytes: i64, flags: u32) -> StarryResult<isize> {
