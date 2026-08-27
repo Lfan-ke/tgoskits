@@ -1,12 +1,12 @@
 [package]
 name = "ax-abi-driver"
 version = "0.1.0"
-repository = "https://github.com/rcore-os/tgoskits"
+repository.workspace = true
 edition.workspace = true
-authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+authors.workspace = true
 description = "Driver ABI compatibility for foreign personalities: decode NT device control codes and route device I/O onto ax-driver."
 keywords = ["driver", "ioctl", "windows", "no-std"]
 categories = ["no-std", "os"]
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]

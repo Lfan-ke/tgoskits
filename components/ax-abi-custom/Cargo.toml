@@ -1,13 +1,13 @@
 [package]
 name = "ax-abi-custom"
 version = "0.1.0"
-repository = "https://github.com/rcore-os/tgoskits"
+repository.workspace = true
 edition.workspace = true
-authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+authors.workspace = true
 description = "User-extensible custom syscalls for ArceOS: a runtime registry of trap-index handlers that extends or, via intercept dispatch, overrides a base ABI."
 keywords = ["syscall", "custom", "personality", "no-std"]
 categories = ["no-std", "os"]
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]
 ax-binfmt = { workspace = true }
