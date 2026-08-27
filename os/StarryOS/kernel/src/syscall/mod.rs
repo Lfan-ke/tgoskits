@@ -21,7 +21,7 @@ pub use self::{
     task::*, time::*,
 };
 use crate::{
-    Errno, StarryError,
+    Errno, StarryError, StarryResult,
     task::{AsThread, SeccompDecision, do_exit, seccomp_errno},
 };
 
@@ -111,7 +111,24 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     // non-x86_64 arches retval and arg0 (signo) share a register.
     let prev_ip = uctx.ip();
 
-    let result = match sysno {
+    // The Linux personality owns the syscalls that have moved into it; the table
+    // below still carries the rest.
+    let result = match crate::abi::route_syscall(uctx) {
+        Some(result) => result,
+        None => dispatch_table(sysno, uctx),
+    };
+    debug!("Syscall {sysno} return {result:?}");
+    let new_retval = result.unwrap_or_else(|err| -err.linux_errno().into_raw() as _) as _;
+
+    if uctx.ip() == prev_ip {
+        uctx.set_retval(new_retval);
+    }
+}
+
+/// The kernel's own syscall table: every call the Linux personality has not
+/// taken over yet.
+fn dispatch_table(sysno: Sysno, uctx: &mut UserContext) -> StarryResult<isize> {
+    match sysno {
         // fs ctl
         Sysno::ioctl => sys_ioctl(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
         Sysno::chdir => sys_chdir(uctx.arg0() as _),
@@ -1063,12 +1080,6 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             warn!("Unimplemented syscall: {sysno} (tid={tid})");
             Err(StarryError::Unsupported)
         }
-    };
-    debug!("Syscall {sysno} return {result:?}");
-    let new_retval = result.unwrap_or_else(|err| -err.linux_errno().into_raw() as _) as _;
-
-    if uctx.ip() == prev_ip {
-        uctx.set_retval(new_retval);
     }
 }
 

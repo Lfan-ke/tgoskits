@@ -18,6 +18,7 @@
 pub mod macho;
 pub mod pe;
 
+use ax_crate_interface::def_interface;
 use bitflags::bitflags;
 
 /// The OS personality a user binary targets.
@@ -168,6 +169,22 @@ pub trait Personality: Sync {
 pub trait CustomHandler: Sync {
     /// Service the trapped index if it is one this extension owns.
     fn handle(&self, env: &mut dyn TrapEnv) -> Dispatch;
+}
+
+/// What servicing a trapped index produced: `None` when no personality claimed
+/// it, otherwise the outcome - a return value, or a positive error number the
+/// caller encodes its own way.
+pub type TrapOutcome = Option<Result<isize, i32>>;
+
+/// The dispatch entry a hosting kernel calls, without naming a personality.
+///
+/// The ABI layer supplies the single implementation: it knows which domains are
+/// compiled in and which one owns the running task. So swapping the ABI a system
+/// speaks is a dependency change there - the kernel keeps calling this.
+#[def_interface]
+pub trait TrapDispatch {
+    /// Service a trapped index for the calling task's personality.
+    fn route(env: &mut dyn TrapEnv) -> TrapOutcome;
 }
 
 /// Run each custom handler in registration order, stopping at the first that

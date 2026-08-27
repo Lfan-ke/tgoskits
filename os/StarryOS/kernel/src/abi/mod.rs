@@ -21,7 +21,7 @@ use ax_abi_port::{Clock, Creds, CurrentHost, Files, Host, Mem, Platform, Random,
 use ax_binfmt::TrapEnv;
 use ax_runtime::hal::cpu::uspace::UserContext;
 
-use crate::{StarryError, StarryResult};
+use crate::{Errno, StarryError, StarryResult};
 
 /// Borrows a trapped [`UserContext`] and presents it as the ABI-neutral
 /// [`TrapEnv`] the personality domains consume.
@@ -61,29 +61,29 @@ impl Host for KernelHost {
     fn platform(&self) -> &dyn Platform {
         self
     }
-    fn tasks(&self) -> &dyn Tasks {
-        self
+    fn tasks(&self) -> Option<&dyn Tasks> {
+        Some(self)
     }
-    fn files(&self) -> &dyn Files {
-        self
+    fn files(&self) -> Option<&dyn Files> {
+        Some(self)
     }
-    fn mem(&self) -> &dyn Mem {
-        self
+    fn mem(&self) -> Option<&dyn Mem> {
+        Some(self)
     }
-    fn signals(&self) -> &dyn Signals {
-        self
+    fn signals(&self) -> Option<&dyn Signals> {
+        Some(self)
     }
-    fn clock(&self) -> &dyn Clock {
-        self
+    fn clock(&self) -> Option<&dyn Clock> {
+        Some(self)
     }
-    fn random(&self) -> &dyn Random {
-        self
+    fn random(&self) -> Option<&dyn Random> {
+        Some(self)
     }
-    fn system(&self) -> &dyn System {
-        self
+    fn system(&self) -> Option<&dyn System> {
+        Some(self)
     }
-    fn creds(&self) -> &dyn Creds {
-        self
+    fn creds(&self) -> Option<&dyn Creds> {
+        Some(self)
     }
 }
 
@@ -92,6 +92,17 @@ impl CurrentHost for KernelHost {
     fn current() -> &'static dyn Host {
         &HOST
     }
+}
+
+/// Offer a trapped syscall to the Linux personality first.
+///
+/// `Some(result)` when the domain owns the call; `None` leaves it to the
+/// kernel's own table. Returning the outcome rather than writing the trap frame
+/// keeps one epilogue for both paths, so a migrated syscall still goes through
+/// the signal-redirect check and the retval encoding the kernel already applies.
+pub fn route_syscall(uctx: &mut UserContext) -> Option<StarryResult<isize>> {
+    ax_abi_linux::LinuxAbi::route_trapped_syscall(&TrapCtx(uctx))
+        .map(|result| result.map_err(|errno| StarryError::from(Errno::new(errno))))
 }
 
 /// Translate a kernel failure into the errno a personality reports to userspace,

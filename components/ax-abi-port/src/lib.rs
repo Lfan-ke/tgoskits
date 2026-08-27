@@ -50,6 +50,7 @@ pub trait Platform: Sync {
 }
 
 /// Process and thread service.
+#[cfg(feature = "task")]
 pub trait Tasks: Sync {
     /// Thread-group id of the caller.
     fn getpid(&self) -> u32;
@@ -61,29 +62,41 @@ pub trait Tasks: Sync {
     fn set_tid_address(&self, tidptr: usize) -> SysResult;
     /// Relinquish the CPU.
     fn sched_yield(&self) -> SysResult;
-    /// Terminate the calling thread.
-    fn exit(&self, code: i32) -> !;
+    /// Terminate the calling thread. A host whose exit path returns - marking
+    /// the thread and letting the trap return handle it - reports that outcome
+    /// here rather than diverging.
+    fn exit(&self, code: i32) -> SysResult;
     /// Terminate every thread in the process.
-    fn exit_group(&self, code: i32) -> !;
+    fn exit_group(&self, code: i32) -> SysResult;
 }
 
-/// File-descriptor service. Buffers are kernel-side; a domain does the user copy
-/// through [`Platform`], keeping this port free of user-memory concerns.
+/// File-descriptor service.
+///
+/// Bulk transfers name a user range rather than a kernel buffer, and each does
+/// exactly one underlying read or write. That is what a pipe, socket or tty
+/// needs: a second underlying read would block where the call should have
+/// returned, and a bounce buffer would cap the result into a short transfer the
+/// kernel would not have produced. The domain still owns the call: it decodes
+/// and validates the arguments and maps the errno; the host owns moving the
+/// bytes, since only it can touch user memory and the file layer together.
+#[cfg(feature = "fs")]
 pub trait Files: Sync {
-    /// Read up to `buf.len()` bytes from `fd`, returning the count read.
-    fn read(&self, fd: i32, buf: &mut [u8]) -> SysResult;
-    /// Write `buf` to `fd`, returning the count written.
-    fn write(&self, fd: i32, buf: &[u8]) -> SysResult;
+    /// Read from `fd` into the user range at `uaddr`, returning the count read.
+    fn read(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
+    /// Write the user range at `uaddr` to `fd`, returning the count written.
+    fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
     /// Close a descriptor.
     fn close(&self, fd: i32) -> SysResult;
     /// Duplicate a descriptor to the lowest free number.
     fn dup(&self, fd: i32) -> SysResult;
     /// Reposition `fd`'s offset (`whence` is `SEEK_*`).
     fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult;
-    /// Read from `fd` at absolute `offset`, leaving the file position unchanged.
-    fn pread(&self, fd: i32, buf: &mut [u8], offset: u64) -> SysResult;
-    /// Write to `fd` at absolute `offset`, leaving the file position unchanged.
-    fn pwrite(&self, fd: i32, buf: &[u8], offset: u64) -> SysResult;
+    /// Read from `fd` at absolute `offset` into the user range at `uaddr`,
+    /// leaving the file position unchanged.
+    fn pread(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult;
+    /// Write the user range at `uaddr` to `fd` at absolute `offset`, leaving the
+    /// file position unchanged.
+    fn pwrite(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult;
     /// Duplicate `oldfd` onto the specific `newfd`, closing `newfd` first if
     /// open, and return `newfd`. `cloexec` sets close-on-exec on the copy.
     fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult;
@@ -95,6 +108,7 @@ pub trait Files: Sync {
 }
 
 /// Address-space service.
+#[cfg(feature = "mm")]
 pub trait Mem: Sync {
     /// Move the program break to `addr` (0 queries), returning the break.
     fn brk(&self, addr: usize) -> SysResult;
@@ -112,8 +126,8 @@ pub trait Mem: Sync {
     fn munmap(&self, addr: usize, len: usize) -> SysResult;
     /// Change protection of `[addr, addr+len)`.
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
-    /// Advise usage of `[addr, addr+len)`. A domain validates `advice`; page
-    /// alignment is this port's concern, since it knows the page size.
+    /// Advise usage of `[addr, addr+len)`. The host validates `advice`, since
+    /// which hints it honours is its own property, as is page alignment.
     fn madvise(&self, addr: usize, len: usize, advice: i32) -> SysResult;
     /// Flush `[addr, addr+len)` of a file mapping. A domain validates `flags`.
     fn msync(&self, addr: usize, len: usize, flags: i32) -> SysResult;
@@ -121,6 +135,7 @@ pub trait Mem: Sync {
 
 /// A source of randomness. Fills a kernel buffer; a domain copies it to user
 /// memory. Every modern libc draws from it at startup.
+#[cfg(feature = "random")]
 pub trait Random: Sync {
     /// Fill `buf` with random bytes, returning the count produced.
     fn fill(&self, buf: &mut [u8]) -> SysResult;
@@ -128,6 +143,7 @@ pub trait Random: Sync {
 
 /// Signal delivery and the blocked-signal mask. A domain moves the user
 /// `sigset_t` itself; this port carries the mask as a `u64`.
+#[cfg(feature = "signal")]
 pub trait Signals: Sync {
     /// Send `sig` to process `pid`.
     fn kill(&self, pid: i32, sig: i32) -> SysResult;
@@ -140,6 +156,7 @@ pub trait Signals: Sync {
 
 /// Clocks and sleeping, in nanoseconds. A domain packs the `timespec`/`timeval`
 /// structs itself; this port only supplies the raw counters.
+#[cfg(feature = "time")]
 pub trait Clock: Sync {
     /// Monotonic time since boot.
     fn monotonic_ns(&self) -> u64;
@@ -151,6 +168,7 @@ pub trait Clock: Sync {
 
 /// One field of the system identity a `uname`-style call reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "system")]
 pub enum UtsField {
     /// OS name, e.g. `"Linux"`.
     SysName,
@@ -167,6 +185,7 @@ pub enum UtsField {
 }
 
 /// System identity.
+#[cfg(feature = "system")]
 pub trait System: Sync {
     /// Report the system identity, calling `put` once per [`UtsField`].
     ///
@@ -179,6 +198,7 @@ pub trait System: Sync {
 
 /// Process credentials. Each getter returns the `(real, effective, saved)`
 /// triple; a domain projects the single ids it needs from it.
+#[cfg(feature = "creds")]
 pub trait Creds: Sync {
     /// Real, effective and saved user IDs.
     fn uids(&self) -> (u32, u32, u32);
@@ -186,26 +206,60 @@ pub trait Creds: Sync {
     fn gids(&self) -> (u32, u32, u32);
 }
 
-/// The bundle of ports a hosting OS implements for the personalities it runs.
+/// The capabilities a hosting OS registers for the personalities it runs.
+///
+/// Only [`platform`](Host::platform) is required - moving bytes across the user
+/// boundary is what every ABI needs before anything else. The rest are optional
+/// and default to absent, so a host registers the capabilities it actually has:
+/// plug in a filesystem and the file-related syscalls of whichever personality
+/// is loaded light up; leave it out and a domain simply does not offer them, and
+/// the trap falls back to whatever the host does with an unclaimed call.
+///
+/// That is the same composition the rest of the system uses - a capability is a
+/// part you fit, not a slot you must fill.
 pub trait Host: Sync {
-    /// Arch/memory platform.
+    /// Arch/memory platform. Required.
     fn platform(&self) -> &dyn Platform;
     /// Process/thread service.
-    fn tasks(&self) -> &dyn Tasks;
+    #[cfg(feature = "task")]
+    fn tasks(&self) -> Option<&dyn Tasks> {
+        None
+    }
     /// File-descriptor service.
-    fn files(&self) -> &dyn Files;
+    #[cfg(feature = "fs")]
+    fn files(&self) -> Option<&dyn Files> {
+        None
+    }
     /// Address-space service.
-    fn mem(&self) -> &dyn Mem;
+    #[cfg(feature = "mm")]
+    fn mem(&self) -> Option<&dyn Mem> {
+        None
+    }
     /// Signal delivery and masking.
-    fn signals(&self) -> &dyn Signals;
+    #[cfg(feature = "signal")]
+    fn signals(&self) -> Option<&dyn Signals> {
+        None
+    }
     /// Clocks and sleeping.
-    fn clock(&self) -> &dyn Clock;
+    #[cfg(feature = "time")]
+    fn clock(&self) -> Option<&dyn Clock> {
+        None
+    }
     /// Randomness.
-    fn random(&self) -> &dyn Random;
+    #[cfg(feature = "random")]
+    fn random(&self) -> Option<&dyn Random> {
+        None
+    }
     /// System identity.
-    fn system(&self) -> &dyn System;
+    #[cfg(feature = "system")]
+    fn system(&self) -> Option<&dyn System> {
+        None
+    }
     /// Process credentials.
-    fn creds(&self) -> &dyn Creds;
+    #[cfg(feature = "creds")]
+    fn creds(&self) -> Option<&dyn Creds> {
+        None
+    }
 }
 
 /// The global binding a hosting OS provides so a trap path can reach the

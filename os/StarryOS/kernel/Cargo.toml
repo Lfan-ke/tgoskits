@@ -163,7 +163,16 @@ rdrive.workspace = true
 
 axbacktrace = { workspace = true }
 ax-binfmt = { workspace = true }
-ax-abi-port = { workspace = true }
+ax-abi-port = { workspace = true, features = [
+    "fs",
+    "mm",
+    "task",
+    "signal",
+    "time",
+    "random",
+    "system",
+    "creds",
+] }
 ax-abi-linux = { workspace = true }
 ax-cgroup = { workspace = true }
 axfs-ng-vfs = { workspace = true }

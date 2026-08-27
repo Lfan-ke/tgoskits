@@ -23,10 +23,14 @@ use starry_vm::{vm_read_slice, vm_write_slice};
 use super::{KernelHost, errno, port_result};
 use crate::{
     StarryError,
-    file::{File, FileLike, get_file_like},
+    file::{File, FileLike, add_file_like, close_file_like, get_file_like},
+    mm::{VmBytes, VmBytesMut},
     syscall,
-    task::AsThread,
+    task::{AsThread, current_pid_view, do_exit},
 };
+
+/// `O_CLOEXEC` as the generic ABI defines it, the only flag `dup3` accepts.
+const O_CLOEXEC: i32 = 0o2000000;
 
 impl Platform for KernelHost {
     fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
@@ -46,79 +50,106 @@ impl Platform for KernelHost {
 
 impl Tasks for KernelHost {
     fn getpid(&self) -> u32 {
-        syscall::sys_getpid().map_or(0, |pid| pid as u32)
+        let curr = current();
+        current_pid_view()
+            .visible_process_number(&curr.as_thread().proc_data.identity())
+            .map_or(0, |pid| pid.get())
     }
 
     fn getppid(&self) -> u32 {
-        syscall::sys_getppid().map_or(0, |pid| pid as u32)
+        let curr = current();
+        curr.as_thread()
+            .proc_data
+            .proc
+            .parent()
+            .and_then(|parent| current_pid_view().visible_process_number(&parent.identity()))
+            .map_or(0, |pid| pid.get())
     }
 
     fn gettid(&self) -> u32 {
-        syscall::sys_gettid().map_or(0, |tid| tid as u32)
+        current().as_thread().user_tid().get()
     }
 
     fn set_tid_address(&self, tidptr: usize) -> SysResult {
-        port_result(syscall::sys_set_tid_address(tidptr))
+        let curr = current();
+        let thread = curr.as_thread();
+        thread.set_clear_child_tid(tidptr);
+        Ok(thread.user_tid().get() as isize)
     }
 
     fn sched_yield(&self) -> SysResult {
-        port_result(syscall::sys_sched_yield())
+        ax_task::yield_now();
+        Ok(0)
     }
 
-    fn exit(&self, code: i32) -> ! {
-        let _ = syscall::sys_exit(code);
-        unreachable!("sys_exit terminates the calling thread")
+    fn exit(&self, status: i32) -> SysResult {
+        do_exit(status, false);
+        Ok(0)
     }
 
-    fn exit_group(&self, code: i32) -> ! {
-        let _ = syscall::sys_exit_group(code);
-        unreachable!("sys_exit_group terminates the process")
+    fn exit_group(&self, status: i32) -> SysResult {
+        do_exit(status, true);
+        Ok(0)
     }
 }
 
 impl Files for KernelHost {
-    fn read(&self, fd: i32, buf: &mut [u8]) -> SysResult {
+    fn read(&self, fd: i32, uaddr: usize, len: usize) -> SysResult {
         let file = get_file_like(fd).map_err(errno)?;
-        let mut dst = buf;
-        file.read(&mut dst).map(|n| n as isize).map_err(errno)
-    }
-
-    fn write(&self, fd: i32, buf: &[u8]) -> SysResult {
-        let file = get_file_like(fd).map_err(errno)?;
-        let mut src = buf;
-        file.write(&mut src).map(|n| n as isize).map_err(errno)
+        let read = file
+            .read(&mut VmBytesMut::new(uaddr as *mut u8, len))
+            .map_err(errno)?;
+        Ok(read as isize)
     }
 
     fn close(&self, fd: i32) -> SysResult {
-        port_result(syscall::sys_close(fd))
+        close_file_like(fd).map_err(errno)?;
+        Ok(0)
     }
 
     fn dup(&self, fd: i32) -> SysResult {
-        port_result(syscall::sys_dup(fd))
+        let file = get_file_like(fd).map_err(errno)?;
+        let new_fd = add_file_like(file, false).map_err(errno)?;
+        Ok(new_fd as isize)
+    }
+
+    fn pread(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
+        let file = File::from_fd(fd).map_err(errno)?;
+        let read = file
+            .inner()
+            .read_at(VmBytesMut::new(uaddr as *mut u8, len), offset)
+            .map_err(|e| errno(StarryError::from(e)))?;
+        Ok(read as isize)
+    }
+
+    fn pwrite(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
+        let file = File::from_fd(fd).map_err(errno)?;
+        let written = file
+            .inner()
+            .write_at(VmBytes::new(uaddr as *const u8, len), offset)
+            .map_err(|e| errno(StarryError::from(e)))?;
+        Ok(written as isize)
+    }
+
+    // The remaining transfers still need their primitive lifted out of the
+    // kernel's own syscall entry (the write path carries the file-object write
+    // hook and the memfd seal checks; lseek, fsync and ftruncate carry the
+    // per-file-kind dispatch). Until then the domain does not claim them, so
+    // nothing routes through a port that would only forward a syscall.
+    fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult {
+        port_result(syscall::sys_write(fd, uaddr as *mut u8, len))
     }
 
     fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult {
         port_result(syscall::sys_lseek(fd, offset as _, whence))
     }
 
-    fn pread(&self, fd: i32, buf: &mut [u8], offset: u64) -> SysResult {
-        let file = File::from_fd(fd).map_err(errno)?;
-        file.inner()
-            .read_at(buf, offset)
-            .map(|n| n as isize)
-            .map_err(|e| errno(StarryError::from(e)))
-    }
-
-    fn pwrite(&self, fd: i32, buf: &[u8], offset: u64) -> SysResult {
-        let file = File::from_fd(fd).map_err(errno)?;
-        file.inner()
-            .write_at(buf, offset)
-            .map(|n| n as isize)
-            .map_err(|e| errno(StarryError::from(e)))
-    }
-
     fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
-        let flags = if cloexec { 0o2000000 } else { 0 };
+        #[cfg(target_arch = "x86_64")]
+        if !cloexec {
+            return port_result(syscall::sys_dup2(oldfd, newfd));
+        }
+        let flags = if cloexec { O_CLOEXEC } else { 0 };
         port_result(syscall::sys_dup3(oldfd, newfd, flags))
     }
 
@@ -247,12 +278,22 @@ impl System for KernelHost {
 
 impl Creds for KernelHost {
     fn uids(&self) -> (u32, u32, u32) {
+        // A user namespace that cannot map the caller's ids reports the
+        // overflow id for all three, exactly as the kernel's own getters do.
+        let overflow = syscall::user_ns_overflow_uid();
+        if overflow != 0 {
+            return (overflow, overflow, overflow);
+        }
         let curr = current();
         let cred = curr.as_thread().cred();
         (cred.uid, cred.euid, cred.suid)
     }
 
     fn gids(&self) -> (u32, u32, u32) {
+        let overflow = syscall::user_ns_overflow_gid();
+        if overflow != 0 {
+            return (overflow, overflow, overflow);
+        }
         let curr = current();
         let cred = curr.as_thread().cred();
         (cred.gid, cred.egid, cred.sgid)
