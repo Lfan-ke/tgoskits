@@ -41,6 +41,9 @@ const IOV_MAX: usize = 1024;
 const IOVEC_SIZE: usize = 16;
 /// `O_CLOEXEC` (generic ABI, all four targets) - the only flag `dup3` accepts.
 const O_CLOEXEC: i32 = 0o2000000;
+/// One `new_utsname` field width (arch-independent), and the packed struct length.
+const UTS_FIELD: usize = 65;
+const UTS_LEN: usize = 6 * UTS_FIELD;
 /// Nanoseconds per second, for packing `timespec`/`timeval`.
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// `CLOCK_REALTIME` - wall-clock time since the Unix epoch.
@@ -139,6 +142,9 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
 
         // Randomness - the domain fills user memory from the Random port.
         Sysno::getrandom => sys_getrandom(host, arg(0), arg(1)),
+
+        // System identity - the domain packs the utsname struct itself.
+        Sysno::uname => sys_uname(host, arg(0)),
 
         _ => Err(ENOSYS),
     }
@@ -330,6 +336,28 @@ fn sys_getrandom(host: &dyn LinuxHost, ubuf: usize, len: usize) -> SysResult {
     Ok(done as isize)
 }
 
+/// `uname(buf)`: report system identity. The domain packs the six `utsname`
+/// fields, each NUL-padded to 65 bytes, and writes the 390-byte struct to user.
+fn sys_uname(host: &dyn LinuxHost, buf: usize) -> SysResult {
+    let u = host.system().uname();
+    let fields = [
+        u.sysname,
+        u.nodename,
+        u.release,
+        u.version,
+        u.machine,
+        u.domainname,
+    ];
+    let mut out = [0u8; UTS_LEN];
+    for (slot, field) in out.chunks_mut(UTS_FIELD).zip(fields) {
+        let src = field.as_bytes();
+        let n = src.len().min(UTS_FIELD - 1); // keep the trailing NUL
+        slot[..n].copy_from_slice(&src[..n]);
+    }
+    host.platform().write_user(buf, &out)?;
+    Ok(0)
+}
+
 /// `clock_gettime(clockid, ts)`: read the requested clock and pack a `timespec`
 /// (two 64-bit words) into user memory.
 fn sys_clock_gettime(host: &dyn LinuxHost, clockid: i32, ts: usize) -> SysResult {
@@ -425,7 +453,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{Clock, EFAULT, Files, Mem, Platform, Random, Signals, Tasks},
+        ops::{Clock, EFAULT, Files, Mem, Platform, Random, Signals, System, Tasks, UtsName},
         *,
     };
 
@@ -557,6 +585,18 @@ mod tests {
             Ok(b.len() as isize)
         }
     }
+    impl System for FixedHost {
+        fn uname(&self) -> UtsName<'_> {
+            UtsName {
+                sysname: "Linux",
+                nodename: "starry",
+                release: "6.0.0",
+                version: "#1",
+                machine: "x86_64",
+                domainname: "(none)",
+            }
+        }
+    }
     impl LinuxHost for FixedHost {
         fn platform(&self) -> &dyn Platform {
             self
@@ -577,6 +617,9 @@ mod tests {
             self
         }
         fn random(&self) -> &dyn Random {
+            self
+        }
+        fn system(&self) -> &dyn System {
             self
         }
     }
@@ -740,6 +783,18 @@ mod tests {
             Ok(buf.len() as isize)
         }
     }
+    impl System for Host {
+        fn uname(&self) -> UtsName<'_> {
+            UtsName {
+                sysname: "Linux",
+                nodename: "node",
+                release: "rel",
+                version: "ver",
+                machine: "riscv64",
+                domainname: "(none)",
+            }
+        }
+    }
     impl Clock for Host {
         fn monotonic_ns(&self) -> u64 {
             5 * NS_PER_SEC + 250
@@ -772,6 +827,9 @@ mod tests {
             self
         }
         fn mem(&self) -> &dyn Mem {
+            self
+        }
+        fn system(&self) -> &dyn System {
             self
         }
     }
@@ -929,6 +987,22 @@ mod tests {
         let r = dispatch(&host, &Trap::new(Sysno::dup3, [3, 7, 0x1, 0, 0, 0]));
         assert_eq!(r, Err(EINVAL));
         assert!(host.duped.borrow().is_none());
+    }
+
+    #[test]
+    fn uname_packs_utsname_fields() {
+        let host = Host::default();
+        // Pre-fill with 0xFF to prove the domain writes NUL padding, not garbage.
+        *host.umem.borrow_mut() = vec![0xFFu8; 6 * 65];
+        let r = dispatch(&host, &Trap::new(Sysno::uname, [0, 0, 0, 0, 0, 0]));
+        assert_eq!(r, Ok(0));
+        let mem = host.umem.borrow();
+        // Field 0 (sysname) is "Linux", NUL-padded within its 65-byte slot.
+        assert_eq!(&mem[0..5], b"Linux");
+        assert_eq!(mem[5], 0);
+        // Field 4 (machine) sits at offset 4*65 and reads "riscv64".
+        assert_eq!(&mem[4 * 65..4 * 65 + 7], b"riscv64");
+        assert_eq!(mem[4 * 65 + 7], 0);
     }
 
     #[test]

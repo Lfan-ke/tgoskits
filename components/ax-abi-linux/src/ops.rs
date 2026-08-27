@@ -133,6 +133,30 @@ pub trait Clock: Sync {
     fn sleep_ns(&self, ns: u64) -> SysResult;
 }
 
+/// The six `utsname` fields, borrowed from the host. The domain NUL-pads each
+/// into a fixed 65-byte slot of the ABI struct, so this port stays free of the
+/// wire layout.
+pub struct UtsName<'a> {
+    /// OS name, e.g. `"Linux"`.
+    pub sysname: &'a str,
+    /// Host name on the network.
+    pub nodename: &'a str,
+    /// OS release.
+    pub release: &'a str,
+    /// OS version.
+    pub version: &'a str,
+    /// Hardware identifier, e.g. `"x86_64"`.
+    pub machine: &'a str,
+    /// NIS/YP domain name.
+    pub domainname: &'a str,
+}
+
+/// System identity (`uname`).
+pub trait System: Sync {
+    /// The `utsname` fields to report to the process.
+    fn uname(&self) -> UtsName<'_>;
+}
+
 /// The bundle of ports a hosting OS registers for the Linux personality.
 pub trait LinuxHost: Sync {
     /// Arch/memory platform.
@@ -149,4 +173,6 @@ pub trait LinuxHost: Sync {
     fn clock(&self) -> &dyn Clock;
     /// Randomness.
     fn random(&self) -> &dyn Random;
+    /// System identity.
+    fn system(&self) -> &dyn System;
 }
