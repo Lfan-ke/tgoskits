@@ -108,6 +108,8 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         Sysno::write => sys_write(host, arg(0) as i32, arg(1), arg(2)),
         Sysno::close => host.files().close(arg(0) as i32),
         Sysno::dup => host.files().dup(arg(0) as i32),
+        // Only the x86_64 table carries dup2; the generic ABI has dup3 alone.
+        #[cfg(target_arch = "x86_64")]
         Sysno::dup2 => host.files().dup2(arg(0) as i32, arg(1) as i32, false),
         Sysno::dup3 => sys_dup3(host, arg(0) as i32, arg(1) as i32, arg(2) as i32),
         Sysno::lseek => host

@@ -8004,6 +8004,8 @@ dependencies = [
 name = "starry-kernel"
 version = "0.8.3"
 dependencies = [
+ "ax-abi-linux",
+ "ax-abi-port",
  "ax-alloc",
  "ax-binfmt",
  "ax-cgroup",
