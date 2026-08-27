@@ -52,6 +52,9 @@ const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
 /// The kernel `sigset_t` the syscall ABI expects is exactly 8 bytes.
 const SIGSET_SIZE: usize = 8;
+/// Advice values `madvise` accepts (generic ABI: NORMAL/RANDOM/SEQUENTIAL/
+/// WILLNEED/DONTNEED/FREE/REMOVE/DONTFORK/DOFORK).
+const MADV_KNOWN: &[i32] = &[0, 1, 2, 3, 4, 8, 9, 10, 11];
 
 /// The Linux personality: recognizes ELF images and services Linux syscalls
 /// against a host's ports.
@@ -130,6 +133,8 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         ),
         Sysno::munmap => host.mem().munmap(arg(0), arg(1)),
         Sysno::mprotect => host.mem().mprotect(arg(0), arg(1), arg(2) as i32),
+        Sysno::madvise => sys_madvise(host, arg(0), arg(1), arg(2) as i32),
+        Sysno::msync => sys_msync(host, arg(0), arg(1), arg(2) as i32),
 
         // Clocks - the domain packs the timespec/timeval itself.
         Sysno::clock_gettime => sys_clock_gettime(host, arg(0) as i32, arg(1)),
@@ -334,6 +339,28 @@ fn sys_dup3(host: &dyn LinuxHost, oldfd: i32, newfd: i32, flags: i32) -> SysResu
         return Err(EINVAL);
     }
     host.files().dup2(oldfd, newfd, flags & O_CLOEXEC != 0)
+}
+
+/// `madvise(addr, len, advice)`: validate the advice is one the kernel knows,
+/// then hand the region to the Mem port. Unknown advice is `EINVAL`.
+fn sys_madvise(host: &dyn LinuxHost, addr: usize, len: usize, advice: i32) -> SysResult {
+    if !MADV_KNOWN.contains(&advice) {
+        return Err(EINVAL);
+    }
+    host.mem().madvise(addr, len, advice)
+}
+
+/// `msync(addr, len, flags)`: reject unknown flag bits and the mutually exclusive
+/// `MS_SYNC`+`MS_ASYNC` pair, then flush through the Mem port.
+fn sys_msync(host: &dyn LinuxHost, addr: usize, len: usize, flags: i32) -> SysResult {
+    const MS_ASYNC: i32 = 1;
+    const MS_INVALIDATE: i32 = 2;
+    const MS_SYNC: i32 = 4;
+    let known = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+    if flags & !known != 0 || flags & (MS_ASYNC | MS_SYNC) == (MS_ASYNC | MS_SYNC) {
+        return Err(EINVAL);
+    }
+    host.mem().msync(addr, len, flags)
 }
 
 /// `getrandom(ubuf, len)`: fill user memory from the Random port in bounded
@@ -614,6 +641,12 @@ mod tests {
         fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
             Ok(0)
         }
+        fn madvise(&self, _a: usize, _l: usize, _adv: i32) -> SysResult {
+            Ok(0)
+        }
+        fn msync(&self, _a: usize, _l: usize, _f: i32) -> SysResult {
+            Ok(0)
+        }
     }
     impl Signals for FixedHost {
         fn kill(&self, _p: i32, _s: i32) -> SysResult {
@@ -830,6 +863,12 @@ mod tests {
         }
         fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
             Ok(0)
+        }
+        fn madvise(&self, _a: usize, _l: usize, advice: i32) -> SysResult {
+            Ok(advice as isize) // echo so the test sees the delegated advice
+        }
+        fn msync(&self, _a: usize, _l: usize, flags: i32) -> SysResult {
+            Ok(flags as isize)
         }
     }
     impl Signals for Host {
@@ -1171,6 +1210,49 @@ mod tests {
         // The saved-uid pointer is past the end of user memory.
         let r = dispatch(&host, &Trap::new(Sysno::getresuid, [0, 4, 999, 0, 0, 0]));
         assert_eq!(r, Err(EFAULT));
+    }
+
+    #[test]
+    fn madvise_delegates_known_advice() {
+        let host = Host::default();
+        // MADV_DONTNEED (4) is known, so it reaches the Mem port (which echoes it).
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::madvise, [0x1000, 0x2000, 4, 0, 0, 0]),
+        );
+        assert_eq!(r, Ok(4));
+    }
+
+    #[test]
+    fn madvise_rejects_unknown_advice() {
+        let host = Host::default();
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::madvise, [0x1000, 0x2000, 999, 0, 0, 0]),
+        );
+        assert_eq!(r, Err(EINVAL));
+    }
+
+    #[test]
+    fn msync_rejects_sync_and_async_together() {
+        let host = Host::default();
+        // MS_ASYNC(1) | MS_SYNC(4) is a mutually exclusive combination.
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::msync, [0x1000, 0x1000, 5, 0, 0, 0]),
+        );
+        assert_eq!(r, Err(EINVAL));
+    }
+
+    #[test]
+    fn msync_delegates_valid_flags() {
+        let host = Host::default();
+        // MS_SYNC(4) alone is valid and reaches the Mem port.
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::msync, [0x1000, 0x1000, 4, 0, 0, 0]),
+        );
+        assert_eq!(r, Ok(4));
     }
 
     #[test]

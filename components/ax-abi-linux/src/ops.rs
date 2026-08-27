@@ -106,6 +106,12 @@ pub trait Mem: Sync {
     fn munmap(&self, addr: usize, len: usize) -> SysResult;
     /// `mprotect` - change protection of `[addr, addr+len)`.
     fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
+    /// `madvise` - advise usage of `[addr, addr+len)`. `advice` is validated by
+    /// the domain; page alignment is this port's concern (it knows the page size).
+    fn madvise(&self, addr: usize, len: usize, advice: i32) -> SysResult;
+    /// `msync` - flush `[addr, addr+len)` of a file mapping. `flags` is validated
+    /// by the domain.
+    fn msync(&self, addr: usize, len: usize, flags: i32) -> SysResult;
 }
 
 /// A source of randomness (`getrandom`, `/dev/urandom`). Fills a kernel buffer;
