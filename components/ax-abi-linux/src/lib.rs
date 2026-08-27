@@ -18,7 +18,7 @@
 
 pub mod ops;
 
-use ax_binfmt::{Abi, TrapEnv};
+use ax_binfmt::{Abi, Dispatch, TrapEnv};
 use ax_crate_interface::{call_interface, def_interface};
 use ops::{EINVAL, ENOSYS, LinuxHost, SysResult};
 use syscalls::Sysno;
@@ -84,16 +84,36 @@ impl LinuxAbi {
     pub fn handle_trapped_syscall(uctx: &mut dyn TrapEnv) {
         Self::handle_syscall(call_interface!(CurrentHost::current), uctx);
     }
+
+    /// Service a trapped syscall domain-first: write the result and report
+    /// [`Dispatch::Handled`] when it is one this domain owns, else
+    /// [`Dispatch::Passthrough`] with `uctx` untouched. This is the seam a
+    /// monolithic kernel uses during incremental migration - it tries the domain,
+    /// then falls back to its own remaining table for syscalls not yet moved.
+    pub fn try_handle_syscall(host: &dyn LinuxHost, uctx: &mut dyn TrapEnv) -> Dispatch {
+        match route(host, uctx) {
+            Some(result) => {
+                uctx.set_result(encode(result));
+                Dispatch::Handled
+            }
+            None => Dispatch::Passthrough,
+        }
+    }
+
+    /// The parameter-less domain-first entry: resolves the registered host, then
+    /// [`try_handle_syscall`](Self::try_handle_syscall).
+    pub fn try_handle_trapped_syscall(uctx: &mut dyn TrapEnv) -> Dispatch {
+        Self::try_handle_syscall(call_interface!(CurrentHost::current), uctx)
+    }
 }
 
-/// Route one syscall to its handler. Kept free of the trap-frame write so it can
-/// be unit-tested with mock ports and a mock [`TrapEnv`].
-fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
-    let Some(sysno) = Sysno::new(uctx.nr()) else {
-        return Err(ENOSYS);
-    };
+/// Route one syscall to its handler, or `None` when the trapped number is not one
+/// this domain owns, so a hosting kernel can fall back to its own table during
+/// migration. Free of the trap-frame write, so it unit-tests with mock ports.
+fn route(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> Option<SysResult> {
+    let sysno = Sysno::new(uctx.nr())?;
     let arg = |i| uctx.arg(i);
-    match sysno {
+    Some(match sysno {
         // fd I/O - the domain copies user memory itself, then drives Files.
         Sysno::read => sys_read(host, arg(0) as i32, arg(1), arg(2)),
         Sysno::write => sys_write(host, arg(0) as i32, arg(1), arg(2)),
@@ -163,8 +183,14 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         Sysno::getresuid => sys_getres(host, host.creds().uids(), arg(0), arg(1), arg(2)),
         Sysno::getresgid => sys_getres(host, host.creds().gids(), arg(0), arg(1), arg(2)),
 
-        _ => Err(ENOSYS),
-    }
+        _ => return None,
+    })
+}
+
+/// Collapse an unowned syscall to `ENOSYS` - for a domain that is the sole
+/// handler, and for the unit tests.
+fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
+    route(host, uctx).unwrap_or(Err(ENOSYS))
 }
 
 /// `write(fd, ubuf, len)`: copy from user in bounded chunks and write each to
@@ -1276,6 +1302,27 @@ mod tests {
             dispatch(&host, &Trap::new(Sysno::reboot, [0; 6])),
             Err(ENOSYS)
         );
+    }
+
+    #[test]
+    fn try_handle_reports_handled_or_passthrough() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![b'h', b'i', 0];
+        // A syscall the domain owns is handled and its result written to uctx.
+        let mut owned = Trap::new(Sysno::write, [1, 0, 2, 0, 0, 0]);
+        assert_eq!(
+            LinuxAbi::try_handle_syscall(&host, &mut owned),
+            Dispatch::Handled
+        );
+        assert_eq!(owned.result, Some(2));
+        // One the domain does not own passes through untouched, so a kernel can
+        // fall back to its own table.
+        let mut unowned = Trap::new(Sysno::reboot, [0; 6]);
+        assert_eq!(
+            LinuxAbi::try_handle_syscall(&host, &mut unowned),
+            Dispatch::Passthrough
+        );
+        assert_eq!(unowned.result, None);
     }
 
     #[test]
