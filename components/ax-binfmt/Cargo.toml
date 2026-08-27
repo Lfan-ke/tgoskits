@@ -1,13 +1,13 @@
 [package]
 name = "ax-binfmt"
 version = "0.1.0"
-repository = "https://github.com/rcore-os/tgoskits"
+repository.workspace = true
 edition.workspace = true
-authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+authors.workspace = true
 description = "Format-agnostic executable dispatch: sniff a binary's magic and route it to the matching OS personality (Linux ELF / Windows PE / macOS Mach-O)."
 keywords = ["binfmt", "personality", "abi", "no-std"]
 categories = ["no-std", "os"]
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]
 bitflags = { workspace = true }

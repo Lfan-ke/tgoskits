@@ -1,13 +1,13 @@
 [package]
 name = "ax-abi-embedded"
 version = "0.1.0"
-repository = "https://github.com/rcore-os/tgoskits"
+repository.workspace = true
 edition.workspace = true
-authors = ["RCore Team <yuchen@tsinghua.edu.cn>"]
+authors.workspace = true
 description = "Bare interrupt-vector-table personality for ArceOS: the degenerate dispatch domain, and the template for user-extensible trap handlers."
 keywords = ["embedded", "vector-table", "personality", "no-std"]
 categories = ["no-std", "embedded"]
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]
 ax-binfmt = { workspace = true }
