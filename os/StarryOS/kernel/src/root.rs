@@ -25,6 +25,7 @@ mod host_link_symbols {
     static __PERCPU_TEMPLATE_ALIGN_END: usize = 0;
 }
 
+pub mod abi;
 mod cgroup;
 mod config;
 mod ebpf;
