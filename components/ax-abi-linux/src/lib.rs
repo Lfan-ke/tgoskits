@@ -150,6 +150,14 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         // System identity - the domain packs the utsname struct itself.
         Sysno::uname => sys_uname(host, arg(0)),
 
+        // Credentials - identity getters project from the (real, eff, saved) triple.
+        Sysno::getuid => Ok(host.creds().uids().0 as isize),
+        Sysno::geteuid => Ok(host.creds().uids().1 as isize),
+        Sysno::getgid => Ok(host.creds().gids().0 as isize),
+        Sysno::getegid => Ok(host.creds().gids().1 as isize),
+        Sysno::getresuid => sys_getres(host, host.creds().uids(), arg(0), arg(1), arg(2)),
+        Sysno::getresgid => sys_getres(host, host.creds().gids(), arg(0), arg(1), arg(2)),
+
         _ => Err(ENOSYS),
     }
 }
@@ -371,6 +379,22 @@ fn sys_uname(host: &dyn LinuxHost, buf: usize) -> SysResult {
     Ok(0)
 }
 
+/// `getresuid`/`getresgid`: write a `(real, effective, saved)` id triple to three
+/// user pointers, each a 32-bit id.
+fn sys_getres(
+    host: &dyn LinuxHost,
+    ids: (u32, u32, u32),
+    real: usize,
+    eff: usize,
+    saved: usize,
+) -> SysResult {
+    let platform = host.platform();
+    platform.write_user(real, &ids.0.to_le_bytes())?;
+    platform.write_user(eff, &ids.1.to_le_bytes())?;
+    platform.write_user(saved, &ids.2.to_le_bytes())?;
+    Ok(0)
+}
+
 /// `clock_gettime(clockid, ts)`: read the requested clock and pack a `timespec`
 /// (two 64-bit words) into user memory.
 fn sys_clock_gettime(host: &dyn LinuxHost, clockid: i32, ts: usize) -> SysResult {
@@ -478,7 +502,9 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{Clock, EFAULT, Files, Mem, Platform, Random, Signals, System, Tasks, UtsName},
+        ops::{
+            Clock, Creds, EFAULT, Files, Mem, Platform, Random, Signals, System, Tasks, UtsName,
+        },
         *,
     };
 
@@ -628,6 +654,14 @@ mod tests {
             }
         }
     }
+    impl Creds for FixedHost {
+        fn uids(&self) -> (u32, u32, u32) {
+            (0, 0, 0)
+        }
+        fn gids(&self) -> (u32, u32, u32) {
+            (0, 0, 0)
+        }
+    }
     impl LinuxHost for FixedHost {
         fn platform(&self) -> &dyn Platform {
             self
@@ -651,6 +685,9 @@ mod tests {
             self
         }
         fn system(&self) -> &dyn System {
+            self
+        }
+        fn creds(&self) -> &dyn Creds {
             self
         }
     }
@@ -835,6 +872,14 @@ mod tests {
             }
         }
     }
+    impl Creds for Host {
+        fn uids(&self) -> (u32, u32, u32) {
+            (1000, 1000, 0) // real, effective, saved
+        }
+        fn gids(&self) -> (u32, u32, u32) {
+            (1000, 1000, 0)
+        }
+    }
     impl Clock for Host {
         fn monotonic_ns(&self) -> u64 {
             5 * NS_PER_SEC + 250
@@ -870,6 +915,9 @@ mod tests {
             self
         }
         fn system(&self) -> &dyn System {
+            self
+        }
+        fn creds(&self) -> &dyn Creds {
             self
         }
     }
@@ -1086,6 +1134,43 @@ mod tests {
             &Trap::new(Sysno::ftruncate, [3, (-1i64) as usize, 0, 0, 0, 0]),
         );
         assert_eq!(r, Err(EINVAL));
+    }
+
+    #[test]
+    fn identity_getters_project_from_the_triple() {
+        let host = Host::default();
+        assert_eq!(dispatch(&host, &Trap::new(Sysno::getuid, [0; 6])), Ok(1000));
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::geteuid, [0; 6])),
+            Ok(1000)
+        );
+        assert_eq!(dispatch(&host, &Trap::new(Sysno::getgid, [0; 6])), Ok(1000));
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::getegid, [0; 6])),
+            Ok(1000)
+        );
+    }
+
+    #[test]
+    fn getresuid_writes_the_triple() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![0u8; 32];
+        // ruid at 0, euid at 8, suid at 16, each a 4-byte id.
+        let r = dispatch(&host, &Trap::new(Sysno::getresuid, [0, 8, 16, 0, 0, 0]));
+        assert_eq!(r, Ok(0));
+        let mem = host.umem.borrow();
+        assert_eq!(u32::from_le_bytes(mem[0..4].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(mem[8..12].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(mem[16..20].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn getresuid_faults_on_bad_pointer() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![0u8; 8];
+        // The saved-uid pointer is past the end of user memory.
+        let r = dispatch(&host, &Trap::new(Sysno::getresuid, [0, 4, 999, 0, 0, 0]));
+        assert_eq!(r, Err(EFAULT));
     }
 
     #[test]

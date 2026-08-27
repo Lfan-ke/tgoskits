@@ -162,6 +162,15 @@ pub trait System: Sync {
     fn uname(&self) -> UtsName<'_>;
 }
 
+/// Process credentials (`getuid` and friends). Each getter returns the
+/// `(real, effective, saved)` triple; the domain projects the single ids from it.
+pub trait Creds: Sync {
+    /// Real, effective and saved user IDs.
+    fn uids(&self) -> (u32, u32, u32);
+    /// Real, effective and saved group IDs.
+    fn gids(&self) -> (u32, u32, u32);
+}
+
 /// The bundle of ports a hosting OS registers for the Linux personality.
 pub trait LinuxHost: Sync {
     /// Arch/memory platform.
@@ -180,4 +189,6 @@ pub trait LinuxHost: Sync {
     fn random(&self) -> &dyn Random;
     /// System identity.
     fn system(&self) -> &dyn System;
+    /// Process credentials.
+    fn creds(&self) -> &dyn Creds;
 }
