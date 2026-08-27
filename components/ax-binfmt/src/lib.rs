@@ -159,18 +159,36 @@ pub trait Personality: Sync {
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch;
 }
 
-/// A user-registered handler for a reserved index range - the extension point
-/// for adding syscalls/hypercalls/instructions without forking a personality,
+/// A user-registered handler for a trapped index - the extension point for
+/// adding syscalls/hypercalls/instructions without forking a personality,
 /// analogous to RISC-V's reserved custom opcode space or a Chipyard RoCC
-/// accelerator. Tried, in order, after the personality passes an index through.
+/// accelerator. Run in registration order, before or after the personality
+/// depending on which entry point the caller uses ([`dispatch_trap`] for
+/// coequal extension, [`dispatch_trap_intercept`] for override).
 pub trait CustomHandler: Sync {
     /// Service the trapped index if it is one this extension owns.
     fn handle(&self, env: &mut dyn TrapEnv) -> Dispatch;
 }
 
-/// Route one trapped index to the personality, then to the custom extensions in
-/// order, stopping at the first that claims it. Returns [`Dispatch::Passthrough`]
-/// when none does, so the caller can apply the personality's default (`ENOSYS`).
+/// Run each custom handler in registration order, stopping at the first that
+/// claims the index.
+fn run_custom(custom: &[&dyn CustomHandler], env: &mut dyn TrapEnv) -> Dispatch {
+    for &h in custom {
+        if h.handle(env) == Dispatch::Handled {
+            return Dispatch::Handled;
+        }
+    }
+    Dispatch::Passthrough
+}
+
+/// Route a trapped index to the personality first, then to the custom handlers,
+/// stopping at the first that claims it, or [`Dispatch::Passthrough`] when none
+/// does (the caller then applies the personality's default, `ENOSYS`).
+///
+/// Personality-first: custom handlers only see indices the base ABI passed
+/// through, so they extend its reserved space and cannot shadow it. This is the
+/// safe default, in which a custom ABI is a peer of the Linux/Windows/Darwin
+/// personalities rather than an override of one.
 pub fn dispatch_trap(
     personality: &dyn Personality,
     custom: &[&dyn CustomHandler],
@@ -179,11 +197,27 @@ pub fn dispatch_trap(
     if personality.handle_syscall(env) == Dispatch::Handled {
         return Dispatch::Handled;
     }
-    custom
-        .iter()
-        .map(|h| h.handle(env))
-        .find(|&d| d == Dispatch::Handled)
-        .unwrap_or(Dispatch::Passthrough)
+    run_custom(custom, env)
+}
+
+/// Route a trapped index to the custom handlers first, then to the personality.
+///
+/// Custom-first: a custom handler may claim an index the personality also owns,
+/// redirecting that syscall to the user's own implementation. The deliberate
+/// opt-in counterpart to [`dispatch_trap`] - it trades the safety of a
+/// non-shadowable base ABI for the power to intercept it.
+pub fn dispatch_trap_intercept(
+    personality: &dyn Personality,
+    custom: &[&dyn CustomHandler],
+    env: &mut dyn TrapEnv,
+) -> Dispatch {
+    if run_custom(custom, env) == Dispatch::Handled {
+        return Dispatch::Handled;
+    }
+    if personality.handle_syscall(env) == Dispatch::Handled {
+        return Dispatch::Handled;
+    }
+    Dispatch::Passthrough
 }
 
 /// Route `image` to the first registered personality that recognizes it, the
@@ -369,6 +403,53 @@ mod tests {
             Dispatch::Passthrough
         );
         assert_eq!(unowned.result, None);
+    }
+
+    #[test]
+    fn intercept_lets_custom_override_the_personality() {
+        // A personality that owns index 0x42, writing 0xBA5E.
+        struct OwnsOne;
+        impl Personality for OwnsOne {
+            fn abi(&self) -> Abi {
+                Abi::Linux
+            }
+            fn recognizes(&self, _image: &[u8]) -> bool {
+                false
+            }
+            fn load(&self, _req: &LoadRequest<'_>, _env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
+                Ok(Loaded { entry: 0, stack: 0 })
+            }
+            fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
+                if env.nr() == 0x42 {
+                    env.set_result(0xBA5E);
+                    Dispatch::Handled
+                } else {
+                    Dispatch::Passthrough
+                }
+            }
+        }
+        let base = OwnsOne;
+        let custom = CustomOne(0x42); // also claims 0x42, writing 0xC0DE
+        let handlers: [&dyn CustomHandler; 1] = [&custom];
+
+        // Personality-first: the base ABI owns 0x42, so it wins and custom never runs.
+        let mut a = Trap {
+            nr: 0x42,
+            result: None,
+        };
+        assert_eq!(dispatch_trap(&base, &handlers, &mut a), Dispatch::Handled);
+        assert_eq!(a.result, Some(0xBA5E));
+
+        // Custom-first: the interceptor overrides the base ABI's 0x42.
+        let mut b = Trap {
+            nr: 0x42,
+            result: None,
+        };
+        assert_eq!(
+            dispatch_trap_intercept(&base, &handlers, &mut b),
+            Dispatch::Handled
+        );
+        assert_eq!(b.result, Some(0xC0DE));
     }
 
     #[test]
