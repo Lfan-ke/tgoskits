@@ -39,6 +39,8 @@ const CHUNK: usize = 256;
 const IOV_MAX: usize = 1024;
 /// Size of one 64-bit `struct iovec` (an 8-byte base pointer and 8-byte length).
 const IOVEC_SIZE: usize = 16;
+/// `O_CLOEXEC` (generic ABI, all four targets) - the only flag `dup3` accepts.
+const O_CLOEXEC: i32 = 0o2000000;
 /// Nanoseconds per second, for packing `timespec`/`timeval`.
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// `CLOCK_REALTIME` - wall-clock time since the Unix epoch.
@@ -91,6 +93,8 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
         Sysno::write => sys_write(host, arg(0) as i32, arg(1), arg(2)),
         Sysno::close => host.files().close(arg(0) as i32),
         Sysno::dup => host.files().dup(arg(0) as i32),
+        Sysno::dup2 => host.files().dup2(arg(0) as i32, arg(1) as i32, false),
+        Sysno::dup3 => sys_dup3(host, arg(0) as i32, arg(1) as i32, arg(2) as i32),
         Sysno::lseek => host
             .files()
             .lseek(arg(0) as i32, arg(1) as isize, arg(2) as i32),
@@ -293,6 +297,16 @@ fn sys_pwrite64(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize, offset: 
         }
     }
     Ok(done as isize)
+}
+
+/// `dup3(oldfd, newfd, flags)`: duplicate onto a specific fd like `dup2`, but
+/// equal fds are `EINVAL` (not the `dup2` no-op) and the only accepted flag is
+/// `O_CLOEXEC`. The port performs the fd-table replacement.
+fn sys_dup3(host: &dyn LinuxHost, oldfd: i32, newfd: i32, flags: i32) -> SysResult {
+    if oldfd == newfd || (flags & !O_CLOEXEC) != 0 {
+        return Err(EINVAL);
+    }
+    host.files().dup2(oldfd, newfd, flags & O_CLOEXEC != 0)
 }
 
 /// `getrandom(ubuf, len)`: fill user memory from the Random port in bounded
@@ -498,6 +512,9 @@ mod tests {
         fn pwrite(&self, _fd: i32, b: &[u8], _o: u64) -> SysResult {
             Ok(b.len() as isize)
         }
+        fn dup2(&self, _oldfd: i32, newfd: i32, _cloexec: bool) -> SysResult {
+            Ok(newfd as isize)
+        }
     }
     impl Mem for FixedHost {
         fn brk(&self, a: usize) -> SysResult {
@@ -595,6 +612,7 @@ mod tests {
         slept: RefCell<u64>,
         mask: RefCell<u64>,
         killed: RefCell<Option<(i32, i32)>>,
+        duped: RefCell<Option<(i32, i32, bool)>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Host {}
@@ -651,6 +669,10 @@ mod tests {
             }
             file[offset as usize..end].copy_from_slice(buf);
             Ok(buf.len() as isize)
+        }
+        fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
+            *self.duped.borrow_mut() = Some((oldfd, newfd, cloexec));
+            Ok(newfd as isize)
         }
     }
     impl Tasks for Host {
@@ -871,6 +893,42 @@ mod tests {
             &Trap::new(Sysno::pread64, [3, 0, 3, (-1i64) as usize, 0, 0]),
         );
         assert_eq!(r, Err(EINVAL));
+    }
+
+    #[test]
+    fn dup2_duplicates_onto_target() {
+        let host = Host::default();
+        let r = dispatch(&host, &Trap::new(Sysno::dup2, [3, 7, 0, 0, 0, 0]));
+        assert_eq!(r, Ok(7));
+        assert_eq!(*host.duped.borrow(), Some((3, 7, false)));
+    }
+
+    #[test]
+    fn dup3_sets_cloexec() {
+        let host = Host::default();
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::dup3, [3, 7, O_CLOEXEC as usize, 0, 0, 0]),
+        );
+        assert_eq!(r, Ok(7));
+        assert_eq!(*host.duped.borrow(), Some((3, 7, true)));
+    }
+
+    #[test]
+    fn dup3_rejects_equal_fds() {
+        let host = Host::default();
+        // dup3 with oldfd == newfd is EINVAL, unlike the dup2 no-op.
+        let r = dispatch(&host, &Trap::new(Sysno::dup3, [5, 5, 0, 0, 0, 0]));
+        assert_eq!(r, Err(EINVAL));
+        assert!(host.duped.borrow().is_none());
+    }
+
+    #[test]
+    fn dup3_rejects_unknown_flags() {
+        let host = Host::default();
+        let r = dispatch(&host, &Trap::new(Sysno::dup3, [3, 7, 0x1, 0, 0, 0]));
+        assert_eq!(r, Err(EINVAL));
+        assert!(host.duped.borrow().is_none());
     }
 
     #[test]

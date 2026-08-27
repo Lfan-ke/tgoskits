@@ -76,6 +76,11 @@ pub trait Files: Sync {
     /// `pwrite` - write `buf` to `fd` at absolute `offset`, leaving the file
     /// position unchanged, returning the count written.
     fn pwrite(&self, fd: i32, buf: &[u8], offset: u64) -> SysResult;
+    /// `dup2`/`dup3` - duplicate `oldfd` onto the specific `newfd`, closing
+    /// `newfd` first if open, and return `newfd`. `cloexec` sets close-on-exec on
+    /// the copy. Equal fds are a valid no-op for `dup2`; the domain forbids them
+    /// for `dup3` before calling here.
+    fn dup2(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult;
 }
 
 /// Address-space service.
