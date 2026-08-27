@@ -1,0 +1,13 @@
+[package]
+name = "ax-abi-port"
+version = "0.1.0"
+description = "Capability ports an OS implements once so every ArceOS ABI personality can reach files, memory, tasks and clocks without depending on a kernel"
+repository.workspace = true
+edition.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories = ["os", "no-std"]
+license.workspace = true
+
+[dependencies]
+ax-crate-interface = { workspace = true }

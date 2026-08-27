@@ -727,6 +727,7 @@ dependencies = [
  "ax-abi-driver",
  "ax-abi-embedded",
  "ax-abi-path",
+ "ax-abi-port",
  "ax-abi-windows",
  "ax-binfmt",
 ]
@@ -760,6 +761,7 @@ dependencies = [
 name = "ax-abi-linux"
 version = "0.1.0"
 dependencies = [
+ "ax-abi-port",
  "ax-binfmt",
  "ax-crate-interface",
  "syscalls",
@@ -768,6 +770,13 @@ dependencies = [
 [[package]]
 name = "ax-abi-path"
 version = "0.1.0"
+
+[[package]]
+name = "ax-abi-port"
+version = "0.1.0"
+dependencies = [
+ "ax-crate-interface",
+]
 
 [[package]]
 name = "ax-abi-windows"

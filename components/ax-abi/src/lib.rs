@@ -7,7 +7,8 @@
 //! "maker" who wants finer control can depend on the sub-crates
 //! (`ax-abi-windows`, `ax-abi-path`, ...) directly instead.
 //!
-//! The dispatch core and the [`Personality`] trait live in [`ax_binfmt`] and are
+//! The dispatch core and the [`Personality`] trait live in [`ax_binfmt`], and the
+//! capability ports a hosting OS implements live in [`ax_abi_port`]; both are
 //! re-exported here so a dependant needs only this crate.
 
 #![no_std]
@@ -26,6 +27,7 @@ pub use ax_abi_driver;
 pub use ax_abi_embedded::{self, VectorTable};
 #[cfg(feature = "path-compat")]
 pub use ax_abi_path;
+pub use ax_abi_port::{self, CurrentHost, Host};
 #[cfg(feature = "win")]
 pub use ax_abi_windows::{self, WindowsAbi};
 pub use ax_binfmt::{

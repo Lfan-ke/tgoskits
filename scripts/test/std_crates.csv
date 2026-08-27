@@ -13,6 +13,7 @@ ax-abi-path
 ax-abi-driver
 ax-abi-embedded
 ax-abi-custom
+ax-abi-port
 axdevice
 axdevice_base
 axfs-ng-vfs
