@@ -12,6 +12,8 @@ license.workspace = true
 [dependencies]
 ax-binfmt = { workspace = true }
 ax-abi-port = { workspace = true }
+ax-abi-linux = { workspace = true, optional = true }
+ax-crate-interface = { workspace = true }
 ax-abi-windows = { workspace = true, optional = true }
 ax-abi-darwin = { workspace = true, optional = true }
 ax-abi-path = { workspace = true, optional = true }
@@ -26,7 +28,7 @@ ax-abi-custom = { workspace = true, optional = true }
 default = ["win", "mac", "auto-dispatch"]
 
 # Select which syscall personalities are compiled in (one or more).
-linux = []
+linux = ["dep:ax-abi-linux"]
 win = ["dep:ax-abi-windows"]
 mac = ["dep:ax-abi-darwin"]
 # The embedded vector-table domain. An integrator supplies its own table, so it

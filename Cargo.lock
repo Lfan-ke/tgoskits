@@ -702,10 +702,12 @@ dependencies = [
  "ax-abi-darwin",
  "ax-abi-driver",
  "ax-abi-embedded",
+ "ax-abi-linux",
  "ax-abi-path",
  "ax-abi-port",
  "ax-abi-windows",
  "ax-binfmt",
+ "ax-crate-interface",
 ]
 
 [[package]]
@@ -7917,7 +7919,7 @@ dependencies = [
 name = "starry-kernel"
 version = "0.8.2"
 dependencies = [
- "ax-abi-linux",
+ "ax-abi",
  "ax-abi-port",
  "ax-alloc",
  "ax-binfmt",

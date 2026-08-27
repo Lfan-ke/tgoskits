@@ -173,7 +173,7 @@ ax-abi-port = { workspace = true, features = [
     "system",
     "creds",
 ] }
-ax-abi-linux = { workspace = true }
+ax-abi = { workspace = true, features = ["linux"] }
 ax-cgroup = { workspace = true }
 axfs-ng-vfs = { workspace = true }
 rdif-block = { workspace = true }
