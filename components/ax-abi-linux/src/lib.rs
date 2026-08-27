@@ -96,6 +96,8 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
             .lseek(arg(0) as i32, arg(1) as isize, arg(2) as i32),
         Sysno::writev => sys_writev(host, arg(0) as i32, arg(1), arg(2) as i32),
         Sysno::readv => sys_readv(host, arg(0) as i32, arg(1), arg(2) as i32),
+        Sysno::pread64 => sys_pread64(host, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
+        Sysno::pwrite64 => sys_pwrite64(host, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
 
         // Process and thread control.
         Sysno::getpid => Ok(host.tasks().getpid() as isize),
@@ -245,6 +247,52 @@ fn total_iov_len(host: &dyn LinuxHost, iov: usize, count: usize) -> SysResult {
             .ok_or(EINVAL)?;
     }
     Ok(total as isize)
+}
+
+/// `pread64(fd, ubuf, len, offset)`: positioned read - like [`sys_read`] but at
+/// an absolute `offset` that advances per chunk, leaving the file position
+/// untouched. A negative offset is `EINVAL`.
+fn sys_pread64(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize, offset: i64) -> SysResult {
+    if offset < 0 {
+        return Err(EINVAL);
+    }
+    let (platform, files) = (host.platform(), host.files());
+    let mut buf = [0u8; CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        let got = files.pread(fd, &mut buf[..n], offset as u64 + done as u64)? as usize;
+        if got == 0 {
+            break;
+        }
+        platform.write_user(ubuf + done, &buf[..got])?;
+        done += got;
+        if got < n {
+            break;
+        }
+    }
+    Ok(done as isize)
+}
+
+/// `pwrite64(fd, ubuf, len, offset)`: positioned write - like [`sys_write`] but
+/// at an absolute `offset` that advances per chunk. A negative offset is `EINVAL`.
+fn sys_pwrite64(host: &dyn LinuxHost, fd: i32, ubuf: usize, len: usize, offset: i64) -> SysResult {
+    if offset < 0 {
+        return Err(EINVAL);
+    }
+    let (platform, files) = (host.platform(), host.files());
+    let mut buf = [0u8; CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(CHUNK);
+        platform.read_user(ubuf + done, &mut buf[..n])?;
+        let written = files.pwrite(fd, &buf[..n], offset as u64 + done as u64)? as usize;
+        done += written;
+        if written < n {
+            break;
+        }
+    }
+    Ok(done as isize)
 }
 
 /// `getrandom(ubuf, len)`: fill user memory from the Random port in bounded
@@ -444,6 +492,12 @@ mod tests {
         fn lseek(&self, _fd: i32, o: isize, _w: i32) -> SysResult {
             Ok(o)
         }
+        fn pread(&self, _fd: i32, _b: &mut [u8], _o: u64) -> SysResult {
+            Ok(0)
+        }
+        fn pwrite(&self, _fd: i32, b: &[u8], _o: u64) -> SysResult {
+            Ok(b.len() as isize)
+        }
     }
     impl Mem for FixedHost {
         fn brk(&self, a: usize) -> SysResult {
@@ -537,6 +591,7 @@ mod tests {
         umem: RefCell<Vec<u8>>,
         written: RefCell<Vec<u8>>,
         to_read: RefCell<Vec<u8>>,
+        file: RefCell<Vec<u8>>,
         slept: RefCell<u64>,
         mask: RefCell<u64>,
         killed: RefCell<Option<(i32, i32)>>,
@@ -580,6 +635,22 @@ mod tests {
         }
         fn lseek(&self, _fd: i32, offset: isize, _whence: i32) -> SysResult {
             Ok(offset)
+        }
+        fn pread(&self, _fd: i32, buf: &mut [u8], offset: u64) -> SysResult {
+            let file = self.file.borrow();
+            let start = (offset as usize).min(file.len());
+            let n = buf.len().min(file.len() - start);
+            buf[..n].copy_from_slice(&file[start..start + n]);
+            Ok(n as isize)
+        }
+        fn pwrite(&self, _fd: i32, buf: &[u8], offset: u64) -> SysResult {
+            let mut file = self.file.borrow_mut();
+            let end = offset as usize + buf.len();
+            if file.len() < end {
+                file.resize(end, 0);
+            }
+            file[offset as usize..end].copy_from_slice(buf);
+            Ok(buf.len() as isize)
         }
     }
     impl Tasks for Host {
@@ -767,6 +838,39 @@ mod tests {
         let r = dispatch(&host, &Trap::new(Sysno::writev, [1, 0, 2, 0, 0, 0]));
         assert_eq!(r, Err(EFAULT));
         assert!(host.written.borrow().is_empty());
+    }
+
+    #[test]
+    fn pread_reads_at_offset() {
+        let host = Host::default();
+        *host.file.borrow_mut() = vec![10, 11, 12, 13, 14, 15];
+        *host.umem.borrow_mut() = vec![0u8; 4];
+        // pread(fd=3, ubuf=0, len=3, offset=2) reads [12,13,14] at the offset.
+        let r = dispatch(&host, &Trap::new(Sysno::pread64, [3, 0, 3, 2, 0, 0]));
+        assert_eq!(r, Ok(3));
+        assert_eq!(&host.umem.borrow()[..3], &[12, 13, 14]);
+    }
+
+    #[test]
+    fn pwrite_writes_at_offset() {
+        let host = Host::default();
+        *host.file.borrow_mut() = vec![0u8; 4];
+        *host.umem.borrow_mut() = vec![b'X', b'Y'];
+        // pwrite(fd=3, ubuf=0, len=2, offset=3) grows the file and writes at 3.
+        let r = dispatch(&host, &Trap::new(Sysno::pwrite64, [3, 0, 2, 3, 0, 0]));
+        assert_eq!(r, Ok(2));
+        assert_eq!(&*host.file.borrow(), &[0, 0, 0, b'X', b'Y']);
+    }
+
+    #[test]
+    fn pread_rejects_negative_offset() {
+        let host = Host::default();
+        // A negative loff_t (here -1) is EINVAL, before any access.
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::pread64, [3, 0, 3, (-1i64) as usize, 0, 0]),
+        );
+        assert_eq!(r, Err(EINVAL));
     }
 
     #[test]
