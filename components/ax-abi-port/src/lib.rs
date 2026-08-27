@@ -113,7 +113,12 @@ pub trait Files: Sync {
 
 #[cfg(feature = "mm")]
 pub trait Mem: Sync {
-    fn brk(&self, addr: usize) -> SysResult;
+    /// Where the program break sits now.
+    fn brk(&self) -> usize;
+    /// Move the program break to `addr`, mapping or unmapping to match. Fails
+    /// when the host will not place it there; what a caller reports for that is
+    /// the ABI's business.
+    fn set_brk(&self, addr: usize) -> SysResult;
     fn mmap(
         &self,
         addr: usize,

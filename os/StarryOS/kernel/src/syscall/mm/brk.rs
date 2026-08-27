@@ -4,29 +4,27 @@ use ax_task::current;
 use linux_raw_sys::general::RLIMIT_DATA;
 
 use crate::{
-    StarryResult,
+    StarryError, StarryResult,
     config::{USER_HEAP_BASE, USER_HEAP_SIZE, USER_HEAP_SIZE_MAX},
     mm::Backend,
     task::AsThread,
 };
 
-pub fn sys_brk(addr: usize) -> StarryResult<isize> {
+/// The program break as it stands.
+pub(crate) fn heap_top() -> usize {
+    current().as_thread().proc_data.get_heap_top() as usize
+}
+
+/// Move the program break to `addr`, mapping or unmapping to match. Errors when
+/// the address is outside the heap window, past `RLIMIT_DATA`, or unmappable.
+pub(crate) fn set_heap_top(addr: usize) -> StarryResult<()> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let current_top = proc_data.get_heap_top() as usize;
 
-    // brk(0) returns current heap top
-    if addr == 0 {
-        return Ok(current_top as isize);
-    }
-
-    // Linux brk syscall semantics:
-    // - Success: return new break address
-    // - Failure: return current break address (NOT -1, no errno)
-
     // Check address is within valid heap range
     if !(USER_HEAP_BASE..=USER_HEAP_BASE + USER_HEAP_SIZE_MAX).contains(&addr) {
-        return Ok(current_top as isize);
+        return Err(StarryError::InvalidInput);
     }
 
     // Check RLIMIT_DATA: Linux limits heap expansion by RLIMIT_DATA.
@@ -38,7 +36,7 @@ pub fn sys_brk(addr: usize) -> StarryResult<isize> {
     if rlimit_data != u64::MAX {
         let heap_size = addr.saturating_sub(USER_HEAP_BASE);
         if heap_size > rlimit_data as usize {
-            return Ok(current_top as isize);
+            return Err(StarryError::InvalidInput);
         }
     }
 
@@ -66,7 +64,7 @@ pub fn sys_brk(addr: usize) -> StarryResult<isize> {
                 )
                 .is_err()
             {
-                return Ok(current_top as isize);
+                return Err(StarryError::InvalidInput);
             }
             drop(aspace);
         }
@@ -82,10 +80,20 @@ pub fn sys_brk(addr: usize) -> StarryResult<isize> {
                 .unmap(shrink_start, shrink_size)
                 .is_err()
         {
-            return Ok(current_top as isize);
+            return Err(StarryError::InvalidInput);
         }
     }
 
     proc_data.set_heap_top(addr);
-    Ok(addr as isize) // Linux brk syscall returns new break address on success
+    Ok(())
+}
+
+pub fn sys_brk(addr: usize) -> StarryResult<isize> {
+    let current_top = heap_top();
+    // brk(0) queries, and a refused move reports the break that still stands
+    // rather than an error.
+    if addr == 0 {
+        return Ok(current_top as isize);
+    }
+    Ok(set_heap_top(addr).map_or(current_top as isize, |()| addr as isize))
 }

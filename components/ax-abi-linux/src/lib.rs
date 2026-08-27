@@ -174,7 +174,7 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
 
         // Address space.
         #[cfg(feature = "mm")]
-        Sysno::brk => host.mem()?.brk(arg(0)),
+        Sysno::brk => sys_brk(host.mem()?, arg(0)),
         #[cfg(feature = "mm")]
         Sysno::mmap => host.mem()?.mmap(
             arg(0),
@@ -283,6 +283,17 @@ fn sys_pwrite64(
         return Err(ops::EINVAL);
     }
     files.pwrite(fd, ubuf, len, offset as u64)
+}
+
+/// `brk(addr)`: query with zero, otherwise move the break. Linux answers a
+/// refused move with the break that still stands, not with an error.
+#[cfg(feature = "mm")]
+fn sys_brk(mem: &dyn ops::Mem, addr: usize) -> SysResult {
+    let current = mem.brk() as isize;
+    if addr == 0 {
+        return Ok(current);
+    }
+    Ok(mem.set_brk(addr).map_or(current, |_| addr as isize))
 }
 
 /// `ftruncate(fd, len)`: resize `fd`. A negative length is `EINVAL`; the port
@@ -592,8 +603,11 @@ mod tests {
         }
     }
     impl Mem for FixedHost {
-        fn brk(&self, a: usize) -> SysResult {
-            Ok(a as isize)
+        fn brk(&self) -> usize {
+            0
+        }
+        fn set_brk(&self, _addr: usize) -> SysResult {
+            Ok(0)
         }
         fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
             Ok(0)
@@ -712,6 +726,7 @@ mod tests {
         duped: RefCell<Option<(i32, i32, bool)>>,
         exited: RefCell<Option<(i32, bool)>>,
         synced: RefCell<Option<bool>>,
+        heap: RefCell<usize>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Mock {}
@@ -819,8 +834,16 @@ mod tests {
         }
     }
     impl Mem for Mock {
-        fn brk(&self, addr: usize) -> SysResult {
-            Ok(addr as isize)
+        fn brk(&self) -> usize {
+            *self.heap.borrow()
+        }
+        fn set_brk(&self, addr: usize) -> SysResult {
+            // The mock stands in for a host that refuses to go below its base.
+            if addr < 0x1000 {
+                return Err(ops::EINVAL);
+            }
+            *self.heap.borrow_mut() = addr;
+            Ok(0)
         }
         fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
             Ok(0x1000)
@@ -1211,6 +1234,27 @@ mod tests {
         assert_eq!(
             route(&full, &Trap::new(Sysno::getpid, [0; 6])),
             Some(Ok(42))
+        );
+    }
+
+    #[test]
+    fn brk_reports_the_standing_break_when_refused() {
+        let host = Mock::default();
+        *host.heap.borrow_mut() = 0x4000;
+        // A query leaves it alone.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::brk, [0, 0, 0, 0, 0, 0])),
+            Ok(0x4000)
+        );
+        // A move the host takes reports the new break.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::brk, [0x8000, 0, 0, 0, 0, 0])),
+            Ok(0x8000)
+        );
+        // A move it refuses reports the break that still stands, not an error.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::brk, [0x10, 0, 0, 0, 0, 0])),
+            Ok(0x8000)
         );
     }
 

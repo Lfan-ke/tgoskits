@@ -162,8 +162,13 @@ impl Files for KernelHost {
 }
 
 impl Mem for KernelHost {
-    fn brk(&self, addr: usize) -> SysResult {
-        port_result(syscall::sys_brk(addr))
+    fn brk(&self) -> usize {
+        syscall::heap_top()
+    }
+
+    fn set_brk(&self, addr: usize) -> SysResult {
+        syscall::set_heap_top(addr).map_err(errno)?;
+        Ok(0)
     }
 
     fn mmap(
