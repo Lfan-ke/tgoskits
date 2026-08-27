@@ -25,15 +25,31 @@ pub use ax_abi_darwin::{self, DarwinAbi};
 pub use ax_abi_driver;
 #[cfg(feature = "embedded")]
 pub use ax_abi_embedded::{self, VectorTable};
+#[cfg(feature = "linux")]
+pub use ax_abi_linux::{self, LinuxAbi};
 #[cfg(feature = "path-compat")]
 pub use ax_abi_path;
 pub use ax_abi_port::{self, CurrentHost, Host};
 #[cfg(feature = "win")]
 pub use ax_abi_windows::{self, WindowsAbi};
 pub use ax_binfmt::{
-    self, Abi, AbiError, AbiResult, CustomHandler, Dispatch, Personality, detect, dispatch_trap,
-    dispatch_trap_intercept,
+    self, Abi, AbiError, AbiResult, CustomHandler, Dispatch, Personality, TrapDispatch, TrapEnv,
+    TrapOutcome, detect, dispatch_trap, dispatch_trap_intercept,
 };
+
+/// Answers the hosting kernel's [`TrapDispatch`] with whichever personality is
+/// compiled in, so the kernel never names one. Swapping the ABI a system speaks
+/// is a feature change here.
+#[cfg(feature = "linux")]
+struct Dispatcher;
+
+#[cfg(feature = "linux")]
+#[ax_crate_interface::impl_interface]
+impl TrapDispatch for Dispatcher {
+    fn route(env: &mut dyn TrapEnv) -> TrapOutcome {
+        ax_abi_linux::LinuxAbi::route_trapped_syscall(env)
+    }
+}
 
 // Each compiled-in personality is a zero-sized handler with a `'static` address,
 // so the assembled set holds `'static` references without allocation of the

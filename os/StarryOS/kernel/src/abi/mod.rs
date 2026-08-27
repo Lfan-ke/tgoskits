@@ -19,6 +19,7 @@ mod port;
 
 use ax_abi_port::{Clock, Creds, CurrentHost, Files, Host, Mem, Platform, Random, Signals, System, Tasks};
 use ax_binfmt::TrapEnv;
+use ax_crate_interface::call_interface;
 use ax_runtime::hal::cpu::uspace::UserContext;
 
 use crate::{Errno, StarryError, StarryResult};
@@ -96,12 +97,15 @@ impl CurrentHost for KernelHost {
 
 /// Offer a trapped syscall to the Linux personality first.
 ///
-/// `Some(result)` when the domain owns the call; `None` leaves it to the
-/// kernel's own table. Returning the outcome rather than writing the trap frame
-/// keeps one epilogue for both paths, so a migrated syscall still goes through
-/// the signal-redirect check and the retval encoding the kernel already applies.
+/// `Some(result)` when a personality owns the call; `None` leaves it to the
+/// kernel's own table. The kernel does not name the personality: the ABI layer
+/// answers, so which ABI this system speaks is a dependency of that layer.
+///
+/// Returning the outcome rather than writing the trap frame keeps one epilogue
+/// for both paths, so a migrated syscall still goes through the signal-redirect
+/// check and the retval encoding the kernel already applies.
 pub fn route_syscall(uctx: &mut UserContext) -> Option<StarryResult<isize>> {
-    ax_abi_linux::LinuxAbi::route_trapped_syscall(&TrapCtx(uctx))
+    call_interface!(ax_binfmt::TrapDispatch::route, &mut TrapCtx(uctx))
         .map(|result| result.map_err(|errno| StarryError::from(Errno::new(errno))))
 }
 

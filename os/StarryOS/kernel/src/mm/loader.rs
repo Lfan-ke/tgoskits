@@ -819,7 +819,7 @@ fn load_user_app_with_depth(
             // diagnostic names the format. Running a PE/Mach-O image needs the
             // personality loader wired into exec, a later on-target step; until
             // then report precisely instead of a generic "invalid executable".
-            if let Some(abi) = ax_binfmt::detect(&data) {
+            if let Some(abi) = ax_abi::detect(&data) {
                 warn!("exec {path}: {abi:?} personality image is not yet runnable");
             }
             return Err(StarryError::InvalidExecutable);
