@@ -27,6 +27,7 @@ members = [
     "components/ax-abi-darwin",
     "components/ax-abi-path",
     "components/ax-abi-driver",
+    "components/ax-abi-embedded",
     "components/ax-cgroup",
     "components/ax-lazyinit",
     "components/axbacktrace",
@@ -145,6 +146,7 @@ ax-abi-windows = { version = "0.1", path = "components/ax-abi-windows" }
 ax-abi-darwin = { version = "0.1", path = "components/ax-abi-darwin" }
 ax-abi-path = { version = "0.1", path = "components/ax-abi-path" }
 ax-abi-driver = { version = "0.1", path = "components/ax-abi-driver" }
+ax-abi-embedded = { version = "0.1", path = "components/ax-abi-embedded" }
 cpu-local = { version = "0.2", path = "components/cpu-local" }
 ax-cpu = { version = "0.8", path = "components/axcpu" }
 ax-cpumask = { version = "0.4", path = "components/cpumask" }

@@ -20,6 +20,8 @@ use alloc::vec::Vec;
 pub use ax_abi_darwin::{self, DarwinAbi};
 #[cfg(feature = "driver-compat")]
 pub use ax_abi_driver;
+#[cfg(feature = "embedded")]
+pub use ax_abi_embedded::{self, VectorTable};
 #[cfg(feature = "path-compat")]
 pub use ax_abi_path;
 #[cfg(feature = "win")]

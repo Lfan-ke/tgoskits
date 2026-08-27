@@ -33,6 +33,10 @@ pub enum Abi {
     Windows,
     /// Mach-O images executing the Darwin (BSD + Mach) ABI.
     Darwin,
+    /// A bare interrupt-vector table: the degenerate dispatch domain for
+    /// embedded targets, with no OS object model and no magic-routed image
+    /// format. Installed explicitly by an integrator, not selected by [`detect`].
+    Embedded,
 }
 
 /// Errors surfaced while recognizing, loading or running a foreign binary.

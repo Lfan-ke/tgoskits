@@ -700,6 +700,7 @@ version = "0.1.0"
 dependencies = [
  "ax-abi-darwin",
  "ax-abi-driver",
+ "ax-abi-embedded",
  "ax-abi-path",
  "ax-abi-windows",
  "ax-binfmt",
@@ -715,6 +716,13 @@ dependencies = [
 [[package]]
 name = "ax-abi-driver"
 version = "0.1.0"
+
+[[package]]
+name = "ax-abi-embedded"
+version = "0.1.0"
+dependencies = [
+ "ax-binfmt",
+]
 
 [[package]]
 name = "ax-abi-linux"
