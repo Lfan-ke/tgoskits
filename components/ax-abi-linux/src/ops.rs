@@ -70,6 +70,12 @@ pub trait Files: Sync {
     fn dup(&self, fd: i32) -> SysResult;
     /// `lseek` - reposition `fd`'s offset (`whence` is `SEEK_*`).
     fn lseek(&self, fd: i32, offset: isize, whence: i32) -> SysResult;
+    /// `pread` - read up to `buf.len()` bytes from `fd` at absolute `offset`,
+    /// leaving the file position unchanged, returning the count read.
+    fn pread(&self, fd: i32, buf: &mut [u8], offset: u64) -> SysResult;
+    /// `pwrite` - write `buf` to `fd` at absolute `offset`, leaving the file
+    /// position unchanged, returning the count written.
+    fn pwrite(&self, fd: i32, buf: &[u8], offset: u64) -> SysResult;
 }
 
 /// Address-space service.
