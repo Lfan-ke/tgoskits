@@ -16,6 +16,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "custom")]
+pub use ax_abi_custom::{self, CustomSyscalls};
 #[cfg(feature = "mac")]
 pub use ax_abi_darwin::{self, DarwinAbi};
 #[cfg(feature = "driver-compat")]
@@ -28,6 +30,7 @@ pub use ax_abi_path;
 pub use ax_abi_windows::{self, WindowsAbi};
 pub use ax_binfmt::{
     self, Abi, AbiError, AbiResult, CustomHandler, Dispatch, Personality, detect, dispatch_trap,
+    dispatch_trap_intercept,
 };
 
 // Each compiled-in personality is a zero-sized handler with a `'static` address,

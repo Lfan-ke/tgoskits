@@ -12,6 +12,7 @@ ax-abi-darwin
 ax-abi-path
 ax-abi-driver
 ax-abi-embedded
+ax-abi-custom
 axdevice
 axdevice_base
 axfs-ng-vfs

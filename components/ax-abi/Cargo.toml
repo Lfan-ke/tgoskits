@@ -16,6 +16,7 @@ ax-abi-darwin = { workspace = true, optional = true }
 ax-abi-path = { workspace = true, optional = true }
 ax-abi-driver = { workspace = true, optional = true }
 ax-abi-embedded = { workspace = true, optional = true }
+ax-abi-custom = { workspace = true, optional = true }
 
 [features]
 # Default wires in every personality whose crate exists today plus automatic
@@ -30,6 +31,8 @@ mac = ["dep:ax-abi-darwin"]
 # The embedded vector-table domain. An integrator supplies its own table, so it
 # is re-exported rather than auto-registered in `personalities()`.
 embedded = ["dep:ax-abi-embedded"]
+# The user-extensible custom-syscall registry, opt-in to the override capability.
+custom = ["dep:ax-abi-custom"]
 
 # Route each executed image to a personality by its magic bytes.
 auto-dispatch = []
