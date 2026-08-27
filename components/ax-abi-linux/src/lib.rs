@@ -133,6 +133,7 @@ fn dispatch(host: &dyn LinuxHost, uctx: &dyn TrapEnv) -> SysResult {
 
         // Clocks - the domain packs the timespec/timeval itself.
         Sysno::clock_gettime => sys_clock_gettime(host, arg(0) as i32, arg(1)),
+        Sysno::clock_getres => sys_clock_getres(host, arg(0) as i32, arg(1)),
         Sysno::gettimeofday => sys_gettimeofday(host, arg(0)),
         Sysno::nanosleep => sys_nanosleep(host, arg(0), arg(1)),
 
@@ -380,6 +381,18 @@ fn sys_clock_gettime(host: &dyn LinuxHost, clockid: i32, ts: usize) -> SysResult
     };
     let packed = pack_time_pair((ns / NS_PER_SEC) as i64, (ns % NS_PER_SEC) as i64);
     host.platform().write_user(ts, &packed)?;
+    Ok(0)
+}
+
+/// `clock_getres(clockid, res)`: report a clock's resolution. Both supported
+/// clocks are nanosecond-resolution; a null `res` is a valid clock-liveness query.
+fn sys_clock_getres(host: &dyn LinuxHost, clockid: i32, res: usize) -> SysResult {
+    if !matches!(clockid, CLOCK_REALTIME | CLOCK_MONOTONIC) {
+        return Err(EINVAL);
+    }
+    if res != 0 {
+        host.platform().write_user(res, &pack_time_pair(0, 1))?;
+    }
     Ok(0)
 }
 
@@ -1122,6 +1135,47 @@ mod tests {
         *host.umem.borrow_mut() = vec![0u8; 16];
         assert_eq!(
             dispatch(&host, &Trap::new(Sysno::clock_gettime, [99, 0, 0, 0, 0, 0])),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn clock_getres_reports_nanosecond_resolution() {
+        let host = Host::default();
+        *host.umem.borrow_mut() = vec![0u8; 32];
+        // res at a non-null user address (address 0 is NULL per the ABI).
+        let r = dispatch(
+            &host,
+            &Trap::new(
+                Sysno::clock_getres,
+                [CLOCK_MONOTONIC as usize, 8, 0, 0, 0, 0],
+            ),
+        );
+        assert_eq!(r, Ok(0));
+        let mem = host.umem.borrow();
+        assert_eq!(i64::from_le_bytes(mem[8..16].try_into().unwrap()), 0);
+        assert_eq!(i64::from_le_bytes(mem[16..24].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn clock_getres_allows_null_res() {
+        let host = Host::default();
+        // A null res pointer still validates the clock id and returns 0.
+        let r = dispatch(
+            &host,
+            &Trap::new(
+                Sysno::clock_getres,
+                [CLOCK_REALTIME as usize, 0, 0, 0, 0, 0],
+            ),
+        );
+        assert_eq!(r, Ok(0));
+    }
+
+    #[test]
+    fn clock_getres_rejects_unknown_clock() {
+        let host = Host::default();
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::clock_getres, [99, 0, 0, 0, 0, 0])),
             Err(EINVAL)
         );
     }
