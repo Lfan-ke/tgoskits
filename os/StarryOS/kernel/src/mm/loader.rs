@@ -739,6 +739,51 @@ pub fn clear_elf_cache() {
 /// # Returns
 /// - The entry point of the user app.
 /// - The stack pointer of the user app.
+/// Lends a personality the address space `exec` is building, so an image the
+/// kernel does not parse itself is still mapped by the package that does.
+struct ExecSpace<'a> {
+    uspace: &'a mut AddrSpace,
+}
+
+impl ax_binfmt::LoadEnv for ExecSpace<'_> {
+    fn map_region(
+        &mut self,
+        va: u64,
+        len: u64,
+        prot: ax_binfmt::Prot,
+        init: Option<&[u8]>,
+    ) -> ax_binfmt::AbiResult<()> {
+        let at = VirtAddr::from_usize(va as usize);
+        let start = at.align_down_4k();
+        let size = (at - start + len as usize).align_up_4k();
+        let mut flags = MappingFlags::USER;
+        if prot.contains(ax_binfmt::Prot::READ) {
+            flags |= MappingFlags::READ;
+        }
+        if prot.contains(ax_binfmt::Prot::WRITE) {
+            flags |= MappingFlags::WRITE | MappingFlags::READ;
+        }
+        if prot.contains(ax_binfmt::Prot::EXEC) {
+            flags |= MappingFlags::EXECUTE;
+        }
+        (|| -> StarryResult<()> {
+            self.uspace.map(
+                start,
+                size,
+                flags,
+                true,
+                Backend::new_alloc(start, PAGE_SIZE_4K, "[image]"),
+            )?;
+            self.uspace.populate_area(start, size, flags)?;
+            if let Some(init) = init {
+                self.uspace.write(at, init)?;
+            }
+            Ok(())
+        })()
+        .map_err(|_| ax_binfmt::AbiError::MapFailed)
+    }
+}
+
 pub fn load_user_app(
     uspace: &mut AddrSpace,
     loc: Location,
@@ -815,14 +860,34 @@ fn load_user_app_with_depth(
                     interpreter_depth + 1,
                 );
             }
-            // Not ELF and not a shebang: sniff the binary's personality so the
-            // diagnostic names the format. Running a PE/Mach-O image needs the
-            // personality loader wired into exec, a later on-target step; until
-            // then report precisely instead of a generic "invalid executable".
-            if let Some(abi) = ax_abi::detect(&data) {
-                warn!("exec {path}: {abi:?} personality image is not yet runnable");
-            }
-            return Err(StarryError::InvalidExecutable);
+            // Not ELF and not a shebang: hand the image to whichever
+            // personality claims it. Which personalities exist is settled by
+            // what the build links in, so this names none of them.
+            let abi = ax_abi::dispatch(&data).map_err(|_| StarryError::InvalidExecutable)?;
+            let loader = abi.loader().ok_or_else(|| {
+                warn!("exec {path}: {:?} images are recognized but not loadable", abi.abi());
+                StarryError::InvalidExecutable
+            })?;
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let envs: Vec<&str> = envs.iter().map(String::as_str).collect();
+            let loaded = loader
+                .load(
+                    &ax_binfmt::LoadRequest {
+                        image: &data,
+                        args: &args,
+                        envs: &envs,
+                    },
+                    &mut ExecSpace {
+                        uspace: &mut *uspace,
+                    },
+                )
+                .map_err(|err| {
+                    warn!("exec {path}: {err}");
+                    StarryError::InvalidExecutable
+                })?;
+            // A personality that leaves the stack to the kernel gets the same
+            // one an ELF does, minus the aux vector it has no use for.
+            (VirtAddr::from_usize(loaded.entry as usize), Vec::new())
         }
     };
 
