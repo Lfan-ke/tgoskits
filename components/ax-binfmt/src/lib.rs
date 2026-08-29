@@ -215,7 +215,7 @@ impl Registration {
 ///
 /// Takes a path to a `fn() -> &'static dyn Personality`.
 #[macro_export]
-macro_rules! register_personality {
+macro_rules! register_sysabi {
     ($get:path) => {
         const _: () = {
             #[used(linker)]
@@ -246,7 +246,7 @@ fn no_personality() -> &'static dyn Personality {
     &IT
 }
 
-register_personality!(no_personality);
+register_sysabi!(no_personality);
 
 /// Every personality this build linked in.
 pub fn registered() -> &'static [Registration] {
