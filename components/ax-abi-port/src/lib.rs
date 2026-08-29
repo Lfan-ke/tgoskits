@@ -44,6 +44,8 @@ pub const EBADF: i32 = 9;
 pub const ESRCH: i32 = 3;
 /// `ESPIPE` - the descriptor does not admit positional io.
 pub const ESPIPE: i32 = 29;
+/// `EOPNOTSUPP` - the operation is not one this build carries out.
+pub const EOPNOTSUPP: i32 = 95;
 /// `EINTR` - a signal cut the call short.
 pub const EINTR: i32 = 4;
 
@@ -121,6 +123,10 @@ pub trait Files: Sync {
     fn readv(&self, fd: i32, segs: &[Segment]) -> SysResult;
     /// Write `segs` in order to `fd`, in one underlying transfer.
     fn writev(&self, fd: i32, segs: &[Segment]) -> SysResult;
+    /// Read from `fd` at absolute `offset` into `segs`, in one transfer.
+    fn preadv(&self, fd: i32, segs: &[Segment], offset: u64) -> SysResult;
+    /// Write `segs` to `fd` at absolute `offset`, in one transfer.
+    fn pwritev(&self, fd: i32, segs: &[Segment], offset: u64) -> SysResult;
     /// Whether `fd` can be read or written at an absolute offset. Which
     /// descriptors can is the host's property, and so is the error it reports
     /// for the ones that cannot; an ABI asks before it validates an offset,
