@@ -228,11 +228,9 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
 
         // Signals - the domain moves the sigset; the port carries a u64 mask.
         #[cfg(feature = "signal")]
-        Sysno::kill => host.signals()?.kill(arg(0) as i32, arg(1) as i32),
+        Sysno::kill => sys_kill(host.signals()?, arg(0) as i32, arg(1) as u32),
         #[cfg(feature = "signal")]
-        Sysno::tgkill => host
-            .signals()?
-            .tgkill(arg(0) as i32, arg(1) as i32, arg(2) as i32),
+        Sysno::tgkill => sys_tgkill(host.signals()?, arg(0) as i32, arg(1) as i32, arg(2) as u32),
         #[cfg(feature = "signal")]
         Sysno::rt_sigprocmask => sys_rt_sigprocmask(
             host.platform(),
@@ -547,6 +545,28 @@ fn sys_gettimeofday(
     Some(platform.write_user(tv, &packed).map(|_| 0))
 }
 
+/// `kill(pid, signo)`: the sign of `pid` says who is meant - a process, the
+/// caller's group, everyone reachable, or one group.
+#[cfg(feature = "signal")]
+fn sys_kill(signals: &dyn ops::Signals, pid: i32, signo: u32) -> SysResult {
+    let target = match pid {
+        1.. => ops::SignalTarget::Process(pid as u32),
+        0 => ops::SignalTarget::CallerGroup,
+        -1 => ops::SignalTarget::All,
+        _ => ops::SignalTarget::Group(pid.checked_neg().ok_or(ops::EINVAL)? as u32),
+    };
+    signals.kill(target, signo)
+}
+
+/// `tgkill(tgid, tid, signo)`: both ids must be positive.
+#[cfg(feature = "signal")]
+fn sys_tgkill(signals: &dyn ops::Signals, tgid: i32, tid: i32, signo: u32) -> SysResult {
+    if tgid <= 0 || tid <= 0 {
+        return Err(ops::EINVAL);
+    }
+    signals.tgkill(tgid as u32, tid as u32, signo)
+}
+
 /// `rt_sigprocmask(how, set, old, sigsetsize)`: move the user `sigset_t`, which
 /// the ABI fixes at eight bytes.
 ///
@@ -727,10 +747,10 @@ mod tests {
         }
     }
     impl Signals for FixedHost {
-        fn kill(&self, _p: i32, _s: i32) -> SysResult {
+        fn kill(&self, _target: ops::SignalTarget, _signo: u32) -> SysResult {
             Ok(0)
         }
-        fn tgkill(&self, _t: i32, _i: i32, _s: i32) -> SysResult {
+        fn tgkill(&self, _tgid: u32, _tid: u32, _signo: u32) -> SysResult {
             Ok(0)
         }
         fn sigprocmask(&self, _h: i32, _n: Option<u64>) -> Result<u64, i32> {
@@ -823,7 +843,7 @@ mod tests {
         file: RefCell<Vec<u8>>,
         slept: RefCell<u64>,
         mask: RefCell<u64>,
-        killed: RefCell<Option<(i32, i32)>>,
+        killed: RefCell<Option<(ops::SignalTarget, u32)>>,
         duped: RefCell<Option<(i32, i32, bool)>>,
         exited: RefCell<Option<(i32, bool)>>,
         synced: RefCell<Option<bool>>,
@@ -963,12 +983,12 @@ mod tests {
         }
     }
     impl Signals for Mock {
-        fn kill(&self, pid: i32, sig: i32) -> SysResult {
-            *self.killed.borrow_mut() = Some((pid, sig));
+        fn kill(&self, target: ops::SignalTarget, signo: u32) -> SysResult {
+            *self.killed.borrow_mut() = Some((target, signo));
             Ok(0)
         }
-        fn tgkill(&self, _tgid: i32, tid: i32, sig: i32) -> SysResult {
-            *self.killed.borrow_mut() = Some((tid, sig));
+        fn tgkill(&self, _tgid: u32, tid: u32, signo: u32) -> SysResult {
+            *self.killed.borrow_mut() = Some((ops::SignalTarget::Process(tid), signo));
             Ok(0)
         }
         fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32> {
@@ -1573,13 +1593,28 @@ mod tests {
     }
 
     #[test]
-    fn kill_routes_to_signals() {
+    fn kill_reads_the_target_from_the_sign_of_pid() {
         let host = Mock::default();
+        for (pid, want) in [
+            (1234i32, ops::SignalTarget::Process(1234)),
+            (0, ops::SignalTarget::CallerGroup),
+            (-1, ops::SignalTarget::All),
+            (-42, ops::SignalTarget::Group(42)),
+        ] {
+            assert_eq!(
+                dispatch(
+                    &host,
+                    &Trap::new(Sysno::kill, [pid as usize, 9, 0, 0, 0, 0])
+                ),
+                Ok(0)
+            );
+            assert_eq!(*host.killed.borrow(), Some((want, 9)));
+        }
+        // tgkill wants both ids positive.
         assert_eq!(
-            dispatch(&host, &Trap::new(Sysno::kill, [1234, 9, 0, 0, 0, 0])),
-            Ok(0)
+            dispatch(&host, &Trap::new(Sysno::tgkill, [0, 7, 9, 0, 0, 0])),
+            Err(ops::EINVAL)
         );
-        assert_eq!(*host.killed.borrow(), Some((1234, 9)));
     }
 
     #[test]
