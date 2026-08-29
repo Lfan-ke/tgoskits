@@ -122,6 +122,13 @@ pub trait TrapEnv {
     fn arg(&self, i: usize) -> usize;
     /// Write the syscall's return value into the trap frame.
     fn set_result(&mut self, value: usize);
+
+    /// Report failure through whatever channel the ABI uses beyond the return
+    /// register: Darwin sets the carry flag and returns a positive errno, where
+    /// Linux folds both into a negative value. A host without such a channel
+    /// ignores this, and an ABI that encodes failure in the value alone never
+    /// calls it.
+    fn set_error(&mut self, _failed: bool) {}
 }
 
 /// Whether a trapped index was serviced.
