@@ -286,6 +286,10 @@ fn dispatch(host: &dyn Host, uctx: &dyn TrapEnv) -> SysResult {
 /// negative offset is `EINVAL`.
 #[cfg(feature = "fs")]
 fn sys_pread64(files: &dyn ops::Files, fd: i32, ubuf: usize, len: usize, offset: i64) -> SysResult {
+    // Linux rejects a descriptor that cannot seek before it looks at the
+    // offset (`FMODE_PREAD` precedes `rw_verify_area`), so a pipe read at a
+    // negative offset reports ESPIPE rather than EINVAL.
+    files.seekable(fd)?;
     if offset < 0 {
         return Err(ops::EINVAL);
     }
@@ -364,8 +368,13 @@ fn sys_mmap(
     fd: i32,
     offset: isize,
 ) -> Option<SysResult> {
-    use linux_raw_sys::general::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED};
-    if flags & !(MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED) != 0 {
+    use linux_raw_sys::general::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, MAP_TYPE};
+    // The mapping type is an enumeration inside `MAP_TYPE`, not a pair of
+    // independent bits: `MAP_SHARED_VALIDATE` is `MAP_SHARED | MAP_PRIVATE`.
+    let kind = flags & MAP_TYPE;
+    if (kind != MAP_SHARED && kind != MAP_PRIVATE)
+        || flags & !(MAP_TYPE | MAP_ANONYMOUS | MAP_FIXED) != 0
+    {
         return None;
     }
     Some(map_request(mem, addr, len, prot, flags, fd, offset))
@@ -381,16 +390,12 @@ fn map_request(
     fd: i32,
     offset: isize,
 ) -> SysResult {
-    use linux_raw_sys::general::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED};
+    use linux_raw_sys::general::{MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED, MAP_TYPE};
     if len == 0 {
         return Err(ops::EINVAL);
     }
     let bits = prot_from_abi(prot)?;
-    let shared = match (flags & MAP_SHARED != 0, flags & MAP_PRIVATE != 0) {
-        (true, false) => true,
-        (false, true) => false,
-        _ => return Err(ops::EINVAL),
-    };
+    let shared = flags & MAP_TYPE == MAP_SHARED;
     let offset = usize::try_from(offset).map_err(|_| ops::EINVAL)?;
     if !offset.is_multiple_of(PAGE_SIZE) {
         return Err(ops::EINVAL);
@@ -777,6 +782,9 @@ mod tests {
         fn validate(&self, _fd: i32) -> SysResult {
             Ok(0)
         }
+        fn seekable(&self, _fd: i32) -> SysResult {
+            Ok(0)
+        }
         fn pread(&self, _fd: i32, _u: usize, _len: usize, _o: u64) -> SysResult {
             Ok(0)
         }
@@ -965,6 +973,9 @@ mod tests {
             Ok(offset)
         }
         fn validate(&self, fd: i32) -> SysResult {
+            if fd < 0 { Err(ops::EBADF) } else { Ok(0) }
+        }
+        fn seekable(&self, fd: i32) -> SysResult {
             if fd < 0 { Err(ops::EBADF) } else { Ok(0) }
         }
         fn pread(&self, _fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
@@ -1565,17 +1576,23 @@ mod tests {
         );
         assert!(host.mapped.borrow().unwrap().fixed);
         assert!(host.mapped.borrow().unwrap().shared);
-        // Neither shared nor private, and an unaligned offset, are refused.
-        assert_eq!(
-            dispatch(
-                &host,
-                &Trap::new(
-                    Sysno::mmap,
-                    [0, 0x1000, PROT_READ as usize, 0, -1i32 as usize, 0]
+        // A type field that is neither MAP_SHARED nor MAP_PRIVATE is not a shape
+        // the domain claims. MAP_SHARED_VALIDATE is `MAP_SHARED | MAP_PRIVATE`,
+        // so decoding the two as independent bits would refuse a mapping the
+        // caller supports; both it and an empty type field go back untouched.
+        for kind in [0, MAP_SHARED | MAP_PRIVATE] {
+            assert!(
+                route(
+                    &host,
+                    &Trap::new(
+                        Sysno::mmap,
+                        [0, 0x1000, PROT_READ as usize, kind as usize, 7, 0]
+                    )
                 )
-            ),
-            Err(ops::EINVAL)
-        );
+                .is_none()
+            );
+        }
+        // An unaligned offset is refused.
         assert_eq!(
             dispatch(
                 &host,

@@ -463,11 +463,28 @@ pub fn sys_pread64(
     len: usize,
     offset: __kernel_off_t,
 ) -> StarryResult<isize> {
-    let f = file_or_espipe(fd)?;
+    seekable_fd(fd)?;
     if offset < 0 {
         return Err(StarryError::InvalidInput);
     }
-    let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
+    read_at_fd(fd, buf, len, offset as _)
+}
+
+/// Whether `fd` admits positioned I/O, reporting ESPIPE for the pipes and
+/// sockets that do not.
+pub(crate) fn seekable_fd(fd: c_int) -> StarryResult<()> {
+    file_or_espipe(fd).map(|_| ())
+}
+
+/// One positioned read, without the caller's own offset rule.
+pub(crate) fn read_at_fd(
+    fd: c_int,
+    buf: *mut u8,
+    len: usize,
+    offset: u64,
+) -> StarryResult<isize> {
+    let f = file_or_espipe(fd)?;
+    let read = f.inner().read_at(VmBytesMut::new(buf, len), offset)?;
     Ok(read as _)
 }
 
@@ -480,6 +497,16 @@ pub fn sys_pwrite64(
     if offset < 0 {
         return Err(StarryError::InvalidInput);
     }
+    write_at_fd(fd, buf, len, offset as _)
+}
+
+/// One positioned write, without the caller's own offset rule.
+pub(crate) fn write_at_fd(
+    fd: c_int,
+    buf: *const u8,
+    len: usize,
+    offset: u64,
+) -> StarryResult<isize> {
     // Route memfd fds through the seal-aware `Memfd::write_at` so
     // `F_SEAL_WRITE`/`F_SEAL_GROW` apply to offset writes the same
     // as they do to seq writes; otherwise `pwrite64` would silently
@@ -489,7 +516,7 @@ pub fn sys_pwrite64(
             return Ok(0);
         }
         let data = copy_user_read_buf(buf, len)?;
-        let write = memfd.write_at(data.as_slice(), offset as u64)?;
+        let write = memfd.write_at(data.as_slice(), offset)?;
         return Ok(write as _);
     }
     let f = file_or_espipe_write(fd)?;
@@ -499,9 +526,9 @@ pub fn sys_pwrite64(
     }
     let file_like = get_file_like(fd)?;
     validate_user_read_buf(buf, len)?;
-    memfd_checks_before_write_at(&file_like, offset as u64, len as u64)?;
+    memfd_checks_before_write_at(&file_like, offset, len as u64)?;
     let data = copy_user_read_buf(buf, len)?;
-    let write = f.inner().write_at(data.as_slice(), offset as _)?;
+    let write = f.inner().write_at(data.as_slice(), offset)?;
     Ok(write as _)
 }
 

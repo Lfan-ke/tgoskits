@@ -301,6 +301,9 @@ mod tests {
         fn validate(&self, _fd: i32) -> SysResult {
             Ok(0)
         }
+        fn seekable(&self, _fd: i32) -> SysResult {
+            Ok(0)
+        }
         fn pread(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> SysResult {
             Ok(len as isize)
         }

@@ -96,6 +96,11 @@ pub trait Files: Sync {
     fn seek(&self, fd: i32, offset: isize, from: SeekFrom) -> SysResult;
     /// Report whether `fd` is open, without touching it.
     fn validate(&self, fd: i32) -> SysResult;
+    /// Whether `fd` can be read or written at an absolute offset. Which
+    /// descriptors can is the host's property, and so is the error it reports
+    /// for the ones that cannot; an ABI asks before it validates an offset,
+    /// because that is the order the check falls in.
+    fn seekable(&self, fd: i32) -> SysResult;
     /// Read from `fd` at absolute `offset` into the user range at `uaddr`,
     /// leaving the file position unchanged.
     fn pread(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult;
