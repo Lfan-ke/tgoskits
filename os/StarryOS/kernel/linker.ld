@@ -28,6 +28,12 @@ SECTIONS {
         __stop_kmod_export = .;
     }
 
+    abi_register : {
+        __start_abi_register = .;
+        KEEP(*(abi_register))
+        __stop_abi_register = .;
+    }
+
     .kallsyms : ALIGN(4K) {
         __kallsyms_start = .;
         . += 8M; /* reserve space for kallsyms, can be recycled */
