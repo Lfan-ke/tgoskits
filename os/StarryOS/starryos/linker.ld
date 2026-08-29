@@ -40,6 +40,12 @@ SECTIONS {
         __stop_binfmt_register = .;
     }
 
+    custom_register : {
+        __start_custom_register = .;
+        KEEP(*(custom_register))
+        __stop_custom_register = .;
+    }
+
     .kallsyms : ALIGN(4K) {
         __kallsyms_start = .;
         . += 8M; /* reserve space for kallsyms, can be recycled */

@@ -230,6 +230,84 @@ pub trait CustomHandler: Sync {
     fn handle(&self, env: &mut dyn TrapEnv) -> Dispatch;
 }
 
+/// One extension's entry in the registry, alongside the ABI implementations.
+///
+/// A reserved index range is claimed the same way an ABI is: by being linked
+/// in. Nobody passes a list of extensions to the dispatcher.
+#[repr(C)]
+pub struct CustomRegistration {
+    get: fn() -> &'static dyn CustomHandler,
+}
+
+impl CustomRegistration {
+    /// Wrap the accessor a registration hands out.
+    pub const fn new(get: fn() -> &'static dyn CustomHandler) -> Self {
+        Self { get }
+    }
+
+    /// The extension this entry registers.
+    pub fn handler(&self) -> &'static dyn CustomHandler {
+        (self.get)()
+    }
+}
+
+/// Register an extension for a reserved index range.
+///
+/// Takes a path to a `fn() -> &'static dyn CustomHandler`.
+#[macro_export]
+macro_rules! register_custom {
+    ($get:path) => {
+        const _: () = {
+            #[used(linker)]
+            #[unsafe(link_section = "custom_register")]
+            static REGISTRATION: $crate::CustomRegistration = $crate::CustomRegistration::new($get);
+        };
+    };
+}
+
+/// An extension that claims nothing, registered so the section always exists
+/// and its bounds are always defined, however few extensions are linked in.
+struct NoCustom;
+
+impl CustomHandler for NoCustom {
+    fn handle(&self, _env: &mut dyn TrapEnv) -> Dispatch {
+        Dispatch::Passthrough
+    }
+}
+
+fn no_custom() -> &'static dyn CustomHandler {
+    static IT: NoCustom = NoCustom;
+    &IT
+}
+
+register_custom!(no_custom);
+
+/// Every extension this build linked in.
+pub fn registered_custom() -> &'static [CustomRegistration] {
+    unsafe extern "C" {
+        fn __start_custom_register();
+        fn __stop_custom_register();
+    }
+    let start = __start_custom_register as *const () as *const CustomRegistration;
+    let stop = __stop_custom_register as *const () as *const CustomRegistration;
+    // SAFETY: the two symbols bound one array of `CustomRegistration`, which
+    // the linker fills from the `custom_register` section of every linked crate.
+    unsafe {
+        let len = (stop as usize - start as usize) / size_of::<CustomRegistration>();
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
+/// Offer a trapped index to every registered extension, in registration order.
+pub fn dispatch_registered_custom(env: &mut dyn TrapEnv) -> Dispatch {
+    for entry in registered_custom() {
+        if entry.handler().handle(env) == Dispatch::Handled {
+            return Dispatch::Handled;
+        }
+    }
+    Dispatch::Passthrough
+}
+
 /// What servicing a trapped index produced: `None` when no personality claimed
 /// it, otherwise the outcome - a return value, or a positive error number the
 /// caller encodes its own way.

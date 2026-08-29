@@ -9,6 +9,13 @@ keywords = ["embedded", "vector-table", "personality", "no-std"]
 categories = ["no-std", "embedded"]
 license.workspace = true
 
+[features]
+# A target with an interrupt controller, which is the ordinary MCU/MPU case.
+# Turn it off for a machine that only ever traps synchronously: the vector
+# table then carries no asynchronous entries at all.
+default = ["interrupts"]
+interrupts = []
+
 [dependencies]
 ax-dispatch = { workspace = true }
 ax-binfmt = { workspace = true }
