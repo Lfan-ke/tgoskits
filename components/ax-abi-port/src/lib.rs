@@ -133,6 +133,39 @@ bitflags! {
     }
 }
 
+/// Where a new mapping's contents come from.
+#[cfg(feature = "mm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapSource {
+    /// Zero-filled pages.
+    Anonymous,
+    /// A file, from `offset`.
+    File {
+        /// The descriptor to map.
+        fd: i32,
+        /// Where in the file the mapping starts.
+        offset: usize,
+    },
+}
+
+/// A request to place a new mapping.
+#[cfg(feature = "mm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapRequest {
+    /// Where to place it; zero asks the host to choose.
+    pub addr: usize,
+    /// How much to map.
+    pub len: usize,
+    /// What the mapping allows.
+    pub prot: Prot,
+    /// Place it exactly at `addr`, replacing whatever is there.
+    pub fixed: bool,
+    /// Writes are visible to others mapping the same object.
+    pub shared: bool,
+    /// What backs it.
+    pub source: MapSource,
+}
+
 #[cfg(feature = "mm")]
 pub trait Mem: Sync {
     /// Where the program break sits now.
@@ -141,15 +174,8 @@ pub trait Mem: Sync {
     /// when the host will not place it there; what a caller reports for that is
     /// the ABI's business.
     fn set_brk(&self, addr: usize) -> SysResult;
-    fn mmap(
-        &self,
-        addr: usize,
-        len: usize,
-        prot: i32,
-        flags: i32,
-        fd: i32,
-        offset: usize,
-    ) -> SysResult;
+    /// Place a mapping, returning the address it went to.
+    fn map(&self, req: &MapRequest) -> SysResult;
     /// Unmap `[addr, addr+len)`. The length is rounded up to whole pages here,
     /// since the page size is the host's to know.
     fn unmap(&self, addr: usize, len: usize) -> SysResult;

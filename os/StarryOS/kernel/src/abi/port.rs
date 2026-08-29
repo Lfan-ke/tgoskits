@@ -9,8 +9,8 @@
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
-    Clock, Creds, Files, Mem, Platform, Prot, Random, SeekFrom, SignalTarget, Signals, SysResult,
-    System, Tasks, UtsField,
+    Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
+    SignalTarget, Signals, SysResult, System, Tasks, UtsField,
 };
 use ax_io::SeekFrom as IoSeek;
 use ax_runtime::hal;
@@ -28,7 +28,7 @@ use crate::{
     file::{File, FileLike, add_file_like, close_file_like, get_file_like},
     mm::{VmBytes, VmBytesMut},
     syscall,
-    syscall::{KillTarget, MmapProt},
+    syscall::{KillTarget, MmapFlags, MmapProt},
     task::{AsThread, PgidNumber, TgidNumber, current_pid_view, do_exit},
 };
 
@@ -172,16 +172,36 @@ impl Mem for KernelHost {
         Ok(0)
     }
 
-    fn mmap(
-        &self,
-        addr: usize,
-        len: usize,
-        prot: i32,
-        flags: i32,
-        fd: i32,
-        offset: usize,
-    ) -> SysResult {
-        port_result(syscall::sys_mmap(addr, len, prot as u32, flags as u32, fd, offset as _))
+    fn map(&self, req: &MapRequest) -> SysResult {
+        let mut prot = MmapProt::empty();
+        for (port, host) in [
+            (Prot::READ, MmapProt::READ),
+            (Prot::WRITE, MmapProt::WRITE),
+            (Prot::EXEC, MmapProt::EXEC),
+            (Prot::GROWS_DOWN, MmapProt::GROWDOWN),
+            (Prot::GROWS_UP, MmapProt::GROWSUP),
+        ] {
+            prot.set(host, req.prot.contains(port));
+        }
+        let map_type = if req.shared {
+            MmapFlags::SHARED
+        } else {
+            MmapFlags::PRIVATE
+        };
+        let mut flags = map_type;
+        if req.fixed {
+            flags |= MmapFlags::FIXED;
+        }
+        let (anonymous, fd, offset) = match req.source {
+            MapSource::Anonymous => {
+                flags |= MmapFlags::ANONYMOUS;
+                (true, -1, 0)
+            }
+            MapSource::File { fd, offset } => (false, fd, offset),
+        };
+        port_result(syscall::map_range(
+            req.addr, req.len, prot, flags, map_type, anonymous, fd, offset,
+        ))
     }
 
     fn unmap(&self, addr: usize, len: usize) -> SysResult {
@@ -231,12 +251,12 @@ impl Signals for KernelHost {
     fn kill(&self, target: SignalTarget, signo: u32) -> SysResult {
         let target = match target {
             SignalTarget::Process(tgid) => KillTarget::Process(
-                TgidNumber::try_from(tgid).map_err(|e| errno(StarryError::from(e)))?,
+                TgidNumber::try_from(tgid).map_err(errno)?,
             ),
             SignalTarget::CallerGroup => KillTarget::CurrentProcessGroup,
             SignalTarget::All => KillTarget::AllPermittedProcesses,
             SignalTarget::Group(pgid) => KillTarget::ProcessGroup(
-                PgidNumber::try_from(pgid).map_err(|e| errno(StarryError::from(e)))?,
+                PgidNumber::try_from(pgid).map_err(errno)?,
             ),
         };
         port_result(syscall::signal_target(target, signo))

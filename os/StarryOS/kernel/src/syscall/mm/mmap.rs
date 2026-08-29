@@ -94,7 +94,7 @@ bitflags::bitflags! {
     ///
     /// See <https://github.com/bminor/glibc/blob/master/bits/mman.h>
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    struct MmapFlags: u32 {
+    pub(crate) struct MmapFlags: u32 {
         /// Share changes
         const SHARED = MAP_SHARED;
         /// Share changes, but fail if mapping flags contain unknown
@@ -128,56 +128,21 @@ bitflags::bitflags! {
     }
 }
 
-pub fn sys_mmap(
+/// Place a mapping once the caller has decoded its own flags.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn map_range(
     addr: usize,
     length: usize,
-    prot: u32,
-    flags: u32,
+    permission_flags: MmapProt,
+    map_flags: MmapFlags,
+    map_type: MmapFlags,
+    anonymous: bool,
     fd: i32,
-    offset: isize,
+    offset: usize,
 ) -> StarryResult<isize> {
-    if length == 0 {
-        return Err(StarryError::InvalidInput);
-    }
-
     let curr = current();
     let curr_aspace = curr.as_thread().proc_data.aspace();
     let mut aspace = curr_aspace.lock();
-    let Some(permission_flags) = MmapProt::from_bits(prot) else {
-        return Err(StarryError::InvalidInput);
-    };
-    let map_flags = match MmapFlags::from_bits(flags) {
-        Some(flags) => flags,
-        None => {
-            warn!("unknown mmap flags: {flags}");
-            if (flags & MmapFlags::TYPE.bits()) == MmapFlags::SHARED_VALIDATE.bits() {
-                return Err(StarryError::OperationNotSupported);
-            }
-            MmapFlags::from_bits_truncate(flags)
-        }
-    };
-    if map_flags.contains(MmapFlags::SYNC) {
-        return Err(StarryError::OperationNotSupported);
-    }
-    let anonymous = map_flags.contains(MmapFlags::ANONYMOUS);
-    let map_type = match flags & MmapFlags::TYPE.bits() {
-        MAP_SHARED => MmapFlags::SHARED,
-        MAP_SHARED_VALIDATE if !anonymous => MmapFlags::SHARED,
-        MAP_PRIVATE => MmapFlags::PRIVATE,
-        _ => return Err(StarryError::InvalidInput),
-    };
-    let offset: usize = offset.try_into().map_err(|_| StarryError::InvalidInput)?;
-    if !offset.is_multiple_of(PAGE_SIZE_4K) {
-        return Err(StarryError::InvalidInput);
-    }
-    if !anonymous && fd < 0 {
-        return Err(StarryError::BadFileDescriptor);
-    }
-
-    debug!(
-        "sys_mmap <= addr: {addr:#x?}, length: {length:#x?}, prot: {permission_flags:?}, flags: \
-         {map_flags:?}, fd: {fd:?}, offset: {offset:?}"
-    );
 
     let page_size = if map_flags.contains(MmapFlags::HUGE_1GB) {
         PAGE_SIZE_1G
@@ -598,6 +563,66 @@ pub fn sys_mmap(
     }
 
     Ok(start.as_usize() as _)
+}
+
+pub fn sys_mmap(
+    addr: usize,
+    length: usize,
+    prot: u32,
+    flags: u32,
+    fd: i32,
+    offset: isize,
+) -> StarryResult<isize> {
+    if length == 0 {
+        return Err(StarryError::InvalidInput);
+    }
+
+    let Some(permission_flags) = MmapProt::from_bits(prot) else {
+        return Err(StarryError::InvalidInput);
+    };
+    let map_flags = match MmapFlags::from_bits(flags) {
+        Some(flags) => flags,
+        None => {
+            warn!("unknown mmap flags: {flags}");
+            if (flags & MmapFlags::TYPE.bits()) == MmapFlags::SHARED_VALIDATE.bits() {
+                return Err(StarryError::OperationNotSupported);
+            }
+            MmapFlags::from_bits_truncate(flags)
+        }
+    };
+    if map_flags.contains(MmapFlags::SYNC) {
+        return Err(StarryError::OperationNotSupported);
+    }
+    let anonymous = map_flags.contains(MmapFlags::ANONYMOUS);
+    let map_type = match flags & MmapFlags::TYPE.bits() {
+        MAP_SHARED => MmapFlags::SHARED,
+        MAP_SHARED_VALIDATE if !anonymous => MmapFlags::SHARED,
+        MAP_PRIVATE => MmapFlags::PRIVATE,
+        _ => return Err(StarryError::InvalidInput),
+    };
+    let offset: usize = offset.try_into().map_err(|_| StarryError::InvalidInput)?;
+    if !offset.is_multiple_of(PAGE_SIZE_4K) {
+        return Err(StarryError::InvalidInput);
+    }
+    if !anonymous && fd < 0 {
+        return Err(StarryError::BadFileDescriptor);
+    }
+
+
+    debug!(
+        "sys_mmap <= addr: {addr:#x?}, length: {length:#x?}, prot: {permission_flags:?}, flags: \
+         {map_flags:?}, fd: {fd:?}, offset: {offset:?}"
+    );
+    map_range(
+        addr,
+        length,
+        permission_flags,
+        map_flags,
+        map_type,
+        anonymous,
+        fd,
+        offset,
+    )
 }
 
 /// Unmap `[addr, addr+length)`, rounding the length up to whole pages.
