@@ -39,13 +39,13 @@ impl Handle {
 
     /// Handle value for table slot `index`. Slot 0 maps to handle 4, keeping 0
     /// reserved as NULL.
-    fn from_slot(index: usize) -> Handle {
+    pub(crate) fn from_slot(index: usize) -> Handle {
         Handle((index as u32 + 1) * HANDLE_VALUE_INC)
     }
 
     /// The table slot this handle addresses, or `None` for NULL, pseudo, or
     /// misaligned values.
-    fn slot(self) -> Option<usize> {
+    pub(crate) fn slot(self) -> Option<usize> {
         (self.0 != 0 && self.0.is_multiple_of(HANDLE_VALUE_INC))
             .then(|| (self.0 / HANDLE_VALUE_INC - 1) as usize)
     }
