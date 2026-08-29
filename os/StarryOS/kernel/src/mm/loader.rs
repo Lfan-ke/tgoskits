@@ -17,6 +17,7 @@ use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     mm::aspace::{AddrSpace, Backend},
     sync::Mutex,
+    task::AsThread,
 };
 
 /// Largest argv/envp stack image accepted by execve.
@@ -885,6 +886,13 @@ fn load_user_app_with_depth(
                     warn!("exec {path}: {err}");
                     StarryError::InvalidExecutable
                 })?;
+            // From here the process speaks that ABI, which is what selects the
+            // personality serving its traps.
+            ax_task::current()
+                .as_thread()
+                .proc_data
+                .abi_tag
+                .store(abi.abi().as_tag(), core::sync::atomic::Ordering::Relaxed);
             // A personality that leaves the stack to the kernel gets the same
             // one an ELF does, minus the aux vector it has no use for.
             (VirtAddr::from_usize(loaded.entry as usize), Vec::new())
