@@ -12,12 +12,13 @@ license.workspace = true
 [features]
 # Which syscall families this personality offers, matched to the host
 # capabilities they need.
-default = ["fs", "mm", "task", "signal", "time", "system", "creds"]
+default = ["fs", "mm", "task", "signal", "time", "random", "system", "creds"]
 fs = ["ax-abi-port/fs"]
 mm = ["ax-abi-port/mm"]
 task = ["ax-abi-port/task"]
 signal = ["ax-abi-port/signal"]
 time = ["ax-abi-port/time"]
+random = ["ax-abi-port/random"]
 system = ["ax-abi-port/system"]
 creds = ["ax-abi-port/creds"]
 

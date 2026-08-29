@@ -885,17 +885,20 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> StarryResult<isize
 
     debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:?}");
 
-    let path = if flags.contains(GetRandomFlags::RANDOM) {
-        "/dev/random"
-    } else {
-        "/dev/urandom"
-    };
+    // Linux `import_ubuf()` bounds the request before it reaches the source.
+    fill_random(
+        buf as usize,
+        len.min(GETRANDOM_MAX_LEN),
+        flags.contains(GetRandomFlags::RANDOM),
+    )
+}
 
-    // Linux `import_ubuf()` limits the iterator before feeding it to the
-    // random source. Bound the request equivalently, and reject an address
-    // range that wraps before touching the random device.
-    let len = len.min(GETRANDOM_MAX_LEN);
-    (buf as usize).checked_add(len).ok_or(Errno::EFAULT)?;
+/// Draw `len` bytes of entropy into user memory at `uaddr`.
+pub(crate) fn fill_random(uaddr: usize, len: usize, blocking: bool) -> StarryResult<isize> {
+    let path = if blocking { "/dev/random" } else { "/dev/urandom" };
+
+    // Reject an address range that wraps before touching the random device.
+    uaddr.checked_add(len).ok_or(Errno::EFAULT)?;
 
     let f = ax_fs_ng::vfs::current_fs_context().lock().resolve(path)?;
     let file = f.entry().as_file()?;
@@ -907,7 +910,7 @@ pub fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> StarryResult<isize
         if read == 0 {
             break;
         }
-        let dst = (buf as usize).checked_add(written).ok_or(Errno::EFAULT)? as *mut u8;
+        let dst = uaddr.checked_add(written).ok_or(Errno::EFAULT)? as *mut u8;
         vm_write_slice(dst, &kbuf[..read])?;
         written += read;
         // Preserve a short device read as the syscall result. Retrying after

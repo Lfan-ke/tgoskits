@@ -26,6 +26,7 @@ extern crate alloc;
     feature = "task",
     feature = "signal",
     feature = "time",
+    feature = "random",
     feature = "system",
     feature = "creds"
 )))]
@@ -43,6 +44,10 @@ use syscalls::Sysno;
 const PAGE_SIZE: usize = 4096;
 /// One `new_utsname` field width (arch-independent), and the packed struct length.
 #[cfg(feature = "system")]
+/// What Linux's `import_ubuf()` will pass to the random source at once.
+#[cfg(feature = "random")]
+const GETRANDOM_MAX: usize = (i32::MAX as usize) & !(PAGE_SIZE - 1);
+
 /// `UIO_MAXIOV`: the longest vector Linux accepts.
 const IOV_MAX: usize = 1024;
 
@@ -241,6 +246,10 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
 
         // Clocks - the domain packs the timespec/timeval itself.
         #[cfg(feature = "time")]
+        Sysno::nanosleep => sys_nanosleep(host.platform(), host.clock()?, arg(0), arg(1)),
+        #[cfg(feature = "random")]
+        Sysno::getrandom => sys_getrandom(host.random()?, arg(0), arg(1), arg(2) as u32),
+        #[cfg(feature = "time")]
         Sysno::clock_gettime => {
             sys_clock_gettime(host.platform(), host.clock()?, arg(0) as i32, arg(1))?
         }
@@ -332,6 +341,59 @@ fn segments_from_iov(
         });
     }
     Ok(segs)
+}
+
+/// `nanosleep(req, rem)`: the timespec layout and the remainder handed back on
+/// an interruption are the ABI's; how long the host actually slept is its own.
+#[cfg(feature = "time")]
+fn sys_nanosleep(
+    platform: &dyn ops::Platform,
+    clock: &dyn ops::Clock,
+    req: usize,
+    rem: usize,
+) -> SysResult {
+    let want = read_duration_ns(platform, req)?;
+    match clock.sleep_ns(want) {
+        ops::Slept::Full => Ok(0),
+        ops::Slept::Short { errno, elapsed_ns } => {
+            if rem != 0 {
+                let left = want.saturating_sub(elapsed_ns);
+                let packed = pack_time_pair((left / NS_PER_SEC) as i64, (left % NS_PER_SEC) as i64);
+                platform.write_user(rem, &packed)?;
+            }
+            Err(errno)
+        }
+    }
+}
+
+/// Read a `timespec` as a span. A span longer than the nanosecond counter can
+/// hold saturates: no caller can tell that from waiting out the real one.
+#[cfg(feature = "time")]
+fn read_duration_ns(platform: &dyn ops::Platform, at: usize) -> Result<u64, i32> {
+    let (secs, nanos) = read_time_pair(platform, at)?;
+    if secs < 0 || !(0..NS_PER_SEC as i64).contains(&nanos) {
+        return Err(ops::EINVAL);
+    }
+    Ok((secs as u64)
+        .checked_mul(NS_PER_SEC)
+        .and_then(|s| s.checked_add(nanos as u64))
+        .unwrap_or(u64::MAX))
+}
+
+/// `getrandom(buf, len, flags)`: the flag vocabulary is the ABI's, and so is
+/// the bound Linux puts on a request before it reaches the source.
+#[cfg(feature = "random")]
+fn sys_getrandom(random: &dyn ops::Random, buf: usize, len: usize, flags: u32) -> SysResult {
+    use linux_raw_sys::general::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
+    if len == 0 {
+        return Ok(0);
+    }
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
+        || (flags & GRND_INSECURE != 0 && flags & GRND_RANDOM != 0)
+    {
+        return Err(ops::EINVAL);
+    }
+    random.fill(buf, len.min(GETRANDOM_MAX), flags & GRND_RANDOM != 0)
 }
 
 /// `readv(fd, iov, iovcnt)`: scatter one read across the runs the vector names.
@@ -753,6 +815,17 @@ fn sys_rt_sigprocmask(
 /// Pack two 64-bit little-endian words - the shared layout of `timespec` and
 /// `timeval` on 64-bit Linux.
 #[cfg(feature = "time")]
+/// Read the two words a `timespec` or `timeval` is made of.
+#[cfg(feature = "time")]
+fn read_time_pair(platform: &dyn ops::Platform, at: usize) -> Result<(i64, i64), i32> {
+    let mut buf = [0u8; 16];
+    platform.read_user(at, &mut buf)?;
+    Ok((
+        i64::from_le_bytes(buf[..8].try_into().unwrap()),
+        i64::from_le_bytes(buf[8..].try_into().unwrap()),
+    ))
+}
+
 fn pack_time_pair(hi: i64, lo: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&hi.to_le_bytes());
@@ -775,8 +848,8 @@ mod tests {
 
     use super::{
         ops::{
-            Clock, Creds, CurrentHost, EFAULT, EINVAL, ESPIPE, ESRCH, Files, Mem, Platform,
-            Signals, System, Tasks,
+            Clock, Creds, CurrentHost, EFAULT, EINTR, EINVAL, ESPIPE, ESRCH, Files, Mem, Platform,
+            Random, Signals, System, Tasks,
         },
         *,
     };
@@ -927,8 +1000,8 @@ mod tests {
         fn wall_ns(&self) -> u64 {
             0
         }
-        fn sleep_ns(&self, _n: u64) -> SysResult {
-            Ok(0)
+        fn sleep_ns(&self, _n: u64) -> ops::Slept {
+            ops::Slept::Full
         }
     }
     impl System for FixedHost {
@@ -1012,6 +1085,7 @@ mod tests {
         synced: RefCell<Option<bool>>,
         heap: RefCell<usize>,
         mapped: RefCell<Option<ops::MapRequest>>,
+        blocking_source: RefCell<Option<bool>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Mock {}
@@ -1228,9 +1302,28 @@ mod tests {
         fn wall_ns(&self) -> u64 {
             1_700_000_000 * NS_PER_SEC + 500_000
         }
-        fn sleep_ns(&self, ns: u64) -> SysResult {
+        fn sleep_ns(&self, ns: u64) -> ops::Slept {
             *self.slept.borrow_mut() = ns;
-            Ok(0)
+            // A sleep of exactly one second stands in for one cut short
+            // halfway, so the remainder path has something to report.
+            if ns == NS_PER_SEC {
+                ops::Slept::Short {
+                    errno: EINTR,
+                    elapsed_ns: ns / 2,
+                }
+            } else {
+                ops::Slept::Full
+            }
+        }
+    }
+    impl Random for Mock {
+        fn fill(&self, uaddr: usize, len: usize, blocking: bool) -> SysResult {
+            *self.blocking_source.borrow_mut() = Some(blocking);
+            let mut mem = self.umem.borrow_mut();
+            for (i, slot) in mem[uaddr..uaddr + len].iter_mut().enumerate() {
+                *slot = i as u8;
+            }
+            Ok(len as isize)
         }
     }
     impl Host for Mock {
@@ -1256,6 +1349,9 @@ mod tests {
             Some(self)
         }
         fn creds(&self) -> Option<&dyn Creds> {
+            Some(self)
+        }
+        fn random(&self) -> Option<&dyn Random> {
             Some(self)
         }
     }
@@ -1316,6 +1412,81 @@ mod tests {
         const W: usize = size_of::<usize>();
         mem[at..at + W].copy_from_slice(&base.to_le_bytes());
         mem[at + W..at + 2 * W].copy_from_slice(&len.to_le_bytes());
+    }
+
+    #[test]
+    fn nanosleep_hands_back_what_is_left_of_an_interrupted_sleep() {
+        let host = Mock::default();
+        *host.umem.borrow_mut() = vec![0u8; 64];
+        // req at 0 asks for one second, which the host cuts in half; rem at 16.
+        {
+            let mut mem = host.umem.borrow_mut();
+            mem[..16].copy_from_slice(&pack_time_pair(1, 0));
+        }
+        let r = dispatch(&host, &Trap::new(Sysno::nanosleep, [0, 16, 0, 0, 0, 0]));
+        assert_eq!(r, Err(EINTR));
+        assert_eq!(*host.slept.borrow(), NS_PER_SEC);
+        let mem = host.umem.borrow();
+        assert_eq!(i64::from_le_bytes(mem[16..24].try_into().unwrap()), 0);
+        assert_eq!(
+            i64::from_le_bytes(mem[24..32].try_into().unwrap()),
+            (NS_PER_SEC / 2) as i64
+        );
+    }
+
+    #[test]
+    fn nanosleep_refuses_a_timespec_the_abi_does_not_allow() {
+        let host = Mock::default();
+        *host.umem.borrow_mut() = vec![0u8; 32];
+        for bad in [pack_time_pair(-1, 0), pack_time_pair(0, NS_PER_SEC as i64)] {
+            host.umem.borrow_mut()[..16].copy_from_slice(&bad);
+            assert_eq!(
+                dispatch(&host, &Trap::new(Sysno::nanosleep, [0, 0, 0, 0, 0, 0])),
+                Err(EINVAL)
+            );
+        }
+        assert_eq!(*host.slept.borrow(), 0);
+    }
+
+    #[test]
+    fn getrandom_picks_the_source_and_refuses_a_bad_flag_pair() {
+        use linux_raw_sys::general::{GRND_INSECURE, GRND_RANDOM};
+        let host = Mock::default();
+        *host.umem.borrow_mut() = vec![0u8; 16];
+        // No flags: the source that does not wait.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::getrandom, [0, 4, 0, 0, 0, 0])),
+            Ok(4)
+        );
+        assert_eq!(*host.blocking_source.borrow(), Some(false));
+        assert_eq!(&host.umem.borrow()[..4], &[0, 1, 2, 3]);
+        // GRND_RANDOM asks for the one that does.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::getrandom, [0, 4, GRND_RANDOM as usize, 0, 0, 0])
+            ),
+            Ok(4)
+        );
+        assert_eq!(*host.blocking_source.borrow(), Some(true));
+        // A zero length never reaches the source, and the two source flags
+        // together are a contradiction.
+        *host.blocking_source.borrow_mut() = None;
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::getrandom, [0, 0, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(
+                    Sysno::getrandom,
+                    [0, 4, (GRND_RANDOM | GRND_INSECURE) as usize, 0, 0, 0]
+                )
+            ),
+            Err(EINVAL)
+        );
+        assert!(host.blocking_source.borrow().is_none());
     }
 
     #[test]

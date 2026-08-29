@@ -11,14 +11,11 @@ use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
-    Segment, SignalTarget, Signals, SysResult, System, Tasks, UtsField,
+    Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
 };
 use ax_io::SeekFrom as IoSeek;
 use ax_runtime::hal;
-use ax_task::{
-    current,
-    future::{block_on, interruptible, sleep},
-};
+use ax_task::current;
 use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
 use starry_signal::SignalSet;
 use starry_vm::{vm_read_slice, vm_write_slice};
@@ -245,18 +242,8 @@ impl Mem for KernelHost {
 }
 
 impl Random for KernelHost {
-    fn fill(&self, buf: &mut [u8]) -> SysResult {
-        let entry = ax_fs_ng::vfs::current_fs_context()
-            .lock()
-            .resolve("/dev/urandom")
-            .map_err(|e| errno(StarryError::from(e)))?;
-        let file = entry
-            .entry()
-            .as_file()
-            .map_err(|e| errno(StarryError::from(e)))?;
-        file.read_at(buf, 0)
-            .map(|n| n as isize)
-            .map_err(|e| errno(StarryError::from(e)))
+    fn fill(&self, uaddr: usize, len: usize, blocking: bool) -> SysResult {
+        port_result(syscall::fill_random(uaddr, len, blocking))
     }
 }
 
@@ -305,10 +292,14 @@ impl Clock for KernelHost {
         hal::time::monotonic_time_nanos() + hal::time::epochoffset_nanos()
     }
 
-    fn sleep_ns(&self, ns: u64) -> SysResult {
-        block_on(interruptible(sleep(Duration::from_nanos(ns))))
-            .map_err(|e| errno(StarryError::from(e)))?;
-        Ok(0)
+    fn sleep_ns(&self, ns: u64) -> Slept {
+        match syscall::sleep_monotonic(Duration::from_nanos(ns)) {
+            (Ok(()), _) => Slept::Full,
+            (Err(e), actual) => Slept::Short {
+                errno: errno(e),
+                elapsed_ns: actual.as_nanos().min(u64::MAX as u128) as u64,
+            },
+        }
     }
 }
 
