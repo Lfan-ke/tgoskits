@@ -268,6 +268,16 @@ pub fn registered() -> &'static [Registration] {
 
 /// Ask each registered personality to service a trapped index, stopping at the
 /// first that claims it.
+/// Offer a trapped index to each linked personality until one claims it.
+pub fn dispatch_registered_trap(env: &mut dyn TrapEnv) -> Dispatch {
+    for entry in registered() {
+        if entry.personality().handle_syscall(env) == Dispatch::Handled {
+            return Dispatch::Handled;
+        }
+    }
+    Dispatch::Passthrough
+}
+
 pub fn route_registered(env: &dyn TrapEnv) -> TrapOutcome {
     registered()
         .iter()
@@ -310,8 +320,10 @@ pub type TrapOutcome = Option<Result<isize, i32>>;
 /// speaks is a dependency change there - the kernel keeps calling this.
 #[def_interface]
 pub trait TrapDispatch {
-    /// Service a trapped index for the calling task's personality.
-    fn route(env: &mut dyn TrapEnv) -> TrapOutcome;
+    /// Service a trapped index for the calling task's personality, which writes
+    /// the result itself: how a result is encoded into the frame is part of an
+    /// ABI, not of the kernel hosting it.
+    fn dispatch(env: &mut dyn TrapEnv) -> Dispatch;
 }
 
 /// Run each custom handler in registration order, stopping at the first that

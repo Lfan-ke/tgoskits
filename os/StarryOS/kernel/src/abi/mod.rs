@@ -22,30 +22,45 @@ use ax_binfmt::TrapEnv;
 use ax_crate_interface::call_interface;
 use ax_runtime::hal::cpu::uspace::UserContext;
 
-use crate::{Errno, StarryError, StarryResult};
+use crate::{StarryError, StarryResult};
 
 /// Borrows a trapped [`UserContext`] and presents it as the ABI-neutral
 /// [`TrapEnv`] the personality domains consume.
-pub struct TrapCtx<'a>(pub &'a mut UserContext);
+pub struct TrapCtx<'a> {
+    uctx: &'a mut UserContext,
+    entry_ip: usize,
+}
+
+impl<'a> TrapCtx<'a> {
+    pub fn new(uctx: &'a mut UserContext) -> Self {
+        let entry_ip = uctx.ip();
+        Self { uctx, entry_ip }
+    }
+}
 
 impl TrapEnv for TrapCtx<'_> {
     fn nr(&self) -> usize {
-        self.0.sysno()
+        self.uctx.sysno()
     }
 
     fn arg(&self, i: usize) -> usize {
         match i {
-            0 => self.0.arg0(),
-            1 => self.0.arg1(),
-            2 => self.0.arg2(),
-            3 => self.0.arg3(),
-            4 => self.0.arg4(),
-            _ => self.0.arg5(),
+            0 => self.uctx.arg0(),
+            1 => self.uctx.arg1(),
+            2 => self.uctx.arg2(),
+            3 => self.uctx.arg3(),
+            4 => self.uctx.arg4(),
+            _ => self.uctx.arg5(),
         }
     }
 
     fn set_result(&mut self, value: usize) {
-        self.0.set_retval(value);
+        // A syscall that got a signal delivered has already moved the frame on.
+        // Where the return value shares a register with the first argument,
+        // writing it now would clobber the signal number.
+        if self.uctx.ip() == self.entry_ip {
+            self.uctx.set_retval(value);
+        }
     }
 }
 
@@ -104,9 +119,11 @@ impl CurrentHost for KernelHost {
 /// Returning the outcome rather than writing the trap frame keeps one epilogue
 /// for both paths, so a migrated syscall still goes through the signal-redirect
 /// check and the retval encoding the kernel already applies.
-pub fn route_syscall(uctx: &mut UserContext) -> Option<StarryResult<isize>> {
-    call_interface!(ax_binfmt::TrapDispatch::route, &mut TrapCtx(uctx))
-        .map(|result| result.map_err(|errno| StarryError::from(Errno::new(errno))))
+pub fn dispatch_syscall(uctx: &mut UserContext) -> bool {
+    call_interface!(
+        ax_binfmt::TrapDispatch::dispatch,
+        &mut TrapCtx::new(uctx)
+    ) == ax_binfmt::Dispatch::Handled
 }
 
 /// Translate a kernel failure into the errno a personality reports to userspace,
