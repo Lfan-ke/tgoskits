@@ -247,6 +247,19 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         // Clocks - the domain packs the timespec/timeval itself.
         #[cfg(feature = "time")]
         Sysno::nanosleep => sys_nanosleep(host.platform(), host.clock()?, arg(0), arg(1)),
+        #[cfg(feature = "time")]
+        Sysno::clock_nanosleep => sys_clock_nanosleep(
+            host.platform(),
+            host.clock()?,
+            arg(0) as i32,
+            arg(1) as u32,
+            arg(2),
+            arg(3),
+        )?,
+        #[cfg(all(feature = "time", target_arch = "x86_64"))]
+        Sysno::time => sys_time(host.platform(), host.clock()?, arg(0)),
+        #[cfg(feature = "signal")]
+        Sysno::tkill => sys_tkill(host.signals()?, arg(0) as i32, arg(1) as u32),
         #[cfg(feature = "random")]
         Sysno::getrandom => sys_getrandom(host.random()?, arg(0), arg(1), arg(2) as u32),
         #[cfg(feature = "time")]
@@ -394,6 +407,67 @@ fn sys_getrandom(random: &dyn ops::Random, buf: usize, len: usize, flags: u32) -
         return Err(ops::EINVAL);
     }
     random.fill(buf, len.min(GETRANDOM_MAX), flags & GRND_RANDOM != 0)
+}
+
+/// `tkill(tid, signo)`: a thread named on its own. A non-positive id is the
+/// ABI's own refusal; who may signal whom is the host's.
+#[cfg(feature = "signal")]
+fn sys_tkill(signals: &dyn ops::Signals, tid: i32, signo: u32) -> SysResult {
+    if tid <= 0 {
+        return Err(ops::EINVAL);
+    }
+    signals.tkill(tid as u32, signo)
+}
+
+/// `time(tloc)`: whole seconds of wall time, returned and optionally stored.
+/// Only the x86_64 table still carries it; elsewhere it is `gettimeofday`.
+#[cfg(all(feature = "time", target_arch = "x86_64"))]
+fn sys_time(platform: &dyn ops::Platform, clock: &dyn ops::Clock, tloc: usize) -> SysResult {
+    let secs = (clock.wall_ns() / NS_PER_SEC) as isize;
+    if tloc != 0 {
+        platform.write_user(tloc, &(secs as usize).to_le_bytes())?;
+    }
+    Ok(secs)
+}
+
+/// `clock_nanosleep(clockid, flags, req, rem)`: an absolute deadline is the
+/// ABI's to turn into a span, and it hands back no remainder when it does.
+#[cfg(feature = "time")]
+fn sys_clock_nanosleep(
+    platform: &dyn ops::Platform,
+    clock: &dyn ops::Clock,
+    clockid: i32,
+    flags: u32,
+    req: usize,
+    rem: usize,
+) -> Option<SysResult> {
+    use linux_raw_sys::general::{CLOCK_MONOTONIC, CLOCK_REALTIME, TIMER_ABSTIME};
+    let now = match clockid as u32 {
+        CLOCK_REALTIME => clock.wall_ns(),
+        CLOCK_MONOTONIC => clock.monotonic_ns(),
+        _ => return None,
+    };
+    Some((|| {
+        let want = read_duration_ns(platform, req)?;
+        let absolute = flags & TIMER_ABSTIME != 0;
+        let span = if absolute {
+            want.saturating_sub(now)
+        } else {
+            want
+        };
+        match clock.sleep_ns(span) {
+            ops::Slept::Full => Ok(0),
+            ops::Slept::Short { errno, elapsed_ns } => {
+                if !absolute && rem != 0 {
+                    let left = span.saturating_sub(elapsed_ns);
+                    let packed =
+                        pack_time_pair((left / NS_PER_SEC) as i64, (left % NS_PER_SEC) as i64);
+                    platform.write_user(rem, &packed)?;
+                }
+                Err(errno)
+            }
+        }
+    })())
 }
 
 /// `readv(fd, iov, iovcnt)`: scatter one read across the runs the vector names.
@@ -989,6 +1063,9 @@ mod tests {
         fn tgkill(&self, _tgid: u32, _tid: u32, _signo: u32) -> SysResult {
             Ok(0)
         }
+        fn tkill(&self, _tid: u32, _signo: u32) -> SysResult {
+            Ok(0)
+        }
         fn sigprocmask(&self, _h: i32, _n: Option<u64>) -> Result<u64, i32> {
             Ok(0)
         }
@@ -1264,6 +1341,10 @@ mod tests {
             *self.killed.borrow_mut() = Some((ops::SignalTarget::Process(tid), signo));
             Ok(0)
         }
+        fn tkill(&self, tid: u32, signo: u32) -> SysResult {
+            *self.killed.borrow_mut() = Some((ops::SignalTarget::Process(tid), signo));
+            Ok(0)
+        }
         fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32> {
             let old = *self.mask.borrow();
             if let Some(m) = new {
@@ -1412,6 +1493,84 @@ mod tests {
         const W: usize = size_of::<usize>();
         mem[at..at + W].copy_from_slice(&base.to_le_bytes());
         mem[at + W..at + 2 * W].copy_from_slice(&len.to_le_bytes());
+    }
+
+    #[test]
+    fn tkill_names_a_thread_and_refuses_a_non_positive_id() {
+        let host = Mock::default();
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::tkill, [9, 15, 0, 0, 0, 0])),
+            Ok(0)
+        );
+        assert_eq!(
+            *host.killed.borrow(),
+            Some((ops::SignalTarget::Process(9), 15))
+        );
+        *host.killed.borrow_mut() = None;
+        for bad in [0usize, -1i32 as usize] {
+            assert_eq!(
+                dispatch(&host, &Trap::new(Sysno::tkill, [bad, 15, 0, 0, 0, 0])),
+                Err(EINVAL)
+            );
+        }
+        assert!(host.killed.borrow().is_none());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn time_returns_whole_seconds_and_stores_them_when_asked() {
+        let host = Mock::default();
+        *host.umem.borrow_mut() = vec![0u8; 16];
+        let secs = (host.wall_ns() / NS_PER_SEC) as isize;
+        // A null location just returns.
+        assert_eq!(dispatch(&host, &Trap::new(Sysno::time, [0; 6])), Ok(secs));
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::time, [8, 0, 0, 0, 0, 0])),
+            Ok(secs)
+        );
+        assert_eq!(
+            usize::from_le_bytes(host.umem.borrow()[8..16].try_into().unwrap()),
+            secs as usize
+        );
+    }
+
+    #[test]
+    fn clock_nanosleep_turns_a_deadline_into_a_span_and_reports_no_remainder() {
+        use linux_raw_sys::general::{CLOCK_MONOTONIC, TIMER_ABSTIME};
+        let host = Mock::default();
+        *host.umem.borrow_mut() = vec![0u8; 64];
+        // A deadline one second past now becomes a one-second span, which this
+        // host cuts in half - but an absolute sleep hands back no remainder.
+        let deadline = host.monotonic_ns() + NS_PER_SEC;
+        host.umem.borrow_mut()[..16].copy_from_slice(&pack_time_pair(
+            (deadline / NS_PER_SEC) as i64,
+            (deadline % NS_PER_SEC) as i64,
+        ));
+        let r = dispatch(
+            &host,
+            &Trap::new(
+                Sysno::clock_nanosleep,
+                [
+                    CLOCK_MONOTONIC as usize,
+                    TIMER_ABSTIME as usize,
+                    0,
+                    32,
+                    0,
+                    0,
+                ],
+            ),
+        );
+        assert_eq!(r, Err(EINTR));
+        assert_eq!(*host.slept.borrow(), NS_PER_SEC);
+        assert_eq!(&host.umem.borrow()[32..48], &[0u8; 16]);
+        // A clock the domain does not speak goes back to the caller.
+        assert!(
+            route(
+                &host,
+                &Trap::new(Sysno::clock_nanosleep, [99, 0, 0, 0, 0, 0])
+            )
+            .is_none()
+        );
     }
 
     #[test]
