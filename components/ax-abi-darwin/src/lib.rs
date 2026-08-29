@@ -16,8 +16,6 @@ pub mod bsd;
 
 extern crate alloc;
 
-use alloc::vec;
-
 use ax_binfmt::{
     AbiError, AbiResult, ImageFormat, LoadEnv, LoadRequest, Loaded, Prot,
     macho::{self, Segment},
@@ -59,6 +57,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingEnv {
         maps: Vec<(u64, Prot, usize)>,
+        from_file: Vec<(u64, u64)>,
     }
 
     impl LoadEnv for RecordingEnv {
@@ -71,6 +70,23 @@ mod tests {
         ) -> AbiResult<()> {
             self.maps.push((va, prot, len as usize));
             Ok(())
+        }
+
+        fn map_image(
+            &mut self,
+            va: u64,
+            len: u64,
+            prot: Prot,
+            offset: u64,
+            file_end: u64,
+        ) -> AbiResult<()> {
+            self.maps.push((va, prot, len as usize));
+            self.from_file.push((offset, file_end));
+            Ok(())
+        }
+
+        fn read_image(&mut self, _at: u64, _out: &mut [u8]) -> AbiResult<usize> {
+            Ok(0)
         }
     }
 
@@ -241,12 +257,16 @@ impl ImageFormat for DarwinAbi {
             if seg.initprot == 0 || seg.vmsize == 0 {
                 continue;
             }
-            let mut page = vec![0u8; seg.vmsize as usize];
-            if let Some(data) = seg.file_data(req.image) {
-                let n = data.len().min(page.len());
-                page[..n].copy_from_slice(&data[..n]);
-            }
-            env.map_region(seg.vmaddr, seg.vmsize, segment_prot(&seg), Some(&page))?;
+            // Map from the file rather than copying it in: a segment's
+            // `fileoff`/`filesize` are the same shape as an ELF `PT_LOAD`'s
+            // `p_offset`/`p_filesz`, so it gets the same demand paging.
+            env.map_image(
+                seg.vmaddr,
+                seg.vmsize,
+                segment_prot(&seg),
+                seg.fileoff,
+                seg.fileoff + seg.filesize,
+            )?;
         }
         Ok(Loaded { entry, stack: 0 })
     }

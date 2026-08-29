@@ -13,7 +13,6 @@ use ax_abi_port::{
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
     Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
 };
-use ax_io::SeekFrom as IoSeek;
 use ax_runtime::hal;
 use ax_task::current;
 use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
@@ -132,13 +131,8 @@ impl Files for KernelHost {
         port_result(syscall::write_file(fd, uaddr as *const u8, len))
     }
 
-    fn seek(&self, fd: i32, offset: isize, from: SeekFrom) -> SysResult {
-        let pos = match from {
-            SeekFrom::Start => IoSeek::Start(offset as u64),
-            SeekFrom::Current => IoSeek::Current(offset as i64),
-            SeekFrom::End => IoSeek::End(offset as i64),
-        };
-        port_result(syscall::seek_file(fd, pos))
+    fn seek(&self, fd: i32, to: SeekFrom) -> SysResult {
+        port_result(syscall::seek_file(fd, to))
     }
 
     fn validate(&self, fd: i32) -> SysResult {

@@ -162,13 +162,15 @@ fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
             }
         }
         nr::LSEEK => {
-            let from = match a[2] {
-                0 => SeekFrom::Start,
-                1 => SeekFrom::Current,
-                2 => SeekFrom::End,
+            let offset = a[1] as isize;
+            let to = match a[2] {
+                0 if offset < 0 => return Some(Err(EINVAL)),
+                0 => SeekFrom::Start(offset as u64),
+                1 => SeekFrom::Current(offset as i64),
+                2 => SeekFrom::End(offset as i64),
                 _ => return Some(Err(EINVAL)),
             };
-            host.files()?.seek(fd, a[1] as isize, from)
+            host.files()?.seek(fd, to)
         }
         nr::PREAD => {
             let offset = a[3] as i64;
@@ -295,8 +297,11 @@ mod tests {
         fn dup(&self, _fd: i32) -> SysResult {
             Ok(5)
         }
-        fn seek(&self, _fd: i32, offset: isize, _from: SeekFrom) -> SysResult {
-            Ok(offset)
+        fn seek(&self, _fd: i32, to: ax_abi_port::SeekFrom) -> SysResult {
+            Ok(match to {
+                ax_abi_port::SeekFrom::Start(at) => at as isize,
+                ax_abi_port::SeekFrom::Current(by) | ax_abi_port::SeekFrom::End(by) => by as isize,
+            })
         }
         fn validate(&self, _fd: i32) -> SysResult {
             Ok(0)

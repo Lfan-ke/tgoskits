@@ -32,6 +32,8 @@ use bitflags::bitflags;
 /// encodes it into the trap frame its ABI's way (`-errno` for Linux).
 pub type SysResult = Result<isize, i32>;
 
+pub use ax_io::SeekFrom;
+
 /// `ENOSYS` - no handler for this call (yet).
 pub const ENOSYS: i32 = 38;
 /// `EFAULT` - a user pointer was not accessible.
@@ -87,18 +89,6 @@ pub struct Segment {
     pub len: usize,
 }
 
-/// Where a seek measures from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(feature = "fs")]
-pub enum SeekFrom {
-    /// The start of the file.
-    Start,
-    /// The current position.
-    Current,
-    /// The end of the file.
-    End,
-}
-
 /// File-descriptor service.
 ///
 /// Bulk transfers name a user range rather than a kernel buffer, and each does
@@ -116,7 +106,7 @@ pub trait Files: Sync {
     fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
     fn close(&self, fd: i32) -> SysResult;
     fn dup(&self, fd: i32) -> SysResult;
-    fn seek(&self, fd: i32, offset: isize, from: SeekFrom) -> SysResult;
+    fn seek(&self, fd: i32, to: SeekFrom) -> SysResult;
     /// Report whether `fd` is open, without touching it.
     fn validate(&self, fd: i32) -> SysResult;
     /// Read from `fd` into `segs` in order, in one underlying transfer.

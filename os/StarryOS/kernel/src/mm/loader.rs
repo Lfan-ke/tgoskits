@@ -744,6 +744,15 @@ pub fn clear_elf_cache() {
 /// kernel does not parse itself is still mapped by the package that does.
 struct ExecSpace<'a> {
     uspace: &'a mut AddrSpace,
+    /// The file being loaded. An interpreter replaces it, so a loader never
+    /// holds a file itself and there is no handle to invent.
+    image: CachedFile,
+}
+
+impl<'a> ExecSpace<'a> {
+    fn new(uspace: &'a mut AddrSpace, image: CachedFile) -> Self {
+        Self { uspace, image }
+    }
 }
 
 impl ax_binfmt::LoadEnv for ExecSpace<'_> {
@@ -783,6 +792,69 @@ impl ax_binfmt::LoadEnv for ExecSpace<'_> {
         })()
         .map_err(|_| ax_binfmt::AbiError::MapFailed)
     }
+
+    fn map_image(
+        &mut self,
+        va: u64,
+        len: u64,
+        prot: ax_binfmt::Prot,
+        offset: u64,
+        file_end: u64,
+    ) -> ax_binfmt::AbiResult<()> {
+        let cache = self.image.clone();
+        let at = VirtAddr::from_usize(va as usize);
+        let start = at.align_down_4k();
+        let size = (at - start + len as usize).align_up_4k();
+        // Copy-on-write over the page cache: the pages arrive as they are
+        // touched, which is what makes a large image cheap to start.
+        let backend = Backend::new_cow(
+            at,
+            PAGE_SIZE_4K,
+            FileBackend::Cached(cache),
+            offset,
+            Some(file_end),
+            false,
+        );
+        self.uspace
+            .map(start, size, prot_flags(prot), false, backend)
+            .map_err(|_| ax_binfmt::AbiError::MapFailed)
+    }
+
+    fn read_image(&mut self, at: u64, out: &mut [u8]) -> ax_binfmt::AbiResult<usize> {
+        self.image
+            .read_at(out, at)
+            .map_err(|_| ax_binfmt::AbiError::MalformedImage)
+    }
+
+    fn interpret(&mut self, path: &str) -> ax_binfmt::AbiResult<()> {
+        let loc = ax_fs_ng::vfs::current_fs_context()
+            .lock()
+            .resolve(path)
+            .map_err(|_| ax_binfmt::AbiError::UnknownFormat)?;
+        self.image =
+            CachedFile::get_or_create(loc).map_err(|_| ax_binfmt::AbiError::UnknownFormat)?;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> ax_binfmt::AbiResult<()> {
+        self.uspace.clear();
+        Ok(())
+    }
+}
+
+/// The mapping flags a neutral protection asks for.
+fn prot_flags(prot: ax_binfmt::Prot) -> MappingFlags {
+    let mut flags = MappingFlags::USER;
+    if prot.contains(ax_binfmt::Prot::READ) {
+        flags |= MappingFlags::READ;
+    }
+    if prot.contains(ax_binfmt::Prot::WRITE) {
+        flags |= MappingFlags::WRITE | MappingFlags::READ;
+    }
+    if prot.contains(ax_binfmt::Prot::EXEC) {
+        flags |= MappingFlags::EXECUTE;
+    }
+    flags
 }
 
 pub fn load_user_app(
@@ -828,6 +900,9 @@ fn load_user_app_with_depth(
         );
     }
 
+    // Keep the location: if this is not an ELF, a format package still needs
+    // the file to map from.
+    let image = loc.clone();
     let (entry, auxv) = match { ELF_LOADER.lock().load(uspace, loc)? } {
         Ok((entry, auxv)) => (entry, auxv),
         Err(data) => {
@@ -867,6 +942,7 @@ fn load_user_app_with_depth(
             let format = ax_abi::dispatch(&data).map_err(|_| StarryError::InvalidExecutable)?;
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let envs: Vec<&str> = envs.iter().map(String::as_str).collect();
+            let cache = CachedFile::get_or_create(image)?;
             let loaded = format
                 .load(
                     &ax_binfmt::LoadRequest {
@@ -874,9 +950,7 @@ fn load_user_app_with_depth(
                         args: &args,
                         envs: &envs,
                     },
-                    &mut ExecSpace {
-                        uspace: &mut *uspace,
-                    },
+                    &mut ExecSpace::new(&mut *uspace, cache),
                 )
                 .map_err(|err| {
                     warn!("exec {path}: {err}");

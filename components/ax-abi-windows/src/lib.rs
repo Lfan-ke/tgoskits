@@ -58,20 +58,29 @@ fn map_image(pe: &PeInfo, image: &[u8], load_base: u64, env: &mut dyn LoadEnv) -
     };
 
     for sec in pe.sections(image) {
+        let va = load_base + sec.rva as u64;
+        if delta == 0 {
+            // At its preferred base nothing is rewritten, so the section maps
+            // from the file and its pages arrive as they are touched - the same
+            // reason `binfmt_elf` uses `vm_mmap` for a `PT_LOAD`.
+            env.map_image(
+                va,
+                sec.vsize as u64,
+                section_prot(&sec),
+                sec.raw_ptr as u64,
+                sec.raw_ptr as u64 + sec.raw_size as u64,
+            )?;
+            continue;
+        }
+        // A relocated section is rewritten before it is mapped, so it cannot
+        // come straight from the page cache.
         let mut page = vec![0u8; sec.vsize as usize];
         if let Some(raw) = sec.raw_data(image) {
             let n = raw.len().min(page.len());
             page[..n].copy_from_slice(&raw[..n]);
         }
-        if delta != 0 {
-            relocate_section(&mut page, &sec, &relocs, delta)?;
-        }
-        env.map_region(
-            load_base + sec.rva as u64,
-            sec.vsize as u64,
-            section_prot(&sec),
-            Some(&page),
-        )?;
+        relocate_section(&mut page, &sec, &relocs, delta)?;
+        env.map_region(va, sec.vsize as u64, section_prot(&sec), Some(&page))?;
     }
     Ok(())
 }
@@ -113,6 +122,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingEnv {
         maps: Vec<(u64, Prot, Vec<u8>)>,
+        from_file: Vec<(u64, u64)>,
+        sizes: Vec<u64>,
     }
 
     impl LoadEnv for RecordingEnv {
@@ -129,6 +140,26 @@ mod tests {
             }
             self.maps.push((va, prot, page));
             Ok(())
+        }
+
+        fn map_image(
+            &mut self,
+            va: u64,
+            len: u64,
+            prot: Prot,
+            offset: u64,
+            file_end: u64,
+        ) -> AbiResult<()> {
+            // Nothing is copied: the range says which part of the file backs
+            // this mapping, and `len` the size it occupies once mapped.
+            self.maps.push((va, prot, Vec::new()));
+            self.from_file.push((offset, file_end));
+            self.sizes.push(len);
+            Ok(())
+        }
+
+        fn read_image(&mut self, _at: u64, _out: &mut [u8]) -> AbiResult<usize> {
+            Ok(0)
         }
     }
 
@@ -208,12 +239,14 @@ mod tests {
         assert_eq!(loaded.entry, 0x1_4000_1000);
         assert_eq!(env.maps.len(), 2);
 
-        let (va, prot, page) = &env.maps[0];
+        let (va, prot, _) = &env.maps[0];
         assert_eq!(*va, 0x1_4000_1000);
         assert_eq!(*prot, Prot::READ | Prot::EXEC);
-        assert_eq!(page.len(), 0x2000); // vsize, not raw_size
-        assert_eq!(&page[..4], &[0x90, 0x90, 0x90, 0x90]);
-        assert!(page[4..].iter().all(|&x| x == 0)); // zero-filled tail
+        // The section occupies its virtual size, of which only the raw range
+        // comes from the file; the host zero-fills the tail.
+        assert_eq!(env.sizes[0], 0x2000);
+        let (off, end) = env.from_file[0];
+        assert_eq!(end - off, 4);
 
         let (va, prot, _) = &env.maps[1];
         assert_eq!(*va, 0x1_4000_3000);
@@ -299,12 +332,13 @@ mod tests {
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
         assert_eq!(env.maps[1].1, Prot::READ);
         assert_eq!(env.maps[2].1, Prot::READ | Prot::WRITE);
-        // .bss is fully zero-filled to its virtual size with no file backing.
-        let (va, prot, page) = &env.maps[3];
+        // .bss occupies its virtual size with nothing coming from the file.
+        let (va, prot, _) = &env.maps[3];
         assert_eq!(*va, 0x1_4000_4000);
         assert_eq!(*prot, Prot::READ | Prot::WRITE);
-        assert_eq!(page.len(), 0x1000);
-        assert!(page.iter().all(|&b| b == 0));
+        assert_eq!(env.sizes[3], 0x1000);
+        let (off, end) = env.from_file[3];
+        assert_eq!(end, off);
     }
 
     #[test]
