@@ -41,11 +41,11 @@ impl Personality for WindowsAbi {
         ax_binfmt::detect(image) == Some(Abi::Windows)
     }
 
-    fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
-        // NT syscall dispatch (see the `nt` module) is wired on-target in a later
-        // phase; until then no index is serviced, so pass through to any custom
-        // handler or the caller's default.
-        Dispatch::Passthrough
+    fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
+        nt::dispatch(
+            env,
+            ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current),
+        )
     }
 
     fn loader(&self) -> Option<&dyn Loader> {
