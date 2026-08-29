@@ -267,11 +267,9 @@ pub trait Signals: Sync {
     fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32>;
 }
 
-/// Clocks and sleeping, in nanoseconds. A domain packs the `timespec`/`timeval`
-/// structs itself; this port only supplies the raw counters.
-#[cfg(feature = "time")]
 /// How a sleep ended. A sleep cut short says how far it got, because an ABI
 /// that hands the caller the time remaining has to work that out itself.
+#[cfg(feature = "time")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slept {
     /// The whole requested span elapsed.
@@ -280,6 +278,9 @@ pub enum Slept {
     Short { errno: i32, elapsed_ns: u64 },
 }
 
+/// Clocks and sleeping, in nanoseconds. A domain packs the `timespec`/`timeval`
+/// structs itself; this port only supplies the raw counters.
+#[cfg(feature = "time")]
 pub trait Clock: Sync {
     fn monotonic_ns(&self) -> u64;
     fn wall_ns(&self) -> u64;
