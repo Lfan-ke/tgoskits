@@ -266,6 +266,10 @@ impl Signals for KernelHost {
         port_result(syscall::signal_thread(tgid, tid, signo))
     }
 
+    fn tkill(&self, tid: u32, signo: u32) -> SysResult {
+        port_result(syscall::signal_one_thread(tid, signo))
+    }
+
     fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32> {
         let curr = current();
         let signal = &curr.as_thread().signal;

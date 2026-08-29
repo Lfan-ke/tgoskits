@@ -254,6 +254,8 @@ pub trait Signals: Sync {
     fn kill(&self, target: SignalTarget, signo: u32) -> SysResult;
     /// Send `signo` to thread `tid` of thread-group `tgid`.
     fn tgkill(&self, tgid: u32, tid: u32, signo: u32) -> SysResult;
+    /// Send `signo` to the thread `tid`, named without its group.
+    fn tkill(&self, tid: u32, signo: u32) -> SysResult;
     /// Apply `new` to the blocked-signal mask per `how` (`SIG_BLOCK`/`UNBLOCK`/
     /// `SETMASK`, already validated), returning the previous mask. `None` queries.
     fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32>;

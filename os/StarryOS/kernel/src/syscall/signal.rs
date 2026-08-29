@@ -265,7 +265,12 @@ pub fn sys_tkill(tid: i32, signo: u32) -> StarryResult<isize> {
     if tid <= 0 {
         return Err(StarryError::InvalidInput);
     }
-    let tid = TidNumber::try_from(tid as u32)?;
+    signal_one_thread(tid as u32, signo)
+}
+
+/// Send `signo` to a thread named on its own, after checking the caller may.
+pub(crate) fn signal_one_thread(tid: u32, signo: u32) -> StarryResult<isize> {
+    let tid = TidNumber::try_from(tid)?;
     let task = get_user_task_by_number(tid)?;
     check_kill_permission_identity(&task.as_thread().proc_data.identity())?;
     let sig = make_siginfo(signo, SI_TKILL)?;
