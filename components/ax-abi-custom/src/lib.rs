@@ -1,24 +1,20 @@
-//! User-extensible custom syscalls for ArceOS.
+//! Extensions for a reserved range of trapped indices.
 //!
-//! [`ax_binfmt`] gives every personality a [`CustomHandler`] seam for trap
-//! indices outside the base ABI. This crate turns that seam into an ergonomic,
-//! runtime-mutable registry: [`CustomSyscalls`] maps a trap index to a handler
-//! and can be changed while the system runs, rather than baked into a `const`
-//! table like `ax_abi_embedded::VectorTable`.
+//! The analogue of RISC-V's reserved custom opcode space, or of a Chipyard RoCC
+//! accelerator: an ABI leaves a range of indices unclaimed, and whoever wants
+//! it registers for it. An extension is a peer of the ABI implementations in
+//! `ax-dispatch`, registered the same way and reached by the same dispatch -
+//! not a mechanism bolted onto one of them.
 //!
-//! The registry implements [`CustomHandler`], so it plugs into either dispatch
-//! order. Which one the kernel calls decides what a handler for an index the
-//! base ABI also owns means:
+//! What this crate adds over registering a handler directly is that its
+//! registry is *runtime-mutable*: [`CustomSyscalls`] maps an index to a handler
+//! and can be changed while the system runs, where `ax_abi_embedded`'s vector
+//! table is a `const` decided at build time.
 //!
-//! - [`ax_dispatch::dispatch_trap`] (personality first) - the handler only runs
-//!   for indices the base ABI passed through, so it *extends* the ABI as a peer
-//!   and cannot shadow it.
-//! - [`ax_dispatch::dispatch_trap_intercept`] (custom first) - the handler runs
-//!   before the base ABI and *overrides* that syscall, redirecting it to the
-//!   user's implementation.
-//!
-//! Depending on this crate is the opt-in to the override capability; a build
-//! that does not want interception simply does not pull it in.
+//! Whether an extension may take an index the ABI also owns is not decided
+//! here. It is a dispatch policy: the umbrella crate offers the ABI first by
+//! default, so a reserved range extends an ABI and cannot shadow it, and its
+//! `custom-intercept` feature reverses that as a deliberate opt-in.
 
 #![no_std]
 
@@ -33,11 +29,14 @@ use ax_dispatch::{CustomHandler, Dispatch, TrapEnv};
 /// synchronization, reached from within the function.
 pub type Handler = fn(&mut dyn TrapEnv) -> Dispatch;
 
-/// A runtime registry of custom syscall handlers, keyed by trap index.
+/// A runtime registry of extension handlers, keyed by trapped index.
 ///
 /// Register with [`register`](Self::register) and drop with
-/// [`remove`](Self::remove). Handlers not present pass through, so the registry
-/// composes with the base ABI under either dispatch order (see the crate docs).
+/// [`remove`](Self::remove). An index with no handler passes through, so the
+/// registry composes with the ABI under either dispatch order (see the crate
+/// docs). An integrator owning a `'static` one registers it with
+/// `ax_dispatch::register_custom!`, and it is then reached like any other
+/// registered owner.
 /// Registration takes `&mut self`; a kernel keeps the registry behind its own
 /// lock and dispatches through a shared borrow.
 #[derive(Default)]

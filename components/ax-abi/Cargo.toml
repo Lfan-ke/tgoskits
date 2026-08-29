@@ -38,6 +38,10 @@ embedded = ["dep:ax-abi-embedded"]
 # The user-extensible custom-syscall registry, opt-in to the override capability.
 custom = ["dep:ax-abi-custom"]
 
+# Let a registered extension take an index the ABI also owns. Off by default:
+# a reserved range extends an ABI, and shadowing one is a deliberate choice.
+custom-intercept = []
+
 # Route each executed image to a personality by its magic bytes.
 auto-dispatch = []
 

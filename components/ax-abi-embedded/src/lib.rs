@@ -36,15 +36,52 @@ pub type Vector = fn(&mut dyn TrapEnv) -> Dispatch;
 /// use is a `static` const table an integrator hands to the kernel.
 pub struct VectorTable<'a> {
     vectors: &'a [(usize, Vector)],
+    /// Asynchronous entries, indexed by interrupt number rather than by trap
+    /// index. A machine with no interrupt controller carries none, and without
+    /// the `interrupts` feature the field does not exist at all.
+    #[cfg(feature = "interrupts")]
+    interrupts: &'a [(usize, Vector)],
     base: u64,
 }
 
 impl<'a> VectorTable<'a> {
     /// Build a table over `vectors`, with `base` the load address a flat image
-    /// is placed at (see [`SysAbi::load`]). `const` so it can back a
+    /// is placed at (see [`load`](Self::load)). `const` so it can back a
     /// `static`.
     pub const fn new(vectors: &'a [(usize, Vector)], base: u64) -> Self {
-        Self { vectors, base }
+        Self {
+            vectors,
+            #[cfg(feature = "interrupts")]
+            interrupts: &[],
+            base,
+        }
+    }
+
+    /// Build a table that also carries asynchronous entries. Only a target with
+    /// an interrupt controller has these, which is what the `interrupts`
+    /// feature says; the ordinary MCU/MPU case, so it is on by default.
+    #[cfg(feature = "interrupts")]
+    pub const fn with_interrupts(
+        vectors: &'a [(usize, Vector)],
+        interrupts: &'a [(usize, Vector)],
+        base: u64,
+    ) -> Self {
+        Self {
+            vectors,
+            interrupts,
+            base,
+        }
+    }
+
+    /// Deliver an asynchronous trap by interrupt number. Kept apart from
+    /// [`dispatch`](Self::dispatch) because the two index spaces are unrelated:
+    /// interrupt 3 and trap index 3 are different events.
+    #[cfg(feature = "interrupts")]
+    pub fn interrupt(&self, nr: usize, env: &mut dyn TrapEnv) -> Dispatch {
+        match self.interrupts.iter().find(|(irq, _)| *irq == nr) {
+            Some((_, handler)) => handler(env),
+            None => Dispatch::Passthrough,
+        }
     }
 
     /// Route one trapped index through the table: run the first handler whose
@@ -103,6 +140,33 @@ impl CustomHandler for VectorTable<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "interrupts")]
+    #[test]
+    fn an_interrupt_number_is_a_different_space_from_a_trap_index() {
+        fn sync(env: &mut dyn TrapEnv) -> Dispatch {
+            env.set_result(0x51);
+            Dispatch::Handled
+        }
+        fn irq(env: &mut dyn TrapEnv) -> Dispatch {
+            env.set_result(0xA2);
+            Dispatch::Handled
+        }
+        static SYNC: [(usize, Vector); 1] = [(3, sync as Vector)];
+        static IRQ: [(usize, Vector); 1] = [(3, irq as Vector)];
+        let table = VectorTable::with_interrupts(&SYNC, &IRQ, 0);
+
+        // Index 3 and interrupt 3 are different events, so they answer apart.
+        let mut trap = Trap::at(3);
+        assert_eq!(table.dispatch(&mut trap), Dispatch::Handled);
+        let mut line = Trap::at(3);
+        assert_eq!(table.interrupt(3, &mut line), Dispatch::Handled);
+        assert_ne!(trap.result, line.result);
+
+        // An interrupt nobody wired up passes through rather than firing a
+        // handler that happens to share the number.
+        assert_eq!(table.interrupt(9, &mut Trap::at(3)), Dispatch::Passthrough);
+    }
+
     use ax_dispatch::dispatch_trap;
 
     use super::*;

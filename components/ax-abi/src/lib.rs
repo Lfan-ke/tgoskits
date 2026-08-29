@@ -48,12 +48,26 @@ struct Dispatcher;
 #[ax_crate_interface::impl_interface]
 impl TrapDispatch for Dispatcher {
     fn dispatch(env: &mut dyn TrapEnv) -> Dispatch {
+        // Whether an extension may take an index the ABI also owns is a policy
+        // of this crate, not a property of the extension: enabling
+        // `custom-intercept` puts extensions first, which is the deliberate
+        // opt-in to shadowing a base ABI.
+        #[cfg(feature = "custom-intercept")]
+        if ax_dispatch::dispatch_registered_custom(env) == Dispatch::Handled {
+            return Dispatch::Handled;
+        }
         // A host that resolved which implementation serves this task gets an
         // index into the registry; one that did not gets the scan.
-        match env.slot() {
+        let claimed = match env.slot() {
             Some(slot) => ax_dispatch::dispatch_at(slot, env),
             None => ax_dispatch::dispatch_registered_trap(env),
+        };
+        if claimed == Dispatch::Handled {
+            return Dispatch::Handled;
         }
+        // Otherwise the index is outside the ABI's own space, which is exactly
+        // what a reserved range is for.
+        ax_dispatch::dispatch_registered_custom(env)
     }
 }
 
