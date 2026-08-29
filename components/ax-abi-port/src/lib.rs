@@ -174,10 +174,27 @@ pub trait Random: Sync {
 
 /// Signal delivery and the blocked-signal mask. A domain moves the user
 /// `sigset_t` itself; this port carries the mask as a `u64`.
+/// Who a signal is aimed at, once an ABI has read its own encoding of that.
+#[cfg(feature = "signal")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalTarget {
+    /// One process.
+    Process(u32),
+    /// Every process in the caller's group.
+    CallerGroup,
+    /// Every process the caller may signal.
+    All,
+    /// Every process in one group.
+    Group(u32),
+}
+
 #[cfg(feature = "signal")]
 pub trait Signals: Sync {
-    fn kill(&self, pid: i32, sig: i32) -> SysResult;
-    fn tgkill(&self, tgid: i32, tid: i32, sig: i32) -> SysResult;
+    /// Send `signo` to `target`. A zero `signo` only checks that the target
+    /// exists and may be signalled.
+    fn kill(&self, target: SignalTarget, signo: u32) -> SysResult;
+    /// Send `signo` to thread `tid` of thread-group `tgid`.
+    fn tgkill(&self, tgid: u32, tid: u32, signo: u32) -> SysResult;
     /// Apply `new` to the blocked-signal mask per `how` (`SIG_BLOCK`/`UNBLOCK`/
     /// `SETMASK`, already validated), returning the previous mask. `None` queries.
     fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32>;

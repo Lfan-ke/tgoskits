@@ -180,7 +180,7 @@ fn kill_process_group_checked(pgid: PgidNumber, sig: Option<SignalInfo>) -> Star
     Ok(())
 }
 
-enum KillTarget {
+pub(crate) enum KillTarget {
     Process(TgidNumber),
     CurrentProcessGroup,
     AllPermittedProcesses,
@@ -202,11 +202,11 @@ impl TryFrom<i32> for KillTarget {
     }
 }
 
-pub fn sys_kill(pid: i32, signo: u32) -> StarryResult<isize> {
-    debug!("sys_kill: pid = {pid}, signo = {signo}");
+/// Send `signo` to `target`, after checking the caller may.
+pub(crate) fn signal_target(target: KillTarget, signo: u32) -> StarryResult<isize> {
     let sig = make_siginfo(signo, SI_USER as _)?;
 
-    match KillTarget::try_from(pid)? {
+    match target {
         KillTarget::Process(tgid) => {
             let identity = current_pid_view().resolve_process(tgid)?;
             check_kill_permission_identity(&identity)?;
@@ -254,6 +254,11 @@ pub fn sys_kill(pid: i32, signo: u32) -> StarryResult<isize> {
         }
     }
     Ok(0)
+}
+
+pub fn sys_kill(pid: i32, signo: u32) -> StarryResult<isize> {
+    debug!("sys_kill: pid = {pid}, signo = {signo}");
+    signal_target(KillTarget::try_from(pid)?, signo)
 }
 
 pub fn sys_tkill(tid: i32, signo: u32) -> StarryResult<isize> {

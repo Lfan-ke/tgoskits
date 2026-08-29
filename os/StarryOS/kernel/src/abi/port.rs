@@ -9,8 +9,8 @@
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
-    Clock, Creds, Files, Mem, Platform, Prot, Random, SeekFrom, Signals, SysResult, System,
-    Tasks, UtsField,
+    Clock, Creds, Files, Mem, Platform, Prot, Random, SeekFrom, SignalTarget, Signals, SysResult,
+    System, Tasks, UtsField,
 };
 use ax_io::SeekFrom as IoSeek;
 use ax_runtime::hal;
@@ -28,8 +28,8 @@ use crate::{
     file::{File, FileLike, add_file_like, close_file_like, get_file_like},
     mm::{VmBytes, VmBytesMut},
     syscall,
-    syscall::MmapProt,
-    task::{AsThread, current_pid_view, do_exit},
+    syscall::{KillTarget, MmapProt},
+    task::{AsThread, PgidNumber, TgidNumber, current_pid_view, do_exit},
 };
 
 impl Platform for KernelHost {
@@ -228,12 +228,22 @@ impl Random for KernelHost {
 }
 
 impl Signals for KernelHost {
-    fn kill(&self, pid: i32, sig: i32) -> SysResult {
-        port_result(syscall::sys_kill(pid, sig as u32))
+    fn kill(&self, target: SignalTarget, signo: u32) -> SysResult {
+        let target = match target {
+            SignalTarget::Process(tgid) => KillTarget::Process(
+                TgidNumber::try_from(tgid).map_err(|e| errno(StarryError::from(e)))?,
+            ),
+            SignalTarget::CallerGroup => KillTarget::CurrentProcessGroup,
+            SignalTarget::All => KillTarget::AllPermittedProcesses,
+            SignalTarget::Group(pgid) => KillTarget::ProcessGroup(
+                PgidNumber::try_from(pgid).map_err(|e| errno(StarryError::from(e)))?,
+            ),
+        };
+        port_result(syscall::signal_target(target, signo))
     }
 
-    fn tgkill(&self, tgid: i32, tid: i32, sig: i32) -> SysResult {
-        port_result(syscall::sys_tgkill(tgid, tid, sig as u32))
+    fn tgkill(&self, tgid: u32, tid: u32, signo: u32) -> SysResult {
+        port_result(syscall::sys_tgkill(tgid as i32, tid as i32, signo))
     }
 
     fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32> {
