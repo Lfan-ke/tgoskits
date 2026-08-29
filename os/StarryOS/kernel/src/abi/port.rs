@@ -25,8 +25,8 @@ use starry_vm::{vm_read_slice, vm_write_slice};
 use super::{KernelHost, errno, port_result};
 use crate::{
     StarryError,
-    file::{File, FileLike, add_file_like, close_file_like, get_file_like},
-    mm::{VmBytes, VmBytesMut},
+    file::{add_file_like, close_file_like, get_file_like},
+    mm::VmBytesMut,
     syscall,
     syscall::{KillTarget, MmapFlags, MmapProt},
     task::{AsThread, PgidNumber, TgidNumber, current_pid_view, do_exit},
@@ -114,21 +114,11 @@ impl Files for KernelHost {
     }
 
     fn pread(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
-        let file = File::from_fd(fd).map_err(errno)?;
-        let read = file
-            .inner()
-            .read_at(VmBytesMut::new(uaddr as *mut u8, len), offset)
-            .map_err(|e| errno(StarryError::from(e)))?;
-        Ok(read as isize)
+        port_result(syscall::read_at_fd(fd, uaddr as *mut u8, len, offset))
     }
 
     fn pwrite(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
-        let file = File::from_fd(fd).map_err(errno)?;
-        let written = file
-            .inner()
-            .write_at(VmBytes::new(uaddr as *const u8, len), offset)
-            .map_err(|e| errno(StarryError::from(e)))?;
-        Ok(written as isize)
+        port_result(syscall::write_at_fd(fd, uaddr as *const u8, len, offset))
     }
 
     fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult {
@@ -146,6 +136,11 @@ impl Files for KernelHost {
 
     fn validate(&self, fd: i32) -> SysResult {
         get_file_like(fd).map_err(errno)?;
+        Ok(0)
+    }
+
+    fn seekable(&self, fd: i32) -> SysResult {
+        syscall::seekable_fd(fd).map_err(errno)?;
         Ok(0)
     }
 

@@ -354,6 +354,9 @@ mod tests {
         fn validate(&self, _fd: i32) -> ax_abi_port::SysResult {
             Ok(0)
         }
+        fn seekable(&self, _fd: i32) -> ax_abi_port::SysResult {
+            Ok(0)
+        }
         fn pread(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> ax_abi_port::SysResult {
             Ok(len as isize)
         }
