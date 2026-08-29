@@ -26,7 +26,7 @@ use crate::{
         memfd::{F_SEAL_ANY_WRITE, F_SEAL_GROW, Memfd},
     },
     ipc::mqueue::MqDescriptor,
-    mm::{IoVec, IoVectorBuf, SegmentBuf, UserConstPtr, VmBytesMut, vm_load_path_string},
+    mm::{IoVec, SegmentBuf, UserConstPtr, VmBytesMut, vm_load_path_string},
     task::AsThread,
 };
 
@@ -196,16 +196,60 @@ pub(crate) fn write_segments(fd: c_int, segs: &[(usize, usize)]) -> StarryResult
     // data, so a count error (EINVAL) takes precedence over a bad segment
     // pointer (EFAULT), matching Linux vfs_writev / eventfd_write ordering.
     file_like.validate_write_len(segments_total_len(segs)?)?;
+    let total = validate_segments(segs)?;
+    memfd_checks_before_stream_write(&file_like, total as u64)?;
+    let data = collect_segments(segs)?;
+    file_like.write(&mut data.as_slice()).map(|n| n as _)
+}
+
+/// One positioned vectored read over runs the caller already decoded. The runs
+/// are checked before the descriptor is, as the iovec path does.
+pub(crate) fn read_at_segments(
+    fd: c_int,
+    segs: &[(usize, usize)],
+    offset: u64,
+) -> StarryResult<isize> {
+    let io = SegmentBuf::new(segs)?.into_io();
+    let f = file_or_espipe(fd)?;
+    Ok(f.inner().read_at(io, offset)? as _)
+}
+
+/// One positioned vectored write over runs the caller already decoded.
+pub(crate) fn write_at_segments(
+    fd: c_int,
+    segs: &[(usize, usize)],
+    offset: u64,
+) -> StarryResult<isize> {
+    // Route memfd fds through the seal-aware path, as the byte-range
+    // positioned write does.
+    if let Ok(memfd) = Memfd::from_fd(fd) {
+        validate_segments(segs)?;
+        let data = collect_segments(segs)?;
+        return Ok(memfd.write_at(data.as_slice(), offset)? as _);
+    }
+    let total = validate_segments(segs)?;
+    let f = file_or_espipe_write(fd)?;
+    let file_like = get_file_like(fd)?;
+    memfd_checks_before_write_at(&file_like, offset, total as u64)?;
+    let data = collect_segments(segs)?;
+    Ok(f.inner().write_at(data.as_slice(), offset)? as _)
+}
+
+/// `access_ok`-style validation of every run, without copying payload.
+fn validate_segments(segs: &[(usize, usize)]) -> StarryResult<usize> {
     let mut total = 0usize;
     for &(base, len) in segs {
         UserConstPtr::<u8>::from(base as *const u8).get_as_slice(len)?;
         total = total.checked_add(len).ok_or(StarryError::InvalidInput)?;
     }
-    memfd_checks_before_stream_write(&file_like, total as u64)?;
+    Ok(total)
+}
+
+fn collect_segments(segs: &[(usize, usize)]) -> StarryResult<Vec<u8>> {
     let mut src = SegmentBuf::new(segs)?.into_io();
     let mut data = vec![0; src.remaining()];
     src.read_exact(&mut data)?;
-    file_like.write(&mut data.as_slice()).map(|n| n as _)
+    Ok(data)
 }
 
 fn segments_total_len(segs: &[(usize, usize)]) -> StarryResult<usize> {
@@ -626,14 +670,12 @@ pub fn sys_preadv2(
     if offset < -1 {
         return Err(StarryError::InvalidInput);
     }
-    let mut io_buf = IoVectorBuf::new(iov, iovcnt)?.into_io();
+    let segs = segments_from_iov(iov, iovcnt)?;
+    // offset == -1: use the current file position, as readv does.
     if offset == -1 {
-        // offset == -1: use current file position (like readv)
-        let f = get_file_like(fd)?;
-        f.read(&mut io_buf).map(|n| n as _)
+        read_segments(fd, &segs)
     } else {
-        let f = file_or_espipe(fd)?;
-        Ok(f.inner().read_at(io_buf, offset as _).map(|n| n as _)?)
+        read_at_segments(fd, &segs, offset as _)
     }
 }
 
@@ -651,30 +693,11 @@ pub fn sys_pwritev2(
     if offset < -1 {
         return Err(StarryError::InvalidInput);
     }
+    let segs = segments_from_iov(iov, iovcnt)?;
     if offset == -1 {
-        // offset == -1: use current file position (like writev)
-        let file_like = get_file_like(fd)?;
-        file_like.validate_write_len(iov_total_len(iov, iovcnt)?)?;
-        let total = validate_user_iov_buf_regions(iov, iovcnt)?;
-        memfd_checks_before_stream_write(&file_like, total as u64)?;
-        let data = copy_user_iov_read_buf(iov, iovcnt)?;
-        file_like.write(&mut data.as_slice()).map(|n| n as _)
-    } else if let Ok(memfd) = Memfd::from_fd(fd) {
-        // Route memfd offset writes through the seal-aware path.
-        validate_user_iov_buf_regions(iov, iovcnt)?;
-        let data = copy_user_iov_read_buf(iov, iovcnt)?;
-        memfd
-            .write_at(data.as_slice(), offset as u64)
-            .map(|n| n as _)
+        write_segments(fd, &segs)
     } else {
-        let total = validate_user_iov_buf_regions(iov, iovcnt)?;
-        let f = file_or_espipe_write(fd)?;
-        let file_like = get_file_like(fd)?;
-        memfd_checks_before_write_at(&file_like, offset as u64, total as u64)?;
-        let data = copy_user_iov_read_buf(iov, iovcnt)?;
-        Ok(f.inner()
-            .write_at(data.as_slice(), offset as _)
-            .map(|n| n as _)?)
+        write_at_segments(fd, &segs, offset as _)
     }
 }
 
@@ -694,52 +717,6 @@ fn validate_user_read_buf(buf: *const u8, len: usize) -> StarryResult<()> {
     Ok(())
 }
 
-/// Sum of `iov_len` across the iovec array. Reads the iovec *struct* (so a bad
-/// array pointer still yields `EFAULT`) but does not touch `iov_base`, letting
-/// callers enforce length invariants (e.g. eventfd's 8-byte count) before any
-/// segment payload is imported. Same overflow cap as [`IoVectorBuf`].
-fn iov_total_len(iov: *const IoVec, iovcnt: usize) -> StarryResult<usize> {
-    if iovcnt > 1024 {
-        return Err(StarryError::InvalidInput);
-    }
-    let mut total = 0usize;
-    for i in 0..iovcnt {
-        let entry = iov.wrapping_add(i).vm_read()?;
-        if entry.iov_len < 0 {
-            return Err(StarryError::InvalidInput);
-        }
-        total = total
-            .checked_add(entry.iov_len as usize)
-            .ok_or(StarryError::InvalidInput)?;
-    }
-    Ok(total)
-}
-
-/// Validate each `iovec` segment is readable; returns total length (same cap as [`IoVectorBuf`]).
-fn validate_user_iov_buf_regions(iov: *const IoVec, iovcnt: usize) -> StarryResult<usize> {
-    if iovcnt > 1024 {
-        return Err(StarryError::InvalidInput);
-    }
-    let mut total = 0usize;
-    for i in 0..iovcnt {
-        let iov = iov.wrapping_add(i).vm_read()?;
-        if iov.iov_len < 0 {
-            return Err(StarryError::InvalidInput);
-        }
-        let seg = iov.iov_len as usize;
-        UserConstPtr::<u8>::from(iov.iov_base.cast_const()).get_as_slice(seg)?;
-        total = total.checked_add(seg).ok_or(StarryError::InvalidInput)?;
-    }
-    Ok(total)
-}
-
-fn copy_user_iov_read_buf(iov: *const IoVec, iovcnt: usize) -> StarryResult<Vec<u8>> {
-    let mut src = IoVectorBuf::new(iov, iovcnt)?.into_io();
-    let len = src.remaining();
-    let mut data = vec![0; len];
-    src.read_exact(&mut data)?;
-    Ok(data)
-}
 
 enum SendFile {
     Direct(Arc<dyn FileLike>),

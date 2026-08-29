@@ -360,7 +360,23 @@ mod tests {
         fn readv(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> ax_abi_port::SysResult {
             Ok(0)
         }
+        fn preadv(
+            &self,
+            _fd: i32,
+            _segs: &[ax_abi_port::Segment],
+            _offset: u64,
+        ) -> ax_abi_port::SysResult {
+            Ok(0)
+        }
         fn writev(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> ax_abi_port::SysResult {
+            Ok(0)
+        }
+        fn pwritev(
+            &self,
+            _fd: i32,
+            _segs: &[ax_abi_port::Segment],
+            _offset: u64,
+        ) -> ax_abi_port::SysResult {
             Ok(0)
         }
         fn pread(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> ax_abi_port::SysResult {

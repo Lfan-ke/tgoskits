@@ -154,6 +154,14 @@ impl Files for KernelHost {
         port_result(syscall::write_segments(fd, &runs(segs)))
     }
 
+    fn preadv(&self, fd: i32, segs: &[Segment], offset: u64) -> SysResult {
+        port_result(syscall::read_at_segments(fd, &runs(segs), offset))
+    }
+
+    fn pwritev(&self, fd: i32, segs: &[Segment], offset: u64) -> SysResult {
+        port_result(syscall::write_at_segments(fd, &runs(segs), offset))
+    }
+
     fn seekable(&self, fd: i32) -> SysResult {
         syscall::seekable_fd(fd).map_err(errno)?;
         Ok(0)

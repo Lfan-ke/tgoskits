@@ -193,6 +193,38 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
             arg(2),
         ),
         #[cfg(feature = "fs")]
+        Sysno::preadv | Sysno::preadv2 => sys_preadv(
+            host.platform(),
+            host.files()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2),
+            arg(3),
+            arg(4),
+            if sysno == Sysno::preadv2 {
+                arg(5) as u32
+            } else {
+                0
+            },
+            sysno == Sysno::preadv2,
+        ),
+        #[cfg(feature = "fs")]
+        Sysno::pwritev | Sysno::pwritev2 => sys_pwritev(
+            host.platform(),
+            host.files()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2),
+            arg(3),
+            arg(4),
+            if sysno == Sysno::pwritev2 {
+                arg(5) as u32
+            } else {
+                0
+            },
+            sysno == Sysno::pwritev2,
+        ),
+        #[cfg(feature = "fs")]
         Sysno::pread64 => sys_pread64(host.files()?, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
         #[cfg(feature = "fs")]
         Sysno::pwrite64 => {
@@ -354,6 +386,85 @@ fn segments_from_iov(
         });
     }
     Ok(segs)
+}
+
+/// The offset a positioned vectored call names. Only a 32-bit ABI splits it
+/// across two argument words.
+#[cfg(feature = "fs")]
+fn offset_from_hilo(lo: usize, _hi: usize) -> i64 {
+    #[cfg(target_pointer_width = "32")]
+    {
+        (((_hi as u64) << 32) | (lo as u32 as u64)) as i64
+    }
+    #[cfg(target_pointer_width = "64")]
+    {
+        lo as i64
+    }
+}
+
+/// `None` is the offset of -1 that stands for the file's own position, which
+/// only the `v2` calls accept. Their per-call flags are a vocabulary this
+/// domain does not carry.
+#[cfg(feature = "fs")]
+fn positioned_offset(
+    lo: usize,
+    hi: usize,
+    flags: u32,
+    accepts_current: bool,
+) -> Result<Option<u64>, i32> {
+    if flags != 0 {
+        return Err(ops::EOPNOTSUPP);
+    }
+    match offset_from_hilo(lo, hi) {
+        -1 if accepts_current => Ok(None),
+        at if at < 0 => Err(ops::EINVAL),
+        at => Ok(Some(at as u64)),
+    }
+}
+
+/// `preadv`/`preadv2`: one positioned read scattered across the runs the
+/// vector names, or an ordinary `readv` when the offset is the file's own.
+#[cfg(feature = "fs")]
+#[allow(clippy::too_many_arguments)]
+fn sys_preadv(
+    platform: &dyn ops::Platform,
+    files: &dyn ops::Files,
+    fd: i32,
+    iov: usize,
+    iovcnt: usize,
+    lo: usize,
+    hi: usize,
+    flags: u32,
+    accepts_current: bool,
+) -> SysResult {
+    let offset = positioned_offset(lo, hi, flags, accepts_current)?;
+    let segs = segments_from_iov(platform, iov, iovcnt)?;
+    match offset {
+        Some(at) => files.preadv(fd, &segs, at),
+        None => files.readv(fd, &segs),
+    }
+}
+
+/// `pwritev`/`pwritev2`, the gathering counterpart.
+#[cfg(feature = "fs")]
+#[allow(clippy::too_many_arguments)]
+fn sys_pwritev(
+    platform: &dyn ops::Platform,
+    files: &dyn ops::Files,
+    fd: i32,
+    iov: usize,
+    iovcnt: usize,
+    lo: usize,
+    hi: usize,
+    flags: u32,
+    accepts_current: bool,
+) -> SysResult {
+    let offset = positioned_offset(lo, hi, flags, accepts_current)?;
+    let segs = segments_from_iov(platform, iov, iovcnt)?;
+    match offset {
+        Some(at) => files.pwritev(fd, &segs, at),
+        None => files.writev(fd, &segs),
+    }
 }
 
 /// `nanosleep(req, rem)`: the timespec layout and the remainder handed back on
@@ -1014,7 +1125,13 @@ mod tests {
         fn readv(&self, _fd: i32, _segs: &[ops::Segment]) -> SysResult {
             Ok(0)
         }
+        fn preadv(&self, _fd: i32, _segs: &[ops::Segment], _offset: u64) -> SysResult {
+            Ok(0)
+        }
         fn writev(&self, _fd: i32, _segs: &[ops::Segment]) -> SysResult {
+            Ok(0)
+        }
+        fn pwritev(&self, _fd: i32, _segs: &[ops::Segment], _offset: u64) -> SysResult {
             Ok(0)
         }
         fn pread(&self, _fd: i32, _u: usize, _len: usize, _o: u64) -> SysResult {
@@ -1226,6 +1343,23 @@ mod tests {
             }
             Ok(done as isize)
         }
+        fn preadv(&self, _fd: i32, segs: &[ops::Segment], offset: u64) -> SysResult {
+            // Scatter the file's contents from `offset` across the runs.
+            let src = self.file.borrow().clone();
+            let mut at = offset as usize;
+            let mut done = 0usize;
+            for seg in segs {
+                let n = seg.len.min(src.len().saturating_sub(at));
+                if n == 0 {
+                    break;
+                }
+                let mut mem = self.umem.borrow_mut();
+                mem[seg.uaddr..seg.uaddr + n].copy_from_slice(&src[at..at + n]);
+                at += n;
+                done += n;
+            }
+            Ok(done as isize)
+        }
         fn writev(&self, _fd: i32, segs: &[ops::Segment]) -> SysResult {
             // Gather the runs, in order, into one write.
             let mem = self.umem.borrow();
@@ -1233,6 +1367,22 @@ mod tests {
             let mut done = 0usize;
             for seg in segs {
                 out.extend_from_slice(&mem[seg.uaddr..seg.uaddr + seg.len]);
+                done += seg.len;
+            }
+            Ok(done as isize)
+        }
+        fn pwritev(&self, _fd: i32, segs: &[ops::Segment], offset: u64) -> SysResult {
+            // Gather the runs into the file at `offset`.
+            let mem = self.umem.borrow();
+            let mut file = self.file.borrow_mut();
+            let mut at = offset as usize;
+            let mut done = 0usize;
+            for seg in segs {
+                if file.len() < at + seg.len {
+                    file.resize(at + seg.len, 0);
+                }
+                file[at..at + seg.len].copy_from_slice(&mem[seg.uaddr..seg.uaddr + seg.len]);
+                at += seg.len;
                 done += seg.len;
             }
             Ok(done as isize)
@@ -1682,6 +1832,69 @@ mod tests {
         let r = dispatch(&host, &Trap::new(Sysno::writev, [3, 32, 2, 0, 0, 0]));
         assert_eq!(r, Ok(5));
         assert_eq!(&*host.written.borrow(), b"abcde");
+    }
+
+    #[test]
+    fn preadv_and_pwritev_carry_the_offset() {
+        const W: usize = size_of::<usize>();
+        let host = Mock::default();
+        *host.file.borrow_mut() = vec![10, 11, 12, 13, 14, 15];
+        *host.umem.borrow_mut() = vec![0u8; 64];
+        {
+            let mut mem = host.umem.borrow_mut();
+            iov_entry(&mut mem, 32, 0, 2);
+            iov_entry(&mut mem, 32 + 2 * W, 8, 2);
+        }
+        // preadv at offset 2 scatters [12,13] then [14,15].
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::preadv, [3, 32, 2, 2, 0, 0])),
+            Ok(4)
+        );
+        {
+            let mem = host.umem.borrow();
+            assert_eq!(&mem[0..2], &[12, 13]);
+            assert_eq!(&mem[8..10], &[14, 15]);
+        }
+        // pwritev at offset 1 gathers the same runs back in.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::pwritev, [3, 32, 2, 1, 0, 0])),
+            Ok(4)
+        );
+        assert_eq!(&*host.file.borrow(), &[10, 12, 13, 14, 15, 15]);
+    }
+
+    #[test]
+    fn only_the_v2_calls_take_the_offset_that_means_here() {
+        const W: usize = size_of::<usize>();
+        let host = Mock::default();
+        *host.file.borrow_mut() = vec![1, 2, 3];
+        *host.to_read.borrow_mut() = vec![7, 8];
+        *host.umem.borrow_mut() = vec![0u8; 64];
+        iov_entry(&mut host.umem.borrow_mut(), 32, 0, 2);
+        // preadv2 with -1 falls through to the file's own position, which this
+        // host serves from a different queue, so the two are distinguishable.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::preadv2, [3, 32, 1, -1i64 as usize, 0, 0])
+            ),
+            Ok(2)
+        );
+        assert_eq!(&host.umem.borrow()[..2], &[7, 8]);
+        // preadv refuses it.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::preadv, [3, 32, 1, -1i64 as usize, 0, 0])
+            ),
+            Err(EINVAL)
+        );
+        // Any flag at all is beyond this domain.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::preadv2, [3, 32, 1, 0, 0, 1])),
+            Err(ops::EOPNOTSUPP)
+        );
+        let _ = W;
     }
 
     #[test]
