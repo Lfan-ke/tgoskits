@@ -202,13 +202,13 @@ pub fn registered() -> &'static [Registration] {
         fn __start_binfmt_register();
         fn __stop_binfmt_register();
     }
-    let start = __start_binfmt_register as *const () as *const Registration;
-    let stop = __stop_binfmt_register as *const () as *const Registration;
     // SAFETY: the two symbols bound one array of `Registration`, which the
     // linker fills from the `binfmt_register` section of every linked crate.
     unsafe {
-        let len = (stop as usize - start as usize) / size_of::<Registration>();
-        core::slice::from_raw_parts(start, len)
+        ax_dispatch::section_entries(
+            __start_binfmt_register as *const () as usize,
+            __stop_binfmt_register as *const () as usize,
+        )
     }
 }
 

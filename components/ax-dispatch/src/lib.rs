@@ -103,6 +103,22 @@ pub trait SysAbi: Sync {
     }
 }
 
+/// The entries the linker gathered between two section-bound symbols.
+///
+/// Every registry here is the same shape - a section the linker fills from
+/// whatever was linked in, bounded by a pair of symbols - so the pointer
+/// arithmetic lives once rather than once per registry. The workspace's driver
+/// registry computes the same thing by hand in `axruntime`.
+///
+/// # Safety
+///
+/// `start` and `stop` must bound one array of `T` that the linker filled, and
+/// the entries must live for the program's lifetime.
+pub unsafe fn section_entries<T>(start: usize, stop: usize) -> &'static [T] {
+    // SAFETY: the caller states the two addresses bound one array of `T`.
+    unsafe { core::slice::from_raw_parts(start as *const T, (stop - start) / size_of::<T>()) }
+}
+
 /// One personality's entry in the registry.
 ///
 /// The entries live in their own linker section, so a personality appears by
@@ -167,13 +183,13 @@ pub fn registered() -> &'static [Registration] {
         fn __start_abi_register();
         fn __stop_abi_register();
     }
-    let start = __start_abi_register as *const () as *const Registration;
-    let stop = __stop_abi_register as *const () as *const Registration;
     // SAFETY: the two symbols bound one array of `Registration`, which the
     // linker fills from the `abi_register` section of every linked crate.
     unsafe {
-        let len = (stop as usize - start as usize) / size_of::<Registration>();
-        core::slice::from_raw_parts(start, len)
+        section_entries(
+            __start_abi_register as *const () as usize,
+            __stop_abi_register as *const () as usize,
+        )
     }
 }
 
@@ -288,13 +304,13 @@ pub fn registered_custom() -> &'static [CustomRegistration] {
         fn __start_custom_register();
         fn __stop_custom_register();
     }
-    let start = __start_custom_register as *const () as *const CustomRegistration;
-    let stop = __stop_custom_register as *const () as *const CustomRegistration;
     // SAFETY: the two symbols bound one array of `CustomRegistration`, which
     // the linker fills from the `custom_register` section of every linked crate.
     unsafe {
-        let len = (stop as usize - start as usize) / size_of::<CustomRegistration>();
-        core::slice::from_raw_parts(start, len)
+        section_entries(
+            __start_custom_register as *const () as usize,
+            __stop_custom_register as *const () as usize,
+        )
     }
 }
 
