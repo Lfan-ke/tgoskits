@@ -182,11 +182,11 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         #[cfg(feature = "mm")]
         Sysno::munmap => sys_munmap(host.mem()?, arg(0), arg(1)),
         #[cfg(feature = "mm")]
-        Sysno::mprotect => host.mem()?.mprotect(arg(0), arg(1), arg(2) as i32),
+        Sysno::mprotect => sys_mprotect(host.mem()?, arg(0), arg(1), arg(2) as u32),
         #[cfg(feature = "mm")]
         Sysno::madvise => sys_madvise(host.mem()?, arg(0), arg(1), arg(2) as i32),
         #[cfg(feature = "mm")]
-        Sysno::msync => sys_msync(host.mem()?, arg(0), arg(1), arg(2) as i32),
+        Sysno::msync => sys_msync(host.mem()?, arg(0), arg(1), arg(2) as u32),
 
         // Clocks - the domain packs the timespec/timeval itself.
         #[cfg(feature = "time")]
@@ -373,18 +373,57 @@ fn sys_dup3(files: &dyn ops::Files, oldfd: i32, newfd: i32, flags: i32) -> SysRe
     )
 }
 
-/// `msync(addr, len, flags)`: reject unknown flag bits and the mutually exclusive
-/// `MS_SYNC`+`MS_ASYNC` pair, then flush through the Mem port.
+/// `msync(addr, len, flags)`: the address must be page-aligned, the flags known,
+/// and `MS_SYNC` and `MS_ASYNC` are mutually exclusive. What the host does is
+/// write the file-backed pages back; none of the flags reach it.
 #[cfg(feature = "mm")]
-fn sys_msync(mem: &dyn ops::Mem, addr: usize, len: usize, flags: i32) -> SysResult {
-    const MS_ASYNC: i32 = 1;
-    const MS_INVALIDATE: i32 = 2;
-    const MS_SYNC: i32 = 4;
-    let known = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
-    if flags & !known != 0 || flags & (MS_ASYNC | MS_SYNC) == (MS_ASYNC | MS_SYNC) {
+fn sys_msync(mem: &dyn ops::Mem, addr: usize, len: usize, flags: u32) -> SysResult {
+    use linux_raw_sys::general::{MS_ASYNC, MS_INVALIDATE, MS_SYNC};
+    if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(ops::EINVAL);
     }
-    mem.msync(addr, len, flags)
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+    {
+        return Err(ops::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    addr.checked_add(len).ok_or(ops::EINVAL)?;
+    mem.writeback(addr, len)
+}
+
+/// `mprotect(addr, len, prot)`: translate the ABI's `PROT_*` bits, refuse an
+/// unknown bit or both growth hints at once, and require a page-aligned address.
+/// A zero length succeeds without touching anything.
+#[cfg(feature = "mm")]
+fn sys_mprotect(mem: &dyn ops::Mem, addr: usize, len: usize, prot: u32) -> SysResult {
+    use linux_raw_sys::general::{PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE};
+    let known = PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN | PROT_GROWSUP;
+    if prot & !known != 0 {
+        return Err(ops::EINVAL);
+    }
+    let mut bits = ops::Prot::empty();
+    for (abi, port) in [
+        (PROT_READ, ops::Prot::READ),
+        (PROT_WRITE, ops::Prot::WRITE),
+        (PROT_EXEC, ops::Prot::EXEC),
+        (PROT_GROWSDOWN, ops::Prot::GROWS_DOWN),
+        (PROT_GROWSUP, ops::Prot::GROWS_UP),
+    ] {
+        bits.set(port, prot & abi != 0);
+    }
+    if bits.contains(ops::Prot::GROWS_DOWN | ops::Prot::GROWS_UP) {
+        return Err(ops::EINVAL);
+    }
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        return Err(ops::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    mem.protect(addr, len, bits)
 }
 
 /// `uname(buf)`: report system identity. The domain packs the six `utsname`
@@ -649,13 +688,13 @@ mod tests {
         fn unmap(&self, _a: usize, _l: usize) -> SysResult {
             Ok(0)
         }
-        fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
+        fn protect(&self, _a: usize, _l: usize, _p: ops::Prot) -> SysResult {
             Ok(0)
         }
         fn advise(&self, _a: usize, _l: usize, _adv: i32) -> SysResult {
             Ok(0)
         }
-        fn msync(&self, _a: usize, _l: usize, _f: i32) -> SysResult {
+        fn writeback(&self, _a: usize, _l: usize) -> SysResult {
             Ok(0)
         }
     }
@@ -885,14 +924,14 @@ mod tests {
         fn unmap(&self, _a: usize, _l: usize) -> SysResult {
             Ok(0)
         }
-        fn mprotect(&self, _a: usize, _l: usize, _p: i32) -> SysResult {
-            Ok(0)
+        fn protect(&self, _a: usize, _l: usize, prot: ops::Prot) -> SysResult {
+            Ok(prot.bits() as isize) // echo so a test sees what reached the host
         }
         fn advise(&self, _a: usize, _l: usize, advice: i32) -> SysResult {
             Ok(advice as isize) // echo so the test sees the delegated advice
         }
-        fn msync(&self, _a: usize, _l: usize, flags: i32) -> SysResult {
-            Ok(flags as isize)
+        fn writeback(&self, _a: usize, len: usize) -> SysResult {
+            Ok(len as isize)
         }
     }
     impl Signals for Mock {
@@ -1202,25 +1241,78 @@ mod tests {
     }
 
     #[test]
-    fn msync_rejects_sync_and_async_together() {
+    fn msync_checks_the_flags_and_the_alignment() {
         let host = Mock::default();
-        // MS_ASYNC(1) | MS_SYNC(4) is a mutually exclusive combination.
-        let r = dispatch(
-            &host,
-            &Trap::new(Sysno::msync, [0x1000, 0x1000, 5, 0, 0, 0]),
+        // MS_ASYNC(1) and MS_SYNC(4) are mutually exclusive.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::msync, [0x1000, 0x1000, 5, 0, 0, 0])
+            ),
+            Err(ops::EINVAL)
         );
-        assert_eq!(r, Err(ops::EINVAL));
+        // An unaligned address is refused before anything else.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::msync, [0x1001, 0x1000, 4, 0, 0, 0])
+            ),
+            Err(ops::EINVAL)
+        );
+        // A zero length succeeds without reaching the host.
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::msync, [0x1000, 0, 4, 0, 0, 0])),
+            Ok(0)
+        );
+        // Otherwise the range goes to the host, which reports what it wrote back.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::msync, [0x1000, 0x2000, 4, 0, 0, 0])
+            ),
+            Ok(0x2000)
+        );
     }
 
     #[test]
-    fn msync_delegates_valid_flags() {
+    fn mprotect_translates_the_prot_bits() {
+        use linux_raw_sys::general::{PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ};
         let host = Mock::default();
-        // MS_SYNC(4) alone is valid and reaches the Mem port.
         let r = dispatch(
             &host,
-            &Trap::new(Sysno::msync, [0x1000, 0x1000, 4, 0, 0, 0]),
+            &Trap::new(
+                Sysno::mprotect,
+                [0x1000, 0x1000, (PROT_READ | PROT_EXEC) as usize, 0, 0, 0],
+            ),
         );
-        assert_eq!(r, Ok(4));
+        assert_eq!(r, Ok((ops::Prot::READ | ops::Prot::EXEC).bits() as isize));
+        // An unknown bit, both growth hints at once, and an unaligned address
+        // are each refused.
+        for args in [
+            [0x1000, 0x1000, 1 << 20, 0, 0, 0],
+            [
+                0x1000,
+                0x1000,
+                (PROT_GROWSDOWN | PROT_GROWSUP) as usize,
+                0,
+                0,
+                0,
+            ],
+            [0x1001, 0x1000, PROT_READ as usize, 0, 0, 0],
+        ] {
+            assert_eq!(
+                dispatch(&host, &Trap::new(Sysno::mprotect, args)),
+                Err(ops::EINVAL)
+            );
+        }
+        // A zero length succeeds without reaching the host.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::mprotect, [0x1000, 0, PROT_READ as usize, 0, 0, 0])
+            ),
+            Ok(0)
+        );
     }
 
     #[test]

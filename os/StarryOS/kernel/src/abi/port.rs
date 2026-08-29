@@ -9,8 +9,8 @@
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
-    Clock, Creds, Files, Mem, Platform, Random, SeekFrom, Signals, SysResult, System, Tasks,
-    UtsField,
+    Clock, Creds, Files, Mem, Platform, Prot, Random, SeekFrom, Signals, SysResult, System,
+    Tasks, UtsField,
 };
 use ax_io::SeekFrom as IoSeek;
 use ax_runtime::hal;
@@ -28,6 +28,7 @@ use crate::{
     file::{File, FileLike, add_file_like, close_file_like, get_file_like},
     mm::{VmBytes, VmBytesMut},
     syscall,
+    syscall::MmapProt,
     task::{AsThread, current_pid_view, do_exit},
 };
 
@@ -187,16 +188,26 @@ impl Mem for KernelHost {
         port_result(syscall::unmap_range(addr, len))
     }
 
-    fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult {
-        port_result(syscall::sys_mprotect(addr, len, prot as u32))
+    fn protect(&self, addr: usize, len: usize, prot: Prot) -> SysResult {
+        let mut flags = MmapProt::empty();
+        for (port, host) in [
+            (Prot::READ, MmapProt::READ),
+            (Prot::WRITE, MmapProt::WRITE),
+            (Prot::EXEC, MmapProt::EXEC),
+            (Prot::GROWS_DOWN, MmapProt::GROWDOWN),
+            (Prot::GROWS_UP, MmapProt::GROWSUP),
+        ] {
+            flags.set(host, prot.contains(port));
+        }
+        port_result(syscall::protect_range(addr, len, flags))
     }
 
     fn advise(&self, addr: usize, len: usize, advice: i32) -> SysResult {
         port_result(syscall::sys_madvise(addr, len, advice))
     }
 
-    fn msync(&self, addr: usize, len: usize, flags: i32) -> SysResult {
-        port_result(syscall::sys_msync(addr, len, flags as u32))
+    fn writeback(&self, addr: usize, len: usize) -> SysResult {
+        port_result(syscall::writeback_range(addr, len))
     }
 }
 

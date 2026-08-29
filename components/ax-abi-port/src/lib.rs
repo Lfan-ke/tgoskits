@@ -25,6 +25,8 @@
 #![no_std]
 
 use ax_crate_interface::def_interface;
+#[cfg(feature = "mm")]
+use bitflags::bitflags;
 
 /// A syscall outcome: `Ok(return value)` or `Err(positive errno)`. A domain
 /// encodes it into the trap frame its ABI's way (`-errno` for Linux).
@@ -112,6 +114,26 @@ pub trait Files: Sync {
 }
 
 #[cfg(feature = "mm")]
+bitflags! {
+    /// How a mapping may be used. The three access bits are common to every ABI;
+    /// the growth hints say a region is a stack that extends one way, which some
+    /// hosts track and others ignore.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Prot: u32 {
+        /// Readable.
+        const READ = 1 << 0;
+        /// Writable.
+        const WRITE = 1 << 1;
+        /// Executable.
+        const EXEC = 1 << 2;
+        /// Grows toward lower addresses.
+        const GROWS_DOWN = 1 << 3;
+        /// Grows toward higher addresses.
+        const GROWS_UP = 1 << 4;
+    }
+}
+
+#[cfg(feature = "mm")]
 pub trait Mem: Sync {
     /// Where the program break sits now.
     fn brk(&self) -> usize;
@@ -131,15 +153,16 @@ pub trait Mem: Sync {
     /// Unmap `[addr, addr+len)`. The length is rounded up to whole pages here,
     /// since the page size is the host's to know.
     fn unmap(&self, addr: usize, len: usize) -> SysResult;
-    fn mprotect(&self, addr: usize, len: usize, prot: i32) -> SysResult;
+    /// Change what `[addr, addr+len)` allows.
+    fn protect(&self, addr: usize, len: usize, prot: Prot) -> SysResult;
     /// Advise usage of `[addr, addr+len)`. The host validates `advice`, since
     /// which hints it honours is its own property, as is page alignment.
     /// Apply `advice` to `[addr, addr+len)`. The caller has already checked the
     /// advice is one its ABI defines; whether this host acts on it is its own
     /// business.
     fn advise(&self, addr: usize, len: usize, advice: i32) -> SysResult;
-    /// Flush `[addr, addr+len)` of a file mapping. A domain validates `flags`.
-    fn msync(&self, addr: usize, len: usize, flags: i32) -> SysResult;
+    /// Write back the file-backed parts of `[addr, addr+len)`.
+    fn writeback(&self, addr: usize, len: usize) -> SysResult;
 }
 
 /// A source of randomness. Fills a kernel buffer; a domain copies it to user

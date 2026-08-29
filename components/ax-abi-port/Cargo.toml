@@ -24,3 +24,4 @@ creds = []
 
 [dependencies]
 ax-crate-interface = { workspace = true }
+bitflags = { workspace = true }
