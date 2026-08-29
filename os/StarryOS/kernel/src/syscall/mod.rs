@@ -64,20 +64,17 @@ pub fn syscall_allows_signal_restart(sysno: usize) -> bool {
 // on a copy that never executes, so the probe would never trigger.
 #[inline(never)]
 pub fn sysno(id: usize) -> Option<Sysno> {
-    let Some(sysno) = Sysno::new(id) else {
-        warn!("Invalid syscall number: {}", id);
-        return None;
-    };
-    Some(sysno)
+    Sysno::new(id)
 }
 
 pub fn handle_syscall(uctx: &mut UserContext) {
-    let Some(sysno) = sysno(uctx.sysno()) else {
-        uctx.set_retval(-Errno::ENOSYS.into_raw() as _);
-        return;
-    };
-
-    trace!("Syscall {sysno:?}");
+    // A trapped number belongs to whichever ABI the task speaks; only this
+    // kernel's own table needs it to name a Linux call, so a number that does
+    // not is carried as far as the personality before it is refused.
+    let sysno = sysno(uctx.sysno());
+    if let Some(sysno) = sysno {
+        trace!("Syscall {sysno:?}");
+    }
     // Fast path: skip the seccomp lock + SeccompState clone + evaluate entirely when
     // no filter is installed (the common case). `seccomp_active` is a lock-free
     // one-way flag, so this can never bypass an installed filter.
@@ -116,6 +113,11 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     if crate::abi::dispatch_syscall(uctx) {
         return;
     }
+    let Some(sysno) = sysno else {
+        warn!("Invalid syscall number: {}", uctx.sysno());
+        uctx.set_retval(-Errno::ENOSYS.into_raw() as _);
+        return;
+    };
     let result = dispatch_table(sysno, uctx);
     debug!("Syscall {sysno} return {result:?}");
     let new_retval = result.unwrap_or_else(|err| -err.linux_errno().into_raw() as _) as _;
