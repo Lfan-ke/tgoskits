@@ -23,7 +23,7 @@ bitflags::bitflags! {
     ///
     /// For `PROT_NONE`, use `ProtFlags::empty()`.
     #[derive(Debug, Clone, Copy)]
-    struct MmapProt: u32 {
+    pub(crate) struct MmapProt: u32 {
         /// Page can be read.
         const READ = PROT_READ;
         /// Page can be written.
@@ -620,26 +620,13 @@ pub fn sys_munmap(addr: usize, length: usize) -> StarryResult<isize> {
     unmap_range(addr, length)
 }
 
-pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> StarryResult<isize> {
-    // TODO: implement PROT_GROWSUP & PROT_GROWSDOWN
-    let Some(permission_flags) = MmapProt::from_bits(prot) else {
-        return Err(StarryError::InvalidInput);
-    };
-    debug!("sys_mprotect <= addr: {addr:#x}, length: {length:x}, prot: {permission_flags:?}");
-
-    if permission_flags.contains(MmapProt::GROWDOWN | MmapProt::GROWSUP) {
-        return Err(StarryError::InvalidInput);
-    }
-
-    // man 2 mprotect: addr is not a multiple of page size → EINVAL.
-    if !addr.is_multiple_of(PAGE_SIZE_4K) {
-        return Err(StarryError::InvalidInput);
-    }
-    // length=0 is a no-op success on Linux.
-    if length == 0 {
-        return Ok(0);
-    }
-
+/// Change what `[addr, addr+length)` allows. The caller has already checked the
+/// bits and the alignment.
+pub(crate) fn protect_range(
+    addr: usize,
+    length: usize,
+    permission_flags: MmapProt,
+) -> StarryResult<isize> {
     let curr = current();
     let aspace_arc = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_arc.lock();
@@ -682,6 +669,28 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> StarryResult<isize
     )?;
 
     Ok(0)
+}
+
+pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> StarryResult<isize> {
+    // TODO: implement PROT_GROWSUP & PROT_GROWSDOWN
+    let Some(permission_flags) = MmapProt::from_bits(prot) else {
+        return Err(StarryError::InvalidInput);
+    };
+    debug!("sys_mprotect <= addr: {addr:#x}, length: {length:x}, prot: {permission_flags:?}");
+
+    if permission_flags.contains(MmapProt::GROWDOWN | MmapProt::GROWSUP) {
+        return Err(StarryError::InvalidInput);
+    }
+
+    // man 2 mprotect: addr is not a multiple of page size → EINVAL.
+    if !addr.is_multiple_of(PAGE_SIZE_4K) {
+        return Err(StarryError::InvalidInput);
+    }
+    // length=0 is a no-op success on Linux.
+    if length == 0 {
+        return Ok(0);
+    }
+    protect_range(addr, length, permission_flags)
 }
 
 const MREMAP_VALID_FLAGS: usize = (MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) as usize;
@@ -1104,25 +1113,8 @@ pub fn sys_madvise(addr: usize, length: usize, advice: i32) -> StarryResult<isiz
     Ok(0)
 }
 
-pub fn sys_msync(addr: usize, length: usize, flags: u32) -> StarryResult<isize> {
-    debug!("sys_msync <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
-
-    if !addr.is_multiple_of(PAGE_SIZE_4K) {
-        return Err(StarryError::InvalidInput);
-    }
-
-    let valid_flags = MS_SYNC | MS_ASYNC | MS_INVALIDATE;
-    if flags & !valid_flags != 0 {
-        return Err(StarryError::InvalidInput);
-    }
-    if flags & MS_SYNC != 0 && flags & MS_ASYNC != 0 {
-        return Err(StarryError::InvalidInput);
-    }
-
-    if length == 0 {
-        return Ok(0);
-    }
-
+/// Write back the file-backed parts of `[addr, addr+length)`.
+pub(crate) fn writeback_range(addr: usize, length: usize) -> StarryResult<isize> {
     let start = VirtAddr::from(addr);
     let end_val = addr.checked_add(length).ok_or(StarryError::InvalidInput)?;
     let end = VirtAddr::from(end_val);
@@ -1155,6 +1147,27 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> StarryResult<isize> 
     }
 
     Ok(0)
+}
+
+pub fn sys_msync(addr: usize, length: usize, flags: u32) -> StarryResult<isize> {
+    debug!("sys_msync <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
+
+    if !addr.is_multiple_of(PAGE_SIZE_4K) {
+        return Err(StarryError::InvalidInput);
+    }
+
+    let valid_flags = MS_SYNC | MS_ASYNC | MS_INVALIDATE;
+    if flags & !valid_flags != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+    if flags & MS_SYNC != 0 && flags & MS_ASYNC != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+
+    if length == 0 {
+        return Ok(0);
+    }
+    writeback_range(addr, length)
 }
 
 pub fn sys_mlock(addr: usize, length: usize) -> StarryResult<isize> {
