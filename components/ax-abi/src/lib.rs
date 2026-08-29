@@ -40,8 +40,8 @@ struct Dispatcher;
 
 #[ax_crate_interface::impl_interface]
 impl TrapDispatch for Dispatcher {
-    fn route(env: &mut dyn TrapEnv) -> TrapOutcome {
-        ax_binfmt::route_registered(env)
+    fn dispatch(env: &mut dyn TrapEnv) -> Dispatch {
+        ax_binfmt::dispatch_registered_trap(env)
     }
 }
 

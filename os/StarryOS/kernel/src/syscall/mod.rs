@@ -111,12 +111,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     // non-x86_64 arches retval and arg0 (signo) share a register.
     let prev_ip = uctx.ip();
 
-    // The Linux personality owns the syscalls that have moved into it; the table
-    // below still carries the rest.
-    let result = match crate::abi::route_syscall(uctx) {
-        Some(result) => result,
-        None => dispatch_table(sysno, uctx),
-    };
+    // A personality that owns this call answers it and writes the result in its
+    // own encoding; the table below still carries the rest, in Linux's.
+    if crate::abi::dispatch_syscall(uctx) {
+        return;
+    }
+    let result = dispatch_table(sysno, uctx);
     debug!("Syscall {sysno} return {result:?}");
     let new_retval = result.unwrap_or_else(|err| -err.linux_errno().into_raw() as _) as _;
 
