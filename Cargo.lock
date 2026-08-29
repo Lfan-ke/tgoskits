@@ -721,7 +721,9 @@ dependencies = [
 name = "ax-abi-darwin"
 version = "0.1.0"
 dependencies = [
+ "ax-abi-port",
  "ax-binfmt",
+ "ax-crate-interface",
 ]
 
 [[package]]
@@ -755,13 +757,16 @@ name = "ax-abi-port"
 version = "0.1.0"
 dependencies = [
  "ax-crate-interface",
+ "bitflags 2.13.1",
 ]
 
 [[package]]
 name = "ax-abi-windows"
 version = "0.1.0"
 dependencies = [
+ "ax-abi-port",
  "ax-binfmt",
+ "ax-crate-interface",
 ]
 
 [[package]]
