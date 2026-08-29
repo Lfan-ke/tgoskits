@@ -6,11 +6,13 @@
 //! segments and find the `LC_MAIN` entry point, transcribed from
 //! `<mach-o/loader.h>` atop [`ax_binfmt::macho`]. Darwin binaries are dyld-based
 //! and position-independent; dyld and chained fixups (the Mach-O analogue of PE
-//! imports/relocations) arrive in a later phase, as does BSD/Mach syscall
-//! dispatch.
+//! imports/relocations) arrive in a later phase. The BSD calls it services live
+//! in [`bsd`]; Mach traps belong to a layer that is not here yet.
 
 #![cfg_attr(not(test), no_std)]
 #![feature(used_with_arg)]
+
+pub mod bsd;
 
 extern crate alloc;
 
@@ -35,10 +37,11 @@ impl Personality for DarwinAbi {
         ax_binfmt::detect(image) == Some(Abi::Darwin)
     }
 
-    fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
-        // Darwin BSD/Mach syscall dispatch is a later phase; until then no index
-        // is serviced, so pass through to a custom handler or the caller default.
-        Dispatch::Passthrough
+    fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
+        bsd::dispatch(
+            env,
+            ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current),
+        )
     }
 
     fn loader(&self) -> Option<&dyn Loader> {
