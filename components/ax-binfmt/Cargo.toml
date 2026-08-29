@@ -4,12 +4,12 @@ version = "0.1.0"
 repository.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Format-agnostic executable dispatch: sniff a binary's magic and route it to the matching OS personality (Linux ELF / Windows PE / macOS Mach-O)."
+description = "Executable formats: recognize an image by its magic and hand it to the loader that claims it (Linux ELF / Windows PE / macOS Mach-O)."
 keywords = ["binfmt", "personality", "abi", "no-std"]
 categories = ["no-std", "os"]
 license.workspace = true
 
 [dependencies]
-ax-crate-interface = { workspace = true }
+ax-dispatch = { workspace = true }
 bitflags = { workspace = true }
 thiserror = { workspace = true }

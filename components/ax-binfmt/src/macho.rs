@@ -174,6 +174,8 @@ fn read_u64(b: &[u8], off: usize) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
 
     // Build a thin Mach-O with one __TEXT segment and an LC_MAIN command.

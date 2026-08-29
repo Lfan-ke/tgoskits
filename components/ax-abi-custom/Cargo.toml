@@ -10,4 +10,4 @@ categories = ["no-std", "os"]
 license.workspace = true
 
 [dependencies]
-ax-binfmt = { workspace = true }
+ax-dispatch = { workspace = true }

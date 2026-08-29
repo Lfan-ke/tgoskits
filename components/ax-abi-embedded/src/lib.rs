@@ -8,7 +8,7 @@
 //!
 //! [`VectorTable`] is deliberately the same shape from both directions:
 //!
-//! - as a [`Personality`], it is the fourth dispatch domain alongside Linux,
+//! - as a [`SysAbi`], it is the fourth dispatch domain alongside Linux,
 //!   Windows and Darwin (an integrator installs it directly; it is never magic
 //!   routed, since a bare image carries no universal header);
 //! - as a [`CustomHandler`], it is the reserved-index extension a maker fills to
@@ -20,10 +20,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use ax_binfmt::{
-    Abi, AbiError, AbiResult, CustomHandler, Dispatch, LoadEnv, LoadRequest, Loaded, Loader,
-    Personality, Prot, TrapEnv,
-};
+use ax_binfmt::{AbiError, AbiResult, LoadEnv, LoadRequest, Loaded, Prot};
+use ax_dispatch::{Abi, CustomHandler, Dispatch, SysAbi, TrapEnv};
 
 /// A handler for one trapped index. A bare function pointer, so a vector table
 /// is `const`-constructible and needs no allocation or object identity - the
@@ -43,7 +41,7 @@ pub struct VectorTable<'a> {
 
 impl<'a> VectorTable<'a> {
     /// Build a table over `vectors`, with `base` the load address a flat image
-    /// is placed at (see [`Personality::load`]). `const` so it can back a
+    /// is placed at (see [`SysAbi::load`]). `const` so it can back a
     /// `static`.
     pub const fn new(vectors: &'a [(usize, Vector)], base: u64) -> Self {
         Self { vectors, base }
@@ -51,7 +49,7 @@ impl<'a> VectorTable<'a> {
 
     /// Route one trapped index through the table: run the first handler whose
     /// index matches, else [`Dispatch::Passthrough`] so the caller can fall to
-    /// the next handler or its default. The single point both the [`Personality`]
+    /// the next handler or its default. The single point both the [`SysAbi`]
     /// and [`CustomHandler`] faces delegate to.
     pub fn dispatch(&self, env: &mut dyn TrapEnv) -> Dispatch {
         match self.vectors.iter().find(|(nr, _)| *nr == env.nr()) {
@@ -61,7 +59,7 @@ impl<'a> VectorTable<'a> {
     }
 }
 
-impl Personality for VectorTable<'_> {
+impl SysAbi for VectorTable<'_> {
     fn abi(&self) -> Abi {
         Abi::Embedded
     }
@@ -69,26 +67,18 @@ impl Personality for VectorTable<'_> {
     /// Always `false`: a bare image carries no universal magic, so the embedded
     /// domain is installed explicitly by an integrator, never selected by
     /// [`ax_binfmt::detect`] or [`ax_binfmt::dispatch`].
-    fn recognizes(&self, _image: &[u8]) -> bool {
-        false
-    }
-
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
         self.dispatch(env)
     }
-
-    fn loader(&self) -> Option<&dyn Loader> {
-        Some(self)
-    }
 }
 
-impl Loader for VectorTable<'_> {
+impl VectorTable<'_> {
     /// Load a flat image: map the opaque blob at [`base`](Self::base) and start
     /// there. Mapped read-write-execute because a flat binary interleaves code
     /// and mutable data with no section table to separate them - matching how a
     /// bootloader drops a raw blob into RAM on an MMU-less target. A maker who
     /// needs W^X separation uses a structured personality (ELF/PE/Mach-O).
-    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
+    pub fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
         if req.image.is_empty() {
             return Err(AbiError::MalformedImage);
         }
@@ -113,7 +103,7 @@ impl CustomHandler for VectorTable<'_> {
 
 #[cfg(test)]
 mod tests {
-    use ax_binfmt::dispatch_trap;
+    use ax_dispatch::dispatch_trap;
 
     use super::*;
 
@@ -199,11 +189,7 @@ mod tests {
     #[test]
     fn is_the_fourth_dispatch_domain() {
         assert_eq!(TABLE.abi(), Abi::Embedded);
-        // Never magic-routed: recognizes nothing, whatever the bytes.
-        assert!(!TABLE.recognizes(b"\x7fELF"));
-        assert!(!TABLE.recognizes(&[0xFE, 0xED, 0xFA, 0xCF]));
-        assert!(!TABLE.recognizes(b""));
-        // Its Personality face dispatches exactly like the table.
+        // Its SysAbi face dispatches exactly like the table.
         let mut env = Trap::at(0x10);
         assert_eq!(TABLE.handle_syscall(&mut env), Dispatch::Handled);
         assert_eq!(env.result, Some(42));
@@ -243,12 +229,9 @@ mod tests {
     // A domain that owns no syscalls, so every index passes through to the
     // custom handlers - the seam a maker extends.
     struct NullDomain;
-    impl Personality for NullDomain {
+    impl SysAbi for NullDomain {
         fn abi(&self) -> Abi {
             Abi::Linux
-        }
-        fn recognizes(&self, _: &[u8]) -> bool {
-            false
         }
         fn handle_syscall(&self, _: &mut dyn TrapEnv) -> Dispatch {
             Dispatch::Passthrough

@@ -18,7 +18,7 @@
 //! ReactOS `ntoskrnl/io`,`mm`), read via the ABI-neutral [`TrapEnv`].
 
 use ax_abi_port::{Host, MapRequest, MapSource, Prot};
-use ax_binfmt::{Dispatch, TrapEnv};
+use ax_dispatch::{Dispatch, TrapEnv};
 
 use crate::handle::Handle;
 

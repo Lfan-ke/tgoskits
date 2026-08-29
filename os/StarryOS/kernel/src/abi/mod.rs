@@ -18,7 +18,7 @@
 mod port;
 
 use ax_abi_port::{Clock, Creds, CurrentHost, Files, Host, Mem, Platform, Random, Signals, System, Tasks};
-use ax_binfmt::{Abi, TrapEnv};
+use ax_dispatch::TrapEnv;
 use ax_crate_interface::call_interface;
 use ax_runtime::hal::cpu::uspace::UserContext;
 
@@ -31,23 +31,25 @@ use crate::{StarryError, StarryResult, task::AsThread};
 pub struct TrapCtx<'a> {
     uctx: &'a mut UserContext,
     entry_ip: usize,
-    abi: Option<Abi>,
+    slot: Option<usize>,
 }
 
 impl<'a> TrapCtx<'a> {
     pub fn new(uctx: &'a mut UserContext) -> Self {
         let entry_ip = uctx.ip();
-        let abi = Abi::from_tag(
-            current()
-                .as_thread()
-                .proc_data
-                .abi_tag
-                .load(core::sync::atomic::Ordering::Relaxed),
-        );
+        // The slot was resolved when the image was loaded, so this is a load
+        // and a subtract, not a search through the registry.
+        let slot = current()
+            .as_thread()
+            .proc_data
+            .abi_slot
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .checked_sub(1)
+            .map(|slot| slot as usize);
         Self {
             uctx,
             entry_ip,
-            abi,
+            slot,
         }
     }
 }
@@ -68,8 +70,8 @@ impl TrapEnv for TrapCtx<'_> {
         }
     }
 
-    fn abi(&self) -> Option<Abi> {
-        self.abi
+    fn slot(&self) -> Option<usize> {
+        self.slot
     }
 
     fn set_result(&mut self, value: usize) {
@@ -138,10 +140,8 @@ impl CurrentHost for KernelHost {
 /// for both paths, so a migrated syscall still goes through the signal-redirect
 /// check and the retval encoding the kernel already applies.
 pub fn dispatch_syscall(uctx: &mut UserContext) -> bool {
-    call_interface!(
-        ax_binfmt::TrapDispatch::dispatch,
-        &mut TrapCtx::new(uctx)
-    ) == ax_binfmt::Dispatch::Handled
+    call_interface!(ax_dispatch::TrapDispatch::dispatch, &mut TrapCtx::new(uctx))
+        == ax_dispatch::Dispatch::Handled
 }
 
 /// Translate a kernel failure into the errno a personality reports to userspace,
