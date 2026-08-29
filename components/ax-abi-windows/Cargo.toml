@@ -10,6 +10,7 @@ categories = ["no-std", "os"]
 license.workspace = true
 
 [dependencies]
+ax-dispatch = { workspace = true }
 ax-binfmt = { workspace = true }
 ax-abi-port = { workspace = true, features = ["fs", "mm", "task"] }
 ax-crate-interface = { workspace = true }

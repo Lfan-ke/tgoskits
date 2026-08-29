@@ -1,7 +1,7 @@
 //! Windows NT personality for ArceOS/StarryOS.
 //!
 //! This crate teaches ArceOS to load and run PE/COFF (`.exe`) images as a
-//! `Personality` alongside the native Linux one, mapping Windows execution onto
+//! `SysAbi` alongside the native Linux one, mapping Windows execution onto
 //! the shared `ax_*` primitives (an address space via [`LoadEnv`], a trap frame
 //! via [`TrapEnv`]). It targets the NT-native ABI - a `subsystem == NATIVE` PE
 //! that links only ntdll and issues NT syscalls directly - which is the smallest
@@ -23,22 +23,18 @@ pub mod teb_peb;
 use alloc::{vec, vec::Vec};
 
 use ax_binfmt::{
-    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Loader, Personality, Prot,
-    TrapEnv,
+    AbiError, AbiResult, ImageFormat, LoadEnv, LoadRequest, Loaded, Prot,
     pe::{self, PeInfo, Reloc, Section},
 };
+use ax_dispatch::{Abi, Dispatch, SysAbi, TrapEnv};
 
 /// The Windows NT personality: recognizes PE images and loads them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsAbi;
 
-impl Personality for WindowsAbi {
+impl SysAbi for WindowsAbi {
     fn abi(&self) -> Abi {
         Abi::Windows
-    }
-
-    fn recognizes(&self, image: &[u8]) -> bool {
-        ax_binfmt::detect(image) == Some(Abi::Windows)
     }
 
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
@@ -46,10 +42,6 @@ impl Personality for WindowsAbi {
             env,
             ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current),
         )
-    }
-
-    fn loader(&self) -> Option<&dyn Loader> {
-        Some(self)
     }
 }
 
@@ -333,7 +325,15 @@ mod tests {
     }
 }
 
-impl Loader for WindowsAbi {
+impl ImageFormat for WindowsAbi {
+    fn abi(&self) -> Abi {
+        Abi::Windows
+    }
+
+    fn recognizes(&self, image: &[u8]) -> bool {
+        ax_binfmt::detect(image) == Some(Abi::Windows)
+    }
+
     fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
         let pe = pe::parse(req.image).ok_or(AbiError::MalformedImage)?;
         if !pe.pe64 {
@@ -351,9 +351,18 @@ impl Loader for WindowsAbi {
     }
 }
 
-fn windows() -> &'static dyn Personality {
+fn windows() -> &'static dyn SysAbi {
     static IT: WindowsAbi = WindowsAbi;
     &IT
 }
 
-ax_binfmt::register_sysabi!(windows);
+ax_dispatch::register_sysabi!(windows);
+
+/// The same package registers twice, once per capability: it knows how to
+/// map this format, and it knows how to service the traps that follow.
+fn windows_format() -> &'static dyn ImageFormat {
+    static IT: WindowsAbi = WindowsAbi;
+    &IT
+}
+
+ax_binfmt::register_binfmt!(windows_format);

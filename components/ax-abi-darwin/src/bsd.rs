@@ -10,7 +10,7 @@
 //! [`TrapEnv::set_error`] alongside the value.
 
 use ax_abi_port::{Host, MapRequest, MapSource, Prot, SeekFrom, SysResult};
-use ax_binfmt::{Dispatch, TrapEnv};
+use ax_dispatch::{Dispatch, TrapEnv};
 
 /// Where the call class sits in a Darwin system-call number.
 const CLASS_SHIFT: usize = 24;

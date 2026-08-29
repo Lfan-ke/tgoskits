@@ -7,9 +7,15 @@
 //! "maker" who wants finer control can depend on the sub-crates
 //! (`ax-abi-windows`, `ax-abi-path`, ...) directly instead.
 //!
-//! The dispatch core and the [`Personality`] trait live in [`ax_binfmt`], and the
-//! capability ports a hosting OS implements live in [`ax_abi_port`]; both are
-//! re-exported here so a dependant needs only this crate.
+//! The dispatch spine and the [`SysAbi`] trait live in [`ax_dispatch`], the
+//! executable formats in [`ax_binfmt`], and the capability ports a hosting OS
+//! implements in [`ax_abi_port`]; all three are re-exported here so a dependant
+//! needs only this crate.
+//!
+//! Nothing here selects anything at run time. A feature adds a crate to the
+//! link, that crate registers itself, and this crate supplies the one default
+//! dispatch policy the kernel calls. A host wanting another policy depends on
+//! the packages directly and implements [`TrapDispatch`] itself.
 
 #![no_std]
 
@@ -28,9 +34,10 @@ pub use ax_abi_path;
 pub use ax_abi_port::{self, CurrentHost, Host};
 #[cfg(feature = "win")]
 pub use ax_abi_windows::{self, WindowsAbi};
-pub use ax_binfmt::{
-    self, Abi, AbiError, AbiResult, CustomHandler, Dispatch, Personality, TrapDispatch, TrapEnv,
-    TrapOutcome, detect, dispatch_trap, dispatch_trap_intercept,
+pub use ax_binfmt::{self, AbiError, AbiResult, ImageFormat, detect, dispatch_image};
+pub use ax_dispatch::{
+    self, Abi, CustomHandler, Dispatch, SysAbi, TrapDispatch, TrapEnv, TrapOutcome, dispatch_trap,
+    dispatch_trap_intercept,
 };
 
 /// Answers the hosting kernel's [`TrapDispatch`] from the registry, so neither
@@ -41,15 +48,20 @@ struct Dispatcher;
 #[ax_crate_interface::impl_interface]
 impl TrapDispatch for Dispatcher {
     fn dispatch(env: &mut dyn TrapEnv) -> Dispatch {
-        ax_binfmt::dispatch_registered_trap(env)
+        // A host that resolved which implementation serves this task gets an
+        // index into the registry; one that did not gets the scan.
+        match env.slot() {
+            Some(slot) => ax_dispatch::dispatch_at(slot, env),
+            None => ax_dispatch::dispatch_registered_trap(env),
+        }
     }
 }
 
-/// The personalities this build linked in, in registration order.
-pub fn personalities() -> impl Iterator<Item = &'static dyn Personality> {
-    ax_binfmt::registered()
+/// The ABI implementations this build linked in, in registration order.
+pub fn personalities() -> impl Iterator<Item = &'static dyn SysAbi> {
+    ax_dispatch::registered()
         .iter()
-        .map(ax_binfmt::Registration::personality)
+        .map(ax_dispatch::Registration::sysabi)
 }
 
 /// Route `image` to the first compiled-in personality that recognizes it.
@@ -59,8 +71,8 @@ pub fn personalities() -> impl Iterator<Item = &'static dyn Personality> {
 /// Returns [`AbiError::UnknownFormat`] when no enabled personality claims the
 /// image (the caller reports `ENOEXEC`).
 #[cfg(feature = "auto-dispatch")]
-pub fn dispatch(image: &[u8]) -> AbiResult<&'static dyn Personality> {
-    ax_binfmt::dispatch_registered(image)
+pub fn dispatch(image: &[u8]) -> AbiResult<&'static dyn ImageFormat> {
+    ax_binfmt::dispatch_image(image)
 }
 
 #[cfg(test)]

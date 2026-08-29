@@ -861,17 +861,13 @@ fn load_user_app_with_depth(
                     interpreter_depth + 1,
                 );
             }
-            // Not ELF and not a shebang: hand the image to whichever
-            // personality claims it. Which personalities exist is settled by
-            // what the build links in, so this names none of them.
-            let abi = ax_abi::dispatch(&data).map_err(|_| StarryError::InvalidExecutable)?;
-            let loader = abi.loader().ok_or_else(|| {
-                warn!("exec {path}: {:?} images are recognized but not loadable", abi.abi());
-                StarryError::InvalidExecutable
-            })?;
+            // Not ELF and not a shebang: hand the image to whichever format
+            // claims it. Which formats exist is settled by what the build
+            // links in, so this names none of them.
+            let format = ax_abi::dispatch(&data).map_err(|_| StarryError::InvalidExecutable)?;
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let envs: Vec<&str> = envs.iter().map(String::as_str).collect();
-            let loaded = loader
+            let loaded = format
                 .load(
                     &ax_binfmt::LoadRequest {
                         image: &data,
@@ -886,13 +882,17 @@ fn load_user_app_with_depth(
                     warn!("exec {path}: {err}");
                     StarryError::InvalidExecutable
                 })?;
-            // From here the process speaks that ABI, which is what selects the
-            // personality serving its traps.
+            // From here the process speaks that ABI. Resolve which registered
+            // implementation serves it once, now, so its traps are an index.
+            let slot = ax_dispatch::slot_of(format.abi()).ok_or_else(|| {
+                warn!("exec {path}: no package services the {:?} ABI", format.abi());
+                StarryError::InvalidExecutable
+            })?;
             ax_task::current()
                 .as_thread()
                 .proc_data
-                .abi_tag
-                .store(abi.abi().as_tag(), core::sync::atomic::Ordering::Relaxed);
+                .abi_slot
+                .store(slot as u32 + 1, core::sync::atomic::Ordering::Relaxed);
             // A personality that leaves the stack to the kernel gets the same
             // one an ELF does, minus the aux vector it has no use for.
             (VirtAddr::from_usize(loaded.entry as usize), Vec::new())

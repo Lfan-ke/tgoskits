@@ -318,6 +318,8 @@ fn read_u64(b: &[u8], off: usize) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
 
     const PE_OFF: usize = 0x80;

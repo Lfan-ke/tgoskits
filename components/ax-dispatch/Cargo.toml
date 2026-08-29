@@ -1,0 +1,13 @@
+[package]
+name = "ax-dispatch"
+version = "0.1.0"
+repository.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Registered owners of a trapped index: gather what is linked in and route (index, arguments) to the implementation that claims it."
+keywords = ["dispatch", "syscall", "abi", "no-std"]
+categories = ["no-std", "os"]
+license.workspace = true
+
+[dependencies]
+ax-crate-interface = { workspace = true }

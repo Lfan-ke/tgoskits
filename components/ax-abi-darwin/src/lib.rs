@@ -1,6 +1,6 @@
 //! Darwin (macOS) personality for ArceOS/StarryOS.
 //!
-//! Teaches ArceOS to load Mach-O (`.macho`) executables as a `Personality`,
+//! Teaches ArceOS to load Mach-O (`.macho`) executables as a `SysAbi`,
 //! mapping Darwin execution onto the shared `ax_*` primitives just as
 //! `ax-abi-windows` does for PE. This is the loader half: map `LC_SEGMENT_64`
 //! segments and find the `LC_MAIN` entry point, transcribed from
@@ -19,22 +19,18 @@ extern crate alloc;
 use alloc::vec;
 
 use ax_binfmt::{
-    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Loader, Personality, Prot,
-    TrapEnv,
+    AbiError, AbiResult, ImageFormat, LoadEnv, LoadRequest, Loaded, Prot,
     macho::{self, Segment},
 };
+use ax_dispatch::{Abi, Dispatch, SysAbi, TrapEnv};
 
 /// The Darwin personality: recognizes Mach-O images and loads them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DarwinAbi;
 
-impl Personality for DarwinAbi {
+impl SysAbi for DarwinAbi {
     fn abi(&self) -> Abi {
         Abi::Darwin
-    }
-
-    fn recognizes(&self, image: &[u8]) -> bool {
-        ax_binfmt::detect(image) == Some(Abi::Darwin)
     }
 
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
@@ -42,10 +38,6 @@ impl Personality for DarwinAbi {
             env,
             ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current),
         )
-    }
-
-    fn loader(&self) -> Option<&dyn Loader> {
-        Some(self)
     }
 }
 
@@ -229,7 +221,15 @@ mod tests {
     }
 }
 
-impl Loader for DarwinAbi {
+impl ImageFormat for DarwinAbi {
+    fn abi(&self) -> Abi {
+        Abi::Darwin
+    }
+
+    fn recognizes(&self, image: &[u8]) -> bool {
+        ax_binfmt::detect(image) == Some(Abi::Darwin)
+    }
+
     fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
         let macho = macho::parse(req.image).ok_or(AbiError::MalformedImage)?;
         // No LC_MAIN means a legacy LC_UNIXTHREAD entry, which is out of scope.
@@ -252,9 +252,18 @@ impl Loader for DarwinAbi {
     }
 }
 
-fn darwin() -> &'static dyn Personality {
+fn darwin() -> &'static dyn SysAbi {
     static IT: DarwinAbi = DarwinAbi;
     &IT
 }
 
-ax_binfmt::register_sysabi!(darwin);
+ax_dispatch::register_sysabi!(darwin);
+
+/// The same package registers twice, once per capability: it knows how to
+/// map this format, and it knows how to service the traps that follow.
+fn darwin_format() -> &'static dyn ImageFormat {
+    static IT: DarwinAbi = DarwinAbi;
+    &IT
+}
+
+ax_binfmt::register_binfmt!(darwin_format);

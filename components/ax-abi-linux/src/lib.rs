@@ -33,8 +33,8 @@ extern crate alloc;
 compile_error!("ax-abi-linux needs at least one syscall family enabled");
 
 pub use ax_abi_port as ops;
-use ax_binfmt::{Abi, Dispatch, Personality, TrapEnv, TrapOutcome};
 use ax_crate_interface::call_interface;
+use ax_dispatch::{Abi, Dispatch, SysAbi, TrapEnv, TrapOutcome};
 use ops::{ENOSYS, Host, SysResult};
 use syscalls::Sysno;
 
@@ -70,11 +70,6 @@ impl LinuxAbi {
     /// The ABI this personality implements.
     pub const fn abi() -> Abi {
         Abi::Linux
-    }
-
-    /// Whether `image` is an ELF this personality claims.
-    pub fn recognizes(image: &[u8]) -> bool {
-        ax_binfmt::detect(image) == Some(Abi::Linux)
     }
 
     /// Service one trapped syscall against `host`, writing the result into `uctx`.
@@ -126,13 +121,9 @@ impl LinuxAbi {
     }
 }
 
-impl Personality for LinuxAbi {
+impl SysAbi for LinuxAbi {
     fn abi(&self) -> Abi {
         Abi::Linux
-    }
-
-    fn recognizes(&self, image: &[u8]) -> bool {
-        Self::recognizes(image)
     }
 
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
@@ -146,12 +137,12 @@ impl Personality for LinuxAbi {
     // The ELF loader still lives in the hosting kernel, so no `loader` here.
 }
 
-fn linux() -> &'static dyn Personality {
+fn linux() -> &'static dyn SysAbi {
     static IT: LinuxAbi = LinuxAbi;
     &IT
 }
 
-ax_binfmt::register_sysabi!(linux);
+ax_dispatch::register_sysabi!(linux);
 
 /// Route one syscall to its handler, or `None` when the trapped number is not one
 /// this domain owns, so a hosting kernel can fall back to its own table during

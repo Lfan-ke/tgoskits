@@ -901,10 +901,10 @@ pub struct ProcessData {
     pub envp: RwLock<Arc<Vec<String>>>,
     /// Auxiliary vector entries exported via `/proc/[pid]/auxv`.
     pub auxv: RwLock<Vec<AuxEntry>>,
-    /// Which syscall ABI this process's image speaks, as the neutral tag
-    /// `ax_binfmt` reads. Set when the image is loaded and read on every trap,
-    /// so it is a plain word rather than anything the trap path must lock.
-    pub abi_tag: core::sync::atomic::AtomicU32,
+    /// Where in the dispatch registry this process's ABI sits, plus one so
+    /// zero means unresolved. Settled when the image is loaded, so servicing a
+    /// trap is an index into the registry rather than a search through it.
+    pub abi_slot: core::sync::atomic::AtomicU32,
     /// The root directory path, exported via `/proc/[pid]/root`.
     pub root_path: RwLock<String>,
     /// The current working directory path, exported via `/proc/[pid]/cwd`.
@@ -1129,8 +1129,10 @@ impl ProcessData {
             envp: RwLock::new(image.envp),
             auxv: RwLock::new(image.auxv),
             // An ELF is the format the kernel loads itself; anything else is
-            // retagged by the personality that claimed it.
-            abi_tag: core::sync::atomic::AtomicU32::new(ax_binfmt::Abi::Linux.as_tag()),
+            // re-pointed by the package that claimed it.
+            abi_slot: core::sync::atomic::AtomicU32::new(
+                ax_dispatch::slot_of(ax_dispatch::Abi::Linux).map_or(0, |slot| slot as u32 + 1),
+            ),
             root_path: RwLock::new(image.root_path),
             cwd_path: RwLock::new(image.cwd_path),
             aspace: IrqMutex::new(aspace),

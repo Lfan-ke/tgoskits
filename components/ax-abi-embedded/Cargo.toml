@@ -10,4 +10,5 @@ categories = ["no-std", "embedded"]
 license.workspace = true
 
 [dependencies]
+ax-dispatch = { workspace = true }
 ax-binfmt = { workspace = true }

@@ -10,10 +10,10 @@
 //! order. Which one the kernel calls decides what a handler for an index the
 //! base ABI also owns means:
 //!
-//! - [`ax_binfmt::dispatch_trap`] (personality first) - the handler only runs
+//! - [`ax_dispatch::dispatch_trap`] (personality first) - the handler only runs
 //!   for indices the base ABI passed through, so it *extends* the ABI as a peer
 //!   and cannot shadow it.
-//! - [`ax_binfmt::dispatch_trap_intercept`] (custom first) - the handler runs
+//! - [`ax_dispatch::dispatch_trap_intercept`] (custom first) - the handler runs
 //!   before the base ABI and *overrides* that syscall, redirecting it to the
 //!   user's implementation.
 //!
@@ -26,7 +26,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 
-use ax_binfmt::{CustomHandler, Dispatch, TrapEnv};
+use ax_dispatch::{CustomHandler, Dispatch, TrapEnv};
 
 /// A handler for one custom trap index. A bare function pointer keeps the
 /// registry `Sync` and closure-free; state a handler needs lives behind its own
@@ -85,7 +85,7 @@ impl CustomHandler for CustomSyscalls {
 
 #[cfg(test)]
 mod tests {
-    use ax_binfmt::{Abi, Personality, dispatch_trap, dispatch_trap_intercept};
+    use ax_dispatch::{Abi, SysAbi, dispatch_trap, dispatch_trap_intercept};
 
     use super::*;
 
@@ -146,12 +146,9 @@ mod tests {
     // A base ABI that owns syscall 0x1, writing a sentinel distinct from the
     // custom handler's, so the two dispatch orders are distinguishable.
     struct Base;
-    impl Personality for Base {
+    impl SysAbi for Base {
         fn abi(&self) -> Abi {
             Abi::Linux
-        }
-        fn recognizes(&self, _image: &[u8]) -> bool {
-            false
         }
         fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
             env.set_result(1);
@@ -166,7 +163,7 @@ mod tests {
         let handlers: [&dyn CustomHandler; 1] = [&reg];
         let base = Base;
 
-        // Personality-first: the base ABI keeps 0x1; the registry only extends.
+        // SysAbi-first: the base ABI keeps 0x1; the registry only extends.
         let mut extend = Trap::at(0x1);
         assert_eq!(
             dispatch_trap(&base, &handlers, &mut extend),
