@@ -14,6 +14,7 @@
 //! global mutable state.
 
 #![cfg_attr(not(test), no_std)]
+#![feature(used_with_arg)]
 
 pub mod macho;
 pub mod pe;
@@ -150,14 +151,133 @@ pub trait Personality: Sync {
     /// side-effect free: [`dispatch`] may call it on several handlers.
     fn recognizes(&self, image: &[u8]) -> bool;
 
-    /// Map `req.image` into `env` and return where to start. The analogue of
-    /// `linux_binfmt::load_binary`.
-    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded>;
-
     /// Service one trapped index (a syscall) for a task of this personality,
     /// reporting whether it was this personality's. `Passthrough` defers to the
     /// registered [`CustomHandler`]s.
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch;
+
+    /// Service a trapped index without touching the frame, reporting the
+    /// outcome instead. A host that still carries its own table uses this, so
+    /// its own epilogue runs for serviced and unclaimed calls alike. `None`
+    /// means the call is not this personality's, or that it only offers the
+    /// frame-writing form above.
+    fn route(&self, _env: &dyn TrapEnv) -> TrapOutcome {
+        None
+    }
+
+    /// How this personality loads its images, when it is the one that loads
+    /// them. `None` says the hosting OS still owns that, which is the honest
+    /// answer while a loader has not moved out of a kernel yet.
+    fn loader(&self) -> Option<&dyn Loader> {
+        None
+    }
+}
+
+/// Placing an executable image into a target address space - the analogue of
+/// `linux_binfmt::load_binary`, kept apart from [`Personality`] because loading
+/// and servicing traps are separate capabilities that move out of a kernel at
+/// different times.
+pub trait Loader: Sync {
+    /// Map `req.image` into `env` and return where to begin execution.
+    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded>;
+}
+
+/// One personality's entry in the registry.
+///
+/// The entries live in their own linker section, so a personality appears by
+/// being linked in and disappears by being dropped from the dependency list -
+/// nobody keeps a list. This is how drivers register in this workspace too.
+#[repr(C)]
+pub struct Registration {
+    get: fn() -> &'static dyn Personality,
+}
+
+impl Registration {
+    /// Wrap the accessor a registration hands out.
+    pub const fn new(get: fn() -> &'static dyn Personality) -> Self {
+        Self { get }
+    }
+
+    /// The personality this entry registers.
+    pub fn personality(&self) -> &'static dyn Personality {
+        (self.get)()
+    }
+}
+
+/// Register a personality with the platform.
+///
+/// Takes a path to a `fn() -> &'static dyn Personality`.
+#[macro_export]
+macro_rules! register_personality {
+    ($get:path) => {
+        const _: () = {
+            #[used(linker)]
+            #[unsafe(link_section = "abi_register")]
+            static REGISTRATION: $crate::Registration = $crate::Registration::new($get);
+        };
+    };
+}
+
+/// A personality that claims nothing, registered so the section always exists
+/// and its bounds are always defined, however few personalities are linked in.
+struct NoPersonality;
+
+impl Personality for NoPersonality {
+    fn abi(&self) -> Abi {
+        Abi::Embedded
+    }
+    fn recognizes(&self, _image: &[u8]) -> bool {
+        false
+    }
+    fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
+        Dispatch::Passthrough
+    }
+}
+
+fn no_personality() -> &'static dyn Personality {
+    static IT: NoPersonality = NoPersonality;
+    &IT
+}
+
+register_personality!(no_personality);
+
+/// Every personality this build linked in.
+pub fn registered() -> &'static [Registration] {
+    // Declared as opaque symbols: only their addresses matter, and a function
+    // item keeps the declaration free of a type the linker never sees.
+    unsafe extern "C" {
+        fn __start_abi_register();
+        fn __stop_abi_register();
+    }
+    let start = __start_abi_register as *const () as *const Registration;
+    let stop = __stop_abi_register as *const () as *const Registration;
+    // SAFETY: the two symbols bound one array of `Registration`, which the
+    // linker fills from the `abi_register` section of every linked crate.
+    unsafe {
+        let len = (stop as usize - start as usize) / size_of::<Registration>();
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
+/// Ask each registered personality to service a trapped index, stopping at the
+/// first that claims it.
+pub fn route_registered(env: &dyn TrapEnv) -> TrapOutcome {
+    registered()
+        .iter()
+        .find_map(|entry| entry.personality().route(env))
+}
+
+/// Route `image` to the first registered personality that claims it.
+///
+/// # Errors
+///
+/// [`AbiError::UnknownFormat`] when none does.
+pub fn dispatch_registered(image: &[u8]) -> AbiResult<&'static dyn Personality> {
+    registered()
+        .iter()
+        .map(Registration::personality)
+        .find(|p| p.recognizes(image))
+        .ok_or(AbiError::UnknownFormat)
 }
 
 /// A user-registered handler for a trapped index - the extension point for
@@ -352,9 +472,6 @@ mod tests {
         fn recognizes(&self, image: &[u8]) -> bool {
             detect(image) == Some(self.0)
         }
-        fn load(&self, _req: &LoadRequest<'_>, _env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-            Ok(Loaded { entry: 0, stack: 0 })
-        }
         fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
             // This mock owns no syscalls, so every index passes through - which is
             // exactly what lets the extension tests reach the custom handlers.
@@ -432,9 +549,6 @@ mod tests {
             }
             fn recognizes(&self, _image: &[u8]) -> bool {
                 false
-            }
-            fn load(&self, _req: &LoadRequest<'_>, _env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-                Ok(Loaded { entry: 0, stack: 0 })
             }
             fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
                 if env.nr() == 0x42 {

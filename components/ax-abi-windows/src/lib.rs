@@ -12,6 +12,7 @@
 //! lives in [`ax_binfmt::pe`]. NT syscall dispatch arrives in a later phase.
 
 #![cfg_attr(not(test), no_std)]
+#![feature(used_with_arg)]
 
 extern crate alloc;
 
@@ -22,7 +23,8 @@ pub mod teb_peb;
 use alloc::{vec, vec::Vec};
 
 use ax_binfmt::{
-    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Personality, Prot, TrapEnv,
+    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Loader, Personality, Prot,
+    TrapEnv,
     pe::{self, PeInfo, Reloc, Section},
 };
 
@@ -39,27 +41,15 @@ impl Personality for WindowsAbi {
         ax_binfmt::detect(image) == Some(Abi::Windows)
     }
 
-    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-        let pe = pe::parse(req.image).ok_or(AbiError::MalformedImage)?;
-        if !pe.pe64 {
-            // Only PE32+ is in scope; a 32-bit image is a distinct ABI.
-            return Err(AbiError::Unsupported);
-        }
-        // Honor the image's preferred base, so a well-formed image needs no
-        // relocation; relocation is exercised only when the base must change.
-        let base = pe.image_base;
-        map_image(&pe, req.image, base, env)?;
-        Ok(Loaded {
-            entry: base + pe.entry_rva as u64,
-            stack: 0,
-        })
-    }
-
     fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
         // NT syscall dispatch (see the `nt` module) is wired on-target in a later
         // phase; until then no index is serviced, so pass through to any custom
         // handler or the caller's default.
         Dispatch::Passthrough
+    }
+
+    fn loader(&self) -> Option<&dyn Loader> {
+        Some(self)
     }
 }
 
@@ -342,3 +332,28 @@ mod tests {
         );
     }
 }
+
+impl Loader for WindowsAbi {
+    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
+        let pe = pe::parse(req.image).ok_or(AbiError::MalformedImage)?;
+        if !pe.pe64 {
+            // Only PE32+ is in scope; a 32-bit image is a distinct ABI.
+            return Err(AbiError::Unsupported);
+        }
+        // Honor the image's preferred base, so a well-formed image needs no
+        // relocation; relocation is exercised only when the base must change.
+        let base = pe.image_base;
+        map_image(&pe, req.image, base, env)?;
+        Ok(Loaded {
+            entry: base + pe.entry_rva as u64,
+            stack: 0,
+        })
+    }
+}
+
+fn windows() -> &'static dyn Personality {
+    static IT: WindowsAbi = WindowsAbi;
+    &IT
+}
+
+ax_binfmt::register_personality!(windows);

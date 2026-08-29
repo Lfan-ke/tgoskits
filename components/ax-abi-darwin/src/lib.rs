@@ -10,13 +10,15 @@
 //! dispatch.
 
 #![cfg_attr(not(test), no_std)]
+#![feature(used_with_arg)]
 
 extern crate alloc;
 
 use alloc::vec;
 
 use ax_binfmt::{
-    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Personality, Prot, TrapEnv,
+    Abi, AbiError, AbiResult, Dispatch, LoadEnv, LoadRequest, Loaded, Loader, Personality, Prot,
+    TrapEnv,
     macho::{self, Segment},
 };
 
@@ -33,31 +35,14 @@ impl Personality for DarwinAbi {
         ax_binfmt::detect(image) == Some(Abi::Darwin)
     }
 
-    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-        let macho = macho::parse(req.image).ok_or(AbiError::MalformedImage)?;
-        // No LC_MAIN means a legacy LC_UNIXTHREAD entry, which is out of scope.
-        let entry = macho.entry(req.image).ok_or(AbiError::Unsupported)?;
-
-        for seg in macho.segments(req.image) {
-            // __PAGEZERO and other no-access reservations are address-space
-            // guards, not backed by pages; skip them rather than map gigabytes.
-            if seg.initprot == 0 || seg.vmsize == 0 {
-                continue;
-            }
-            let mut page = vec![0u8; seg.vmsize as usize];
-            if let Some(data) = seg.file_data(req.image) {
-                let n = data.len().min(page.len());
-                page[..n].copy_from_slice(&data[..n]);
-            }
-            env.map_region(seg.vmaddr, seg.vmsize, segment_prot(&seg), Some(&page))?;
-        }
-        Ok(Loaded { entry, stack: 0 })
-    }
-
     fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
         // Darwin BSD/Mach syscall dispatch is a later phase; until then no index
         // is serviced, so pass through to a custom handler or the caller default.
         Dispatch::Passthrough
+    }
+
+    fn loader(&self) -> Option<&dyn Loader> {
+        Some(self)
     }
 }
 
@@ -240,3 +225,33 @@ mod tests {
         );
     }
 }
+
+impl Loader for DarwinAbi {
+    fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
+        let macho = macho::parse(req.image).ok_or(AbiError::MalformedImage)?;
+        // No LC_MAIN means a legacy LC_UNIXTHREAD entry, which is out of scope.
+        let entry = macho.entry(req.image).ok_or(AbiError::Unsupported)?;
+
+        for seg in macho.segments(req.image) {
+            // __PAGEZERO and other no-access reservations are address-space
+            // guards, not backed by pages; skip them rather than map gigabytes.
+            if seg.initprot == 0 || seg.vmsize == 0 {
+                continue;
+            }
+            let mut page = vec![0u8; seg.vmsize as usize];
+            if let Some(data) = seg.file_data(req.image) {
+                let n = data.len().min(page.len());
+                page[..n].copy_from_slice(&data[..n]);
+            }
+            env.map_region(seg.vmaddr, seg.vmsize, segment_prot(&seg), Some(&page))?;
+        }
+        Ok(Loaded { entry, stack: 0 })
+    }
+}
+
+fn darwin() -> &'static dyn Personality {
+    static IT: DarwinAbi = DarwinAbi;
+    &IT
+}
+
+ax_binfmt::register_personality!(darwin);

@@ -15,6 +15,7 @@
 //! binds the registered host to a parameter-less entry at integration time.
 
 #![cfg_attr(not(test), no_std)]
+#![feature(used_with_arg)]
 
 #[cfg(not(any(
     feature = "fs",
@@ -28,7 +29,7 @@
 compile_error!("ax-abi-linux needs at least one syscall family enabled");
 
 pub use ax_abi_port as ops;
-use ax_binfmt::{Abi, Dispatch, TrapEnv};
+use ax_binfmt::{Abi, Dispatch, Personality, TrapEnv, TrapOutcome};
 use ax_crate_interface::call_interface;
 use ops::{ENOSYS, Host, SysResult};
 use syscalls::Sysno;
@@ -113,6 +114,33 @@ impl LinuxAbi {
         route(call_interface!(ax_abi_port::CurrentHost::current), uctx)
     }
 }
+
+impl Personality for LinuxAbi {
+    fn abi(&self) -> Abi {
+        Abi::Linux
+    }
+
+    fn recognizes(&self, image: &[u8]) -> bool {
+        Self::recognizes(image)
+    }
+
+    fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
+        Self::try_handle_trapped_syscall(env)
+    }
+
+    fn route(&self, env: &dyn TrapEnv) -> TrapOutcome {
+        Self::route_trapped_syscall(env)
+    }
+
+    // The ELF loader still lives in the hosting kernel, so no `loader` here.
+}
+
+fn linux() -> &'static dyn Personality {
+    static IT: LinuxAbi = LinuxAbi;
+    &IT
+}
+
+ax_binfmt::register_personality!(linux);
 
 /// Route one syscall to its handler, or `None` when the trapped number is not one
 /// this domain owns, so a hosting kernel can fall back to its own table during

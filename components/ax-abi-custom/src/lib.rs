@@ -85,10 +85,7 @@ impl CustomHandler for CustomSyscalls {
 
 #[cfg(test)]
 mod tests {
-    use ax_binfmt::{
-        Abi, AbiResult, LoadEnv, LoadRequest, Loaded, Personality, dispatch_trap,
-        dispatch_trap_intercept,
-    };
+    use ax_binfmt::{Abi, Personality, dispatch_trap, dispatch_trap_intercept};
 
     use super::*;
 
@@ -155,9 +152,6 @@ mod tests {
         }
         fn recognizes(&self, _image: &[u8]) -> bool {
             false
-        }
-        fn load(&self, _req: &LoadRequest<'_>, _env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-            Ok(Loaded { entry: 0, stack: 0 })
         }
         fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
             env.set_result(1);

@@ -13,10 +13,6 @@
 
 #![no_std]
 
-extern crate alloc;
-
-use alloc::vec::Vec;
-
 #[cfg(feature = "custom")]
 pub use ax_abi_custom::{self, CustomSyscalls};
 #[cfg(feature = "mac")]
@@ -37,56 +33,23 @@ pub use ax_binfmt::{
     TrapOutcome, detect, dispatch_trap, dispatch_trap_intercept,
 };
 
-/// Answers the hosting kernel's [`TrapDispatch`] with whichever personality is
-/// compiled in, so the kernel never names one. Swapping the ABI a system speaks
-/// is a feature change here.
-#[cfg(feature = "linux")]
+/// Answers the hosting kernel's [`TrapDispatch`] from the registry, so neither
+/// the kernel nor this crate names a personality. Swapping the ABI a system
+/// speaks is a dependency change: a linked personality registers itself.
 struct Dispatcher;
 
-#[cfg(feature = "linux")]
 #[ax_crate_interface::impl_interface]
 impl TrapDispatch for Dispatcher {
     fn route(env: &mut dyn TrapEnv) -> TrapOutcome {
-        ax_abi_linux::LinuxAbi::route_trapped_syscall(env)
+        ax_binfmt::route_registered(env)
     }
 }
 
-// Each compiled-in personality is a zero-sized handler with a `'static` address,
-// so the assembled set holds `'static` references without allocation of the
-// handlers themselves.
-#[cfg(feature = "win")]
-static WINDOWS: WindowsAbi = WindowsAbi;
-#[cfg(feature = "mac")]
-static DARWIN: DarwinAbi = DarwinAbi;
-
-/// The personalities compiled into this build, in dispatch-priority order.
-///
-/// Registration order is the match priority, mirroring how the Linux binfmt list
-/// is walked. Only personalities whose feature is enabled appear.
-pub fn personalities() -> Vec<&'static dyn Personality> {
-    // Each slot is `Some` only when its feature is enabled; `flatten` drops the
-    // absent ones, so this stays clean whether zero, one or many are compiled in.
-    let win: Option<&'static dyn Personality> = {
-        #[cfg(feature = "win")]
-        {
-            Some(&WINDOWS)
-        }
-        #[cfg(not(feature = "win"))]
-        {
-            None
-        }
-    };
-    let mac: Option<&'static dyn Personality> = {
-        #[cfg(feature = "mac")]
-        {
-            Some(&DARWIN)
-        }
-        #[cfg(not(feature = "mac"))]
-        {
-            None
-        }
-    };
-    [win, mac].into_iter().flatten().collect()
+/// The personalities this build linked in, in registration order.
+pub fn personalities() -> impl Iterator<Item = &'static dyn Personality> {
+    ax_binfmt::registered()
+        .iter()
+        .map(ax_binfmt::Registration::personality)
 }
 
 /// Route `image` to the first compiled-in personality that recognizes it.
@@ -97,27 +60,52 @@ pub fn personalities() -> Vec<&'static dyn Personality> {
 /// image (the caller reports `ENOEXEC`).
 #[cfg(feature = "auto-dispatch")]
 pub fn dispatch(image: &[u8]) -> AbiResult<&'static dyn Personality> {
-    personalities()
-        .into_iter()
-        .find(|p| p.recognizes(image))
-        .ok_or(AbiError::UnknownFormat)
+    ax_binfmt::dispatch_registered(image)
 }
 
 #[cfg(test)]
 mod tests {
+    use ax_abi_port::{Platform, SysResult};
+
     use super::*;
+
+    // A host with nothing but the platform port, so the registered personalities
+    // have something to resolve while these tests only exercise registration.
+    struct BareHost;
+    impl Platform for BareHost {
+        fn read_user(&self, _uaddr: usize, _out: &mut [u8]) -> SysResult {
+            Ok(0)
+        }
+        fn write_user(&self, _uaddr: usize, _data: &[u8]) -> SysResult {
+            Ok(0)
+        }
+    }
+    impl Host for BareHost {
+        fn platform(&self) -> &dyn Platform {
+            self
+        }
+    }
+
+    struct Binding;
+    #[ax_crate_interface::impl_interface]
+    impl CurrentHost for Binding {
+        fn current() -> &'static dyn Host {
+            static HOST: BareHost = BareHost;
+            &HOST
+        }
+    }
 
     #[cfg(feature = "win")]
     #[test]
-    fn windows_personality_is_compiled_in() {
-        assert!(personalities().iter().any(|p| p.abi() == Abi::Windows));
+    fn a_linked_personality_registers_itself() {
+        assert!(personalities().any(|p| p.abi() == Abi::Windows));
     }
 
     #[cfg(all(feature = "win", feature = "auto-dispatch"))]
     #[test]
     fn dispatches_a_pe_to_windows() {
         // Minimal "MZ..PE\0\0" stub that detect() routes to Windows.
-        let mut pe = alloc::vec![0u8; 0x88];
+        let mut pe = [0u8; 0x88];
         pe[0..2].copy_from_slice(b"MZ");
         pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
         pe[0x80..0x84].copy_from_slice(b"PE\0\0");
@@ -128,7 +116,7 @@ mod tests {
 
     #[cfg(not(feature = "win"))]
     #[test]
-    fn empty_build_has_no_personalities() {
-        assert!(personalities().is_empty());
+    fn an_unlinked_personality_is_absent() {
+        assert!(!personalities().any(|p| p.abi() == Abi::Windows));
     }
 }
