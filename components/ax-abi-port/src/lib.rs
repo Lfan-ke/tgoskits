@@ -40,6 +40,10 @@ pub const EFAULT: i32 = 14;
 pub const EINVAL: i32 = 22;
 /// `EBADF` - not an open descriptor.
 pub const EBADF: i32 = 9;
+/// `ESRCH` - no such process.
+pub const ESRCH: i32 = 3;
+/// `ESPIPE` - the descriptor does not admit positional io.
+pub const ESPIPE: i32 = 29;
 
 /// The minimal arch/memory platform, à la gVisor's `Platform`: move bytes across
 /// the user/kernel boundary. Everything a personality needs from the CPU/MMU
@@ -51,8 +55,13 @@ pub trait Platform: Sync {
 
 #[cfg(feature = "task")]
 pub trait Tasks: Sync {
-    fn getpid(&self) -> u32;
-    fn getppid(&self) -> u32;
+    /// The caller's process id. A host whose namespace cannot see the caller
+    /// says so, so the port reports a result rather than a bare number.
+    fn getpid(&self) -> SysResult;
+    /// The parent's process id, or the host's error when there is no parent
+    /// it can name.
+    fn getppid(&self) -> SysResult;
+    /// The caller's thread id, which always exists.
     fn gettid(&self) -> u32;
     fn set_tid_address(&self, tidptr: usize) -> SysResult;
     fn sched_yield(&self) -> SysResult;
@@ -62,6 +71,16 @@ pub trait Tasks: Sync {
     fn exit(&self, code: i32) -> SysResult;
     /// Terminate every thread in the process.
     fn exit_group(&self, code: i32) -> SysResult;
+}
+
+/// One run of user memory. An ABI decodes its own vector layout and names the
+/// runs it found this way, so the host never learns what an `iovec` looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// Where the run starts in user memory.
+    pub uaddr: usize,
+    /// How many bytes it covers.
+    pub len: usize,
 }
 
 /// Where a seek measures from.
@@ -96,6 +115,10 @@ pub trait Files: Sync {
     fn seek(&self, fd: i32, offset: isize, from: SeekFrom) -> SysResult;
     /// Report whether `fd` is open, without touching it.
     fn validate(&self, fd: i32) -> SysResult;
+    /// Read from `fd` into `segs` in order, in one underlying transfer.
+    fn readv(&self, fd: i32, segs: &[Segment]) -> SysResult;
+    /// Write `segs` in order to `fd`, in one underlying transfer.
+    fn writev(&self, fd: i32, segs: &[Segment]) -> SysResult;
     /// Whether `fd` can be read or written at an absolute offset. Which
     /// descriptors can is the host's property, and so is the error it reports
     /// for the ones that cannot; an ABI asks before it validates an offset,

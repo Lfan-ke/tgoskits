@@ -17,6 +17,9 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(used_with_arg)]
 
+#[cfg(feature = "fs")]
+extern crate alloc;
+
 #[cfg(not(any(
     feature = "fs",
     feature = "mm",
@@ -40,6 +43,9 @@ use syscalls::Sysno;
 const PAGE_SIZE: usize = 4096;
 /// One `new_utsname` field width (arch-independent), and the packed struct length.
 #[cfg(feature = "system")]
+/// `UIO_MAXIOV`: the longest vector Linux accepts.
+const IOV_MAX: usize = 1024;
+
 const UTS_FIELD: usize = 65;
 #[cfg(feature = "system")]
 const UTS_LEN: usize = 6 * UTS_FIELD;
@@ -166,6 +172,22 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         #[cfg(feature = "fs")]
         Sysno::lseek => sys_lseek(host.files()?, arg(0) as i32, arg(1) as isize, arg(2) as i32),
         #[cfg(feature = "fs")]
+        Sysno::readv => sys_readv(
+            host.platform(),
+            host.files()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2),
+        ),
+        #[cfg(feature = "fs")]
+        Sysno::writev => sys_writev(
+            host.platform(),
+            host.files()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2),
+        ),
+        #[cfg(feature = "fs")]
         Sysno::pread64 => sys_pread64(host.files()?, arg(0) as i32, arg(1), arg(2), arg(3) as i64),
         #[cfg(feature = "fs")]
         Sysno::pwrite64 => {
@@ -180,9 +202,9 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
 
         // Process and thread control.
         #[cfg(feature = "task")]
-        Sysno::getpid => Ok(host.tasks()?.getpid() as isize),
+        Sysno::getpid => host.tasks()?.getpid(),
         #[cfg(feature = "task")]
-        Sysno::getppid => Ok(host.tasks()?.getppid() as isize),
+        Sysno::getppid => host.tasks()?.getppid(),
         #[cfg(feature = "task")]
         Sysno::gettid => Ok(host.tasks()?.gettid() as isize),
         #[cfg(feature = "task")]
@@ -280,6 +302,60 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
 /// handler, and for the unit tests.
 fn dispatch(host: &dyn Host, uctx: &dyn TrapEnv) -> SysResult {
     route(host, uctx).unwrap_or(Err(ENOSYS))
+}
+
+/// The iovec array Linux passes to `readv`/`writev`: pairs of a pointer and a
+/// signed length, in the machine's word size. Decoding it is the ABI's job;
+/// the transfer over the runs it names is the host's.
+#[cfg(feature = "fs")]
+fn segments_from_iov(
+    platform: &dyn ops::Platform,
+    iov: usize,
+    iovcnt: usize,
+) -> Result<alloc::vec::Vec<ops::Segment>, i32> {
+    const WORD: usize = size_of::<usize>();
+    if iovcnt > IOV_MAX {
+        return Err(ops::EINVAL);
+    }
+    let mut segs = alloc::vec::Vec::with_capacity(iovcnt);
+    for i in 0..iovcnt {
+        let mut entry = [0u8; 2 * WORD];
+        platform.read_user(iov + i * 2 * WORD, &mut entry)?;
+        let uaddr = usize::from_le_bytes(entry[..WORD].try_into().unwrap());
+        let len = isize::from_le_bytes(entry[WORD..].try_into().unwrap());
+        if len < 0 {
+            return Err(ops::EINVAL);
+        }
+        segs.push(ops::Segment {
+            uaddr,
+            len: len as usize,
+        });
+    }
+    Ok(segs)
+}
+
+/// `readv(fd, iov, iovcnt)`: scatter one read across the runs the vector names.
+#[cfg(feature = "fs")]
+fn sys_readv(
+    platform: &dyn ops::Platform,
+    files: &dyn ops::Files,
+    fd: i32,
+    iov: usize,
+    iovcnt: usize,
+) -> SysResult {
+    files.readv(fd, &segments_from_iov(platform, iov, iovcnt)?)
+}
+
+/// `writev(fd, iov, iovcnt)`: gather one write from the runs the vector names.
+#[cfg(feature = "fs")]
+fn sys_writev(
+    platform: &dyn ops::Platform,
+    files: &dyn ops::Files,
+    fd: i32,
+    iov: usize,
+    iovcnt: usize,
+) -> SysResult {
+    files.writev(fd, &segments_from_iov(platform, iov, iovcnt)?)
 }
 
 /// `pread64(fd, ubuf, len, offset)`: positioned read of the user range. A
@@ -464,7 +540,7 @@ fn sys_lseek(files: &dyn ops::Files, fd: i32, offset: isize, whence: i32) -> Sys
 
 /// `dup2(oldfd, newfd)`: duplicating an fd onto itself is a no-op that still
 /// checks the fd, which is where it parts from `dup3`.
-#[cfg(feature = "fs")]
+#[cfg(all(feature = "fs", target_arch = "x86_64"))]
 fn sys_dup2(files: &dyn ops::Files, oldfd: i32, newfd: i32) -> SysResult {
     if oldfd == newfd {
         files.validate(oldfd)?;
@@ -698,7 +774,10 @@ mod tests {
     use core::cell::RefCell;
 
     use super::{
-        ops::{Clock, Creds, CurrentHost, EFAULT, Files, Mem, Platform, Signals, System, Tasks},
+        ops::{
+            Clock, Creds, CurrentHost, EFAULT, EINVAL, ESPIPE, ESRCH, Files, Mem, Platform,
+            Signals, System, Tasks,
+        },
         *,
     };
 
@@ -741,11 +820,11 @@ mod tests {
         }
     }
     impl Tasks for FixedHost {
-        fn getpid(&self) -> u32 {
-            1
+        fn getpid(&self) -> SysResult {
+            Ok(1)
         }
-        fn getppid(&self) -> u32 {
-            0
+        fn getppid(&self) -> SysResult {
+            Ok(0)
         }
         fn gettid(&self) -> u32 {
             1
@@ -783,6 +862,12 @@ mod tests {
             Ok(0)
         }
         fn seekable(&self, _fd: i32) -> SysResult {
+            Ok(0)
+        }
+        fn readv(&self, _fd: i32, _segs: &[ops::Segment]) -> SysResult {
+            Ok(0)
+        }
+        fn writev(&self, _fd: i32, _segs: &[ops::Segment]) -> SysResult {
             Ok(0)
         }
         fn pread(&self, _fd: i32, _u: usize, _len: usize, _o: u64) -> SysResult {
@@ -975,8 +1060,39 @@ mod tests {
         fn validate(&self, fd: i32) -> SysResult {
             if fd < 0 { Err(ops::EBADF) } else { Ok(0) }
         }
+        fn readv(&self, _fd: i32, segs: &[ops::Segment]) -> SysResult {
+            // Scatter what is queued across the runs, in order.
+            let src = self.to_read.borrow().clone();
+            let mut done = 0usize;
+            for seg in segs {
+                let n = seg.len.min(src.len() - done);
+                if n == 0 {
+                    break;
+                }
+                let mut mem = self.umem.borrow_mut();
+                mem[seg.uaddr..seg.uaddr + n].copy_from_slice(&src[done..done + n]);
+                done += n;
+            }
+            Ok(done as isize)
+        }
+        fn writev(&self, _fd: i32, segs: &[ops::Segment]) -> SysResult {
+            // Gather the runs, in order, into one write.
+            let mem = self.umem.borrow();
+            let mut out = self.written.borrow_mut();
+            let mut done = 0usize;
+            for seg in segs {
+                out.extend_from_slice(&mem[seg.uaddr..seg.uaddr + seg.len]);
+                done += seg.len;
+            }
+            Ok(done as isize)
+        }
         fn seekable(&self, fd: i32) -> SysResult {
-            if fd < 0 { Err(ops::EBADF) } else { Ok(0) }
+            // fd 9 stands in for a pipe: a real descriptor that cannot seek.
+            match fd {
+                _ if fd < 0 => Err(ops::EBADF),
+                9 => Err(ESPIPE),
+                _ => Ok(0),
+            }
         }
         fn pread(&self, _fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
             let bytes: Vec<u8> = {
@@ -1012,11 +1128,11 @@ mod tests {
         }
     }
     impl Tasks for Mock {
-        fn getpid(&self) -> u32 {
-            42
+        fn getpid(&self) -> SysResult {
+            Ok(42)
         }
-        fn getppid(&self) -> u32 {
-            1
+        fn getppid(&self) -> SysResult {
+            Ok(1)
         }
         fn gettid(&self) -> u32 {
             7
@@ -1193,6 +1309,134 @@ mod tests {
         let r = dispatch(&host, &Trap::new(Sysno::pwrite64, [3, 0, 2, 3, 0, 0]));
         assert_eq!(r, Ok(2));
         assert_eq!(&*host.file.borrow(), &[0, 0, 0, b'X', b'Y']);
+    }
+
+    // An iovec entry as the machine lays it out: pointer then signed length.
+    fn iov_entry(mem: &mut [u8], at: usize, base: usize, len: isize) {
+        const W: usize = size_of::<usize>();
+        mem[at..at + W].copy_from_slice(&base.to_le_bytes());
+        mem[at + W..at + 2 * W].copy_from_slice(&len.to_le_bytes());
+    }
+
+    #[test]
+    fn readv_scatters_across_the_runs_the_vector_names() {
+        const W: usize = size_of::<usize>();
+        let host = Mock::default();
+        *host.to_read.borrow_mut() = vec![1, 2, 3, 4, 5];
+        *host.umem.borrow_mut() = vec![0u8; 64];
+        // Two runs at 0 (2 bytes) and 8 (3 bytes); the vector sits at 32.
+        {
+            let mut mem = host.umem.borrow_mut();
+            iov_entry(&mut mem, 32, 0, 2);
+            iov_entry(&mut mem, 32 + 2 * W, 8, 3);
+        }
+        let r = dispatch(&host, &Trap::new(Sysno::readv, [3, 32, 2, 0, 0, 0]));
+        assert_eq!(r, Ok(5));
+        let mem = host.umem.borrow();
+        assert_eq!(&mem[0..2], &[1, 2]);
+        assert_eq!(&mem[8..11], &[3, 4, 5]);
+    }
+
+    #[test]
+    fn writev_gathers_the_runs_in_order() {
+        const W: usize = size_of::<usize>();
+        let host = Mock::default();
+        *host.umem.borrow_mut() = vec![0u8; 64];
+        {
+            let mut mem = host.umem.borrow_mut();
+            mem[0..2].copy_from_slice(b"ab");
+            mem[8..11].copy_from_slice(b"cde");
+            iov_entry(&mut mem, 32, 0, 2);
+            iov_entry(&mut mem, 32 + 2 * W, 8, 3);
+        }
+        let r = dispatch(&host, &Trap::new(Sysno::writev, [3, 32, 2, 0, 0, 0]));
+        assert_eq!(r, Ok(5));
+        assert_eq!(&*host.written.borrow(), b"abcde");
+    }
+
+    #[test]
+    fn a_vector_the_abi_refuses_never_reaches_the_host() {
+        const W: usize = size_of::<usize>();
+        let host = Mock::default();
+        *host.umem.borrow_mut() = vec![0u8; 64];
+        // A negative run length is the ABI's own rule.
+        iov_entry(&mut host.umem.borrow_mut(), 32, 0, -1);
+        assert_eq!(
+            dispatch(&host, &Trap::new(Sysno::writev, [3, 32, 1, 0, 0, 0])),
+            Err(EINVAL)
+        );
+        // So is the cap on how long a vector may be.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(Sysno::readv, [3, 32, IOV_MAX + 1, 0, 0, 0])
+            ),
+            Err(EINVAL)
+        );
+        assert!(host.written.borrow().is_empty());
+        let _ = W;
+    }
+
+    #[test]
+    fn pread_asks_whether_the_fd_seeks_before_it_reads_the_offset() {
+        // Linux checks FMODE_PREAD before rw_verify_area looks at the offset,
+        // so a pipe reports ESPIPE even when the offset is also invalid.
+        let host = Mock::default();
+        let r = dispatch(
+            &host,
+            &Trap::new(Sysno::pread64, [9, 0, 1, -1i64 as usize, 0, 0]),
+        );
+        assert_eq!(r, Err(ESPIPE));
+    }
+
+    #[test]
+    fn getpid_reports_the_hosts_error() {
+        // A host whose namespace cannot name the caller says ESRCH; the port
+        // carries that through rather than flattening it to a pid of zero.
+        struct Nameless;
+        impl Platform for Nameless {
+            fn read_user(&self, _u: usize, _o: &mut [u8]) -> SysResult {
+                Ok(0)
+            }
+            fn write_user(&self, _u: usize, _d: &[u8]) -> SysResult {
+                Ok(0)
+            }
+        }
+        impl Tasks for Nameless {
+            fn getpid(&self) -> SysResult {
+                Err(ESRCH)
+            }
+            fn getppid(&self) -> SysResult {
+                Err(ESRCH)
+            }
+            fn gettid(&self) -> u32 {
+                1
+            }
+            fn set_tid_address(&self, _p: usize) -> SysResult {
+                Ok(1)
+            }
+            fn sched_yield(&self) -> SysResult {
+                Ok(0)
+            }
+            fn exit(&self, _c: i32) -> SysResult {
+                Ok(0)
+            }
+            fn exit_group(&self, _c: i32) -> SysResult {
+                Ok(0)
+            }
+        }
+        impl ops::Host for Nameless {
+            fn platform(&self) -> &dyn Platform {
+                self
+            }
+            fn tasks(&self) -> Option<&dyn Tasks> {
+                Some(self)
+            }
+        }
+        assert_eq!(
+            dispatch(&Nameless, &Trap::new(Sysno::getpid, [0; 6])),
+            Err(ESRCH)
+        );
     }
 
     #[test]

@@ -144,6 +144,114 @@ impl Write for IoVectorBufIo {
     }
 }
 
+/// A vectored transfer named by runs of user memory the kernel already holds,
+/// rather than by an iovec array still in user memory. An ABI that decodes its
+/// own vector layout hands the runs over this way.
+pub struct SegmentBuf {
+    segs: alloc::vec::Vec<(usize, usize)>,
+    len: usize,
+}
+
+impl SegmentBuf {
+    pub fn new(segs: &[(usize, usize)]) -> StarryResult<Self> {
+        let mut len = 0usize;
+        for &(base, seg) in segs {
+            if seg > 0 {
+                check_access(base, seg).map_err(|_| StarryError::BadAddress)?;
+            }
+            len = len
+                .checked_add(seg)
+                .filter(|len| *len <= isize::MAX as usize)
+                .ok_or(StarryError::InvalidInput)?;
+        }
+        Ok(Self {
+            segs: segs.to_vec(),
+            len,
+        })
+    }
+
+    pub fn into_io(self) -> SegmentBufIo {
+        SegmentBufIo {
+            inner: self,
+            start: 0,
+            offset: 0,
+        }
+    }
+}
+
+pub struct SegmentBufIo {
+    inner: SegmentBuf,
+    start: usize,
+    offset: usize,
+}
+
+impl SegmentBufIo {
+    fn skip_empty(&mut self) {
+        while self.start < self.inner.segs.len() {
+            if self.inner.segs[self.start].1 > self.offset {
+                break;
+            }
+            self.offset = 0;
+            self.start += 1;
+        }
+    }
+
+    fn step(&mut self, want: usize) -> Option<(usize, usize)> {
+        self.skip_empty();
+        let &(base, seg) = self.inner.segs.get(self.start)?;
+        let len = (seg - self.offset).min(want);
+        (len != 0).then(|| (base.wrapping_add(self.offset), len))
+    }
+
+    fn advance(&mut self, len: usize) {
+        self.offset += len;
+        self.inner.len -= len;
+    }
+}
+
+impl Read for SegmentBufIo {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        let mut count = 0;
+        while let Some((from, len)) = self.step(buf.len() - count) {
+            vm_read_slice(from as *const u8, unsafe {
+                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut buf[count..count + len])
+            })
+            .map_err(vm_error_to_io_error)?;
+            self.advance(len);
+            count += len;
+        }
+        Ok(count)
+    }
+}
+
+impl Write for SegmentBufIo {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        let mut count = 0;
+        while let Some((to, len)) = self.step(buf.len() - count) {
+            vm_write_slice(to as *mut u8, &buf[count..count + len]).map_err(vm_error_to_io_error)?;
+            self.advance(len);
+            count += len;
+        }
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> IoResult {
+        Ok(())
+    }
+}
+
+impl IoBuf for SegmentBufIo {
+    fn remaining(&self) -> usize {
+        self.inner.len
+    }
+}
+
+impl IoBufMut for SegmentBufIo {
+    fn remaining_mut(&self) -> usize {
+        self.inner.len
+    }
+}
+
 fn vm_error_to_io_error(error: VmError) -> IoError {
     match error {
         VmError::BadAddress | VmError::AccessDenied => IoError::BadAddress,
