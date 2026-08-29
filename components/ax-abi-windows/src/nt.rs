@@ -357,6 +357,12 @@ mod tests {
         fn seekable(&self, _fd: i32) -> ax_abi_port::SysResult {
             Ok(0)
         }
+        fn readv(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> ax_abi_port::SysResult {
+            Ok(0)
+        }
+        fn writev(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> ax_abi_port::SysResult {
+            Ok(0)
+        }
         fn pread(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> ax_abi_port::SysResult {
             Ok(len as isize)
         }

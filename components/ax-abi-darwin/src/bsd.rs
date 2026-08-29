@@ -186,8 +186,8 @@ fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
                 host.files()?.pwrite(fd, a[1], a[2], offset as u64)
             }
         }
-        nr::GETPID => Ok(host.tasks()?.getpid() as isize),
-        nr::GETPPID => Ok(host.tasks()?.getppid() as isize),
+        nr::GETPID => host.tasks()?.getpid(),
+        nr::GETPPID => host.tasks()?.getppid(),
         nr::GETUID => Ok(host.creds()?.uids().0 as isize),
         nr::GETEUID => Ok(host.creds()?.uids().1 as isize),
         nr::GETGID => Ok(host.creds()?.gids().0 as isize),
@@ -304,6 +304,12 @@ mod tests {
         fn seekable(&self, _fd: i32) -> SysResult {
             Ok(0)
         }
+        fn readv(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> SysResult {
+            Ok(0)
+        }
+        fn writev(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> SysResult {
+            Ok(0)
+        }
         fn pread(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> SysResult {
             Ok(len as isize)
         }
@@ -345,11 +351,11 @@ mod tests {
         }
     }
     impl Tasks for MockHost {
-        fn getpid(&self) -> u32 {
-            77
+        fn getpid(&self) -> SysResult {
+            Ok(77)
         }
-        fn getppid(&self) -> u32 {
-            1
+        fn getppid(&self) -> SysResult {
+            Ok(1)
         }
         fn gettid(&self) -> u32 {
             77

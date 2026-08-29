@@ -1050,6 +1050,15 @@ pub fn sys_madvise(addr: usize, length: usize, advice: i32) -> StarryResult<isiz
         return Ok(0);
     }
 
+    advise_range(addr, length, advice)
+}
+
+/// Apply `advice` to a validated range.
+pub(crate) fn advise_range(
+    addr: usize,
+    length: usize,
+    advice: i32,
+) -> StarryResult<isize> {
     let curr = current();
     let aspace_arc = curr.as_thread().proc_data.aspace();
     let mut aspace = aspace_arc.lock();

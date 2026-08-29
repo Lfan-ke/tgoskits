@@ -26,7 +26,7 @@ use crate::{
         memfd::{F_SEAL_ANY_WRITE, F_SEAL_GROW, Memfd},
     },
     ipc::mqueue::MqDescriptor,
-    mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytesMut, vm_load_path_string},
+    mm::{IoVec, IoVectorBuf, SegmentBuf, UserConstPtr, VmBytesMut, vm_load_path_string},
     task::AsThread,
 };
 
@@ -131,9 +131,33 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> StarryResult<isize> {
 
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> StarryResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
+    read_segments(fd, &segments_from_iov(iov, iovcnt)?)
+}
+
+/// Decode an iovec array into the runs it names. Linux snapshots the array
+/// before the transfer rather than re-reading it as it goes.
+pub(crate) fn segments_from_iov(
+    iov: *const IoVec,
+    iovcnt: usize,
+) -> StarryResult<Vec<(usize, usize)>> {
+    if iovcnt > 1024 {
+        return Err(StarryError::InvalidInput);
+    }
+    (0..iovcnt)
+        .map(|i| {
+            let entry = iov.wrapping_add(i).vm_read()?;
+            if entry.iov_len < 0 {
+                return Err(StarryError::InvalidInput);
+            }
+            Ok((entry.iov_base as usize, entry.iov_len as usize))
+        })
+        .collect()
+}
+
+/// One vectored read over runs the caller already decoded.
+pub(crate) fn read_segments(fd: c_int, segs: &[(usize, usize)]) -> StarryResult<isize> {
     let f = get_file_like(fd)?;
-    f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())
-        .map(|n| n as _)
+    f.read(&mut SegmentBuf::new(segs)?.into_io()).map(|n| n as _)
 }
 
 /// Write data to the file indicated by `fd`.
@@ -162,15 +186,32 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> StarryResult<isize> {
 
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> StarryResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
+    write_segments(fd, &segments_from_iov(iov, iovcnt)?)
+}
+
+/// One vectored write over runs the caller already decoded.
+pub(crate) fn write_segments(fd: c_int, segs: &[(usize, usize)]) -> StarryResult<isize> {
     let file_like = get_file_like(fd)?;
     // Check length invariants (e.g. eventfd count) before importing segment
     // data, so a count error (EINVAL) takes precedence over a bad segment
     // pointer (EFAULT), matching Linux vfs_writev / eventfd_write ordering.
-    file_like.validate_write_len(iov_total_len(iov, iovcnt)?)?;
-    let total = validate_user_iov_buf_regions(iov, iovcnt)?;
+    file_like.validate_write_len(segments_total_len(segs)?)?;
+    let mut total = 0usize;
+    for &(base, len) in segs {
+        UserConstPtr::<u8>::from(base as *const u8).get_as_slice(len)?;
+        total = total.checked_add(len).ok_or(StarryError::InvalidInput)?;
+    }
     memfd_checks_before_stream_write(&file_like, total as u64)?;
-    let data = copy_user_iov_read_buf(iov, iovcnt)?;
+    let mut src = SegmentBuf::new(segs)?.into_io();
+    let mut data = vec![0; src.remaining()];
+    src.read_exact(&mut data)?;
     file_like.write(&mut data.as_slice()).map(|n| n as _)
+}
+
+fn segments_total_len(segs: &[(usize, usize)]) -> StarryResult<usize> {
+    segs.iter().try_fold(0usize, |total, &(_, len)| {
+        total.checked_add(len).ok_or(StarryError::InvalidInput)
+    })
 }
 
 /// Seek `fd` to `pos`, whichever kind of file it holds.

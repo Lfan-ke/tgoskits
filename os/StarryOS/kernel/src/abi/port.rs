@@ -6,11 +6,12 @@
 //! domain takes over decoding and validating the call, while the primitive
 //! underneath stays the one the kernel already ships.
 
+use alloc::vec::Vec;
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
-    SignalTarget, Signals, SysResult, System, Tasks, UtsField,
+    Segment, SignalTarget, Signals, SysResult, System, Tasks, UtsField,
 };
 use ax_io::SeekFrom as IoSeek;
 use ax_runtime::hal;
@@ -18,7 +19,7 @@ use ax_task::{
     current,
     future::{block_on, interruptible, sleep},
 };
-use linux_raw_sys::general::{SIG_BLOCK, SIG_UNBLOCK};
+use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
 use starry_signal::SignalSet;
 use starry_vm::{vm_read_slice, vm_write_slice};
 
@@ -49,21 +50,25 @@ impl Platform for KernelHost {
 }
 
 impl Tasks for KernelHost {
-    fn getpid(&self) -> u32 {
+    fn getpid(&self) -> SysResult {
         let curr = current();
         current_pid_view()
             .visible_process_number(&curr.as_thread().proc_data.identity())
-            .map_or(0, |pid| pid.get())
+            .map(|pid| pid.get() as isize)
+            .ok_or(errno(StarryError::NoSuchProcess))
     }
 
-    fn getppid(&self) -> u32 {
+    fn getppid(&self) -> SysResult {
         let curr = current();
-        curr.as_thread()
+        let parent = curr
+            .as_thread()
             .proc_data
             .proc
             .parent()
-            .and_then(|parent| current_pid_view().visible_process_number(&parent.identity()))
-            .map_or(0, |pid| pid.get())
+            .ok_or(errno(StarryError::NoSuchProcess))?;
+        Ok(current_pid_view()
+            .visible_process_number(&parent.identity())
+            .map_or(0, |pid| pid.get() as isize))
     }
 
     fn gettid(&self) -> u32 {
@@ -91,6 +96,11 @@ impl Tasks for KernelHost {
         do_exit(status, true);
         Ok(0)
     }
+}
+
+/// The kernel names a run by a plain pair.
+fn runs(segs: &[Segment]) -> Vec<(usize, usize)> {
+    segs.iter().map(|s| (s.uaddr, s.len)).collect()
 }
 
 impl Files for KernelHost {
@@ -137,6 +147,14 @@ impl Files for KernelHost {
     fn validate(&self, fd: i32) -> SysResult {
         get_file_like(fd).map_err(errno)?;
         Ok(0)
+    }
+
+    fn readv(&self, fd: i32, segs: &[Segment]) -> SysResult {
+        port_result(syscall::read_segments(fd, &runs(segs)))
+    }
+
+    fn writev(&self, fd: i32, segs: &[Segment]) -> SysResult {
+        port_result(syscall::write_segments(fd, &runs(segs)))
     }
 
     fn seekable(&self, fd: i32) -> SysResult {
@@ -218,7 +236,7 @@ impl Mem for KernelHost {
     }
 
     fn advise(&self, addr: usize, len: usize, advice: i32) -> SysResult {
-        port_result(syscall::sys_madvise(addr, len, advice))
+        port_result(syscall::advise_range(addr, len, advice))
     }
 
     fn writeback(&self, addr: usize, len: usize) -> SysResult {
@@ -258,7 +276,7 @@ impl Signals for KernelHost {
     }
 
     fn tgkill(&self, tgid: u32, tid: u32, signo: u32) -> SysResult {
-        port_result(syscall::sys_tgkill(tgid as i32, tid as i32, signo))
+        port_result(syscall::signal_thread(tgid, tid, signo))
     }
 
     fn sigprocmask(&self, how: i32, new: Option<u64>) -> Result<u64, i32> {
@@ -270,7 +288,8 @@ impl Signals for KernelHost {
             signal.set_blocked(match how as u32 {
                 SIG_BLOCK => old | set,
                 SIG_UNBLOCK => old & !set,
-                _ => set,
+                SIG_SETMASK => set,
+                _ => return Err(errno(StarryError::InvalidInput)),
             });
         }
         Ok(set_to_bits(old))
