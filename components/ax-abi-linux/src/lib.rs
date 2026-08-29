@@ -140,7 +140,7 @@ fn linux() -> &'static dyn Personality {
     &IT
 }
 
-ax_binfmt::register_personality!(linux);
+ax_binfmt::register_sysabi!(linux);
 
 /// Route one syscall to its handler, or `None` when the trapped number is not one
 /// this domain owns, so a hosting kernel can fall back to its own table during

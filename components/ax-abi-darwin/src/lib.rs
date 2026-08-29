@@ -257,4 +257,4 @@ fn darwin() -> &'static dyn Personality {
     &IT
 }
 
-ax_binfmt::register_personality!(darwin);
+ax_binfmt::register_sysabi!(darwin);

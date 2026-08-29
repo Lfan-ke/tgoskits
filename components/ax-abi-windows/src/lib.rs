@@ -356,4 +356,4 @@ fn windows() -> &'static dyn Personality {
     &IT
 }
 
-ax_binfmt::register_personality!(windows);
+ax_binfmt::register_sysabi!(windows);
