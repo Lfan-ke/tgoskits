@@ -44,6 +44,8 @@ pub const EBADF: i32 = 9;
 pub const ESRCH: i32 = 3;
 /// `ESPIPE` - the descriptor does not admit positional io.
 pub const ESPIPE: i32 = 29;
+/// `EINTR` - a signal cut the call short.
+pub const EINTR: i32 = 4;
 
 /// The minimal arch/memory platform, à la gVisor's `Platform`: move bytes across
 /// the user/kernel boundary. Everything a personality needs from the CPU/MMU
@@ -223,7 +225,10 @@ pub trait Mem: Sync {
 /// memory. Every modern libc draws from it at startup.
 #[cfg(feature = "random")]
 pub trait Random: Sync {
-    fn fill(&self, buf: &mut [u8]) -> SysResult;
+    /// Fill `len` bytes of user memory at `uaddr` with entropy, returning how
+    /// many arrived. `blocking` asks for the source that waits for entropy
+    /// over the one that never does.
+    fn fill(&self, uaddr: usize, len: usize, blocking: bool) -> SysResult;
 }
 
 /// Signal delivery and the blocked-signal mask. A domain moves the user
@@ -257,10 +262,21 @@ pub trait Signals: Sync {
 /// Clocks and sleeping, in nanoseconds. A domain packs the `timespec`/`timeval`
 /// structs itself; this port only supplies the raw counters.
 #[cfg(feature = "time")]
+/// How a sleep ended. A sleep cut short says how far it got, because an ABI
+/// that hands the caller the time remaining has to work that out itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slept {
+    /// The whole requested span elapsed.
+    Full,
+    /// Something interrupted it after `elapsed_ns`.
+    Short { errno: i32, elapsed_ns: u64 },
+}
+
 pub trait Clock: Sync {
     fn monotonic_ns(&self) -> u64;
     fn wall_ns(&self) -> u64;
-    fn sleep_ns(&self, ns: u64) -> SysResult;
+    /// Sleep for `ns`, reporting whether it ran out or was cut short.
+    fn sleep_ns(&self, ns: u64) -> Slept;
 }
 
 /// One field of the system identity a `uname`-style call reports.

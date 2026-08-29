@@ -44,6 +44,11 @@ fn sleep_impl(clock: impl Fn() -> TimeValue, dur: TimeValue) -> (StarryResult<()
     (result, clock() - start)
 }
 
+/// Sleep `dur` on the monotonic clock, reporting how long it did sleep.
+pub(crate) fn sleep_monotonic(dur: TimeValue) -> (StarryResult<()>, TimeValue) {
+    sleep_impl(hal::time::monotonic_time, dur)
+}
+
 /// Sleep some nanoseconds
 pub fn sys_nanosleep(req: *const timespec, rem: *mut timespec) -> StarryResult<isize> {
     // FIXME: AnyBitPattern
