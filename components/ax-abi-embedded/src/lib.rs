@@ -216,6 +216,22 @@ mod tests {
                 .push((va, len, prot, init.map_or(0, <[u8]>::len)));
             Ok(())
         }
+
+        fn map_image(
+            &mut self,
+            _va: u64,
+            _len: u64,
+            _prot: Prot,
+            _offset: u64,
+            _file_end: u64,
+        ) -> AbiResult<()> {
+            // A flat blob has no file behind it; the table copies it in.
+            Err(AbiError::Unsupported)
+        }
+
+        fn read_image(&mut self, _at: u64, _out: &mut [u8]) -> AbiResult<usize> {
+            Err(AbiError::Unsupported)
+        }
     }
 
     fn put_42(env: &mut dyn TrapEnv) -> Dispatch {

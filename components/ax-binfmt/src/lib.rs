@@ -62,7 +62,8 @@ bitflags! {
 
 /// A request to load an executable image, borrowed to keep the core allocation-free.
 pub struct LoadRequest<'a> {
-    /// The raw executable bytes.
+    /// The raw executable bytes, as much of them as the host read to recognize
+    /// the format. A loader that maps from the file uses [`file`](Self::file).
     pub image: &'a [u8],
     /// Program arguments (`argv`), personality-neutral.
     pub args: &'a [&'a str],
@@ -90,6 +91,48 @@ pub trait LoadEnv {
     /// Map `[va, va + len)` with `prot`, initializing the head from `init`
     /// (the remainder is zero-filled, as `.bss` and PE uninitialized data need).
     fn map_region(&mut self, va: u64, len: u64, prot: Prot, init: Option<&[u8]>) -> AbiResult<()>;
+
+    /// Map `[va, va + len)` from `image` at `offset`, copy-on-write, with the
+    /// file's contribution ending at `file_end` and the rest zero-filled.
+    ///
+    /// The difference from [`map_region`](Self::map_region) is where the bytes
+    /// come from and when: this leaves them in the host's page cache and lets
+    /// them arrive on demand, which is what a format wants for a large image it
+    /// mostly does not touch. A host without demand paging may copy instead.
+    /// Map `[va, va + len)` from the image being loaded, at `offset` in the
+    /// file, copy-on-write, with the file's contribution ending at `file_end`
+    /// and the rest zero-filled.
+    ///
+    /// The difference from [`map_region`](Self::map_region) is where the bytes
+    /// come from and when: this leaves them in the host's page cache and lets
+    /// them arrive as they are touched, which is what `binfmt_elf` gets from
+    /// `vm_mmap` for a `PT_LOAD` and what makes a large image cheap to start.
+    fn map_image(
+        &mut self,
+        va: u64,
+        len: u64,
+        prot: Prot,
+        offset: u64,
+        file_end: u64,
+    ) -> AbiResult<()>;
+
+    /// Read from the image being loaded without mapping it, so a loader can
+    /// read its own headers. Returns how many bytes arrived.
+    fn read_image(&mut self, at: u64, out: &mut [u8]) -> AbiResult<usize>;
+
+    /// Continue with `path` as the image being loaded, for a format whose
+    /// image names the interpreter that should run it. Both stay mapped: an
+    /// ELF maps its own `PT_LOAD`s and then the interpreter's, which is what
+    /// this sequencing is for. The host owns the files throughout; a loader
+    /// never holds one.
+    fn interpret(&mut self, _path: &str) -> AbiResult<()> {
+        Err(AbiError::Unsupported)
+    }
+
+    /// Discard what is mapped before laying out a new image, as an exec does.
+    fn reset(&mut self) -> AbiResult<()> {
+        Err(AbiError::Unsupported)
+    }
 }
 
 /// One format's entry in the registry.

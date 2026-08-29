@@ -23,5 +23,6 @@ system = []
 creds = []
 
 [dependencies]
+ax-io = { workspace = true }
 ax-crate-interface = { workspace = true }
 bitflags = { workspace = true }

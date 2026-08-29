@@ -766,14 +766,14 @@ fn sys_ftruncate(files: &dyn ops::Files, fd: i32, len: i64) -> SysResult {
 /// negative absolute offset, then seek through the port.
 #[cfg(feature = "fs")]
 fn sys_lseek(files: &dyn ops::Files, fd: i32, offset: isize, whence: i32) -> SysResult {
-    let from = match whence {
+    let to = match whence {
         0 if offset < 0 => return Err(ops::EINVAL),
-        0 => ops::SeekFrom::Start,
-        1 => ops::SeekFrom::Current,
-        2 => ops::SeekFrom::End,
+        0 => ops::SeekFrom::Start(offset as u64),
+        1 => ops::SeekFrom::Current(offset as i64),
+        2 => ops::SeekFrom::End(offset as i64),
         _ => return Err(ops::EINVAL),
     };
-    files.seek(fd, offset, from)
+    files.seek(fd, to)
 }
 
 /// `dup2(oldfd, newfd)`: duplicating an fd onto itself is a no-op that still
@@ -1020,6 +1020,15 @@ fn encode(result: SysResult) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// What a host would land on, so a test can check the domain passed the
+    /// offset through unchanged.
+    fn seek_offset(to: ops::SeekFrom) -> isize {
+        match to {
+            ops::SeekFrom::Start(at) => at as isize,
+            ops::SeekFrom::Current(by) | ops::SeekFrom::End(by) => by as isize,
+        }
+    }
+
     use core::cell::RefCell;
 
     use super::{
@@ -1104,8 +1113,8 @@ mod tests {
         fn dup(&self, _fd: i32) -> SysResult {
             Ok(0)
         }
-        fn seek(&self, _fd: i32, o: isize, _from: ops::SeekFrom) -> SysResult {
-            Ok(o)
+        fn seek(&self, _fd: i32, to: ops::SeekFrom) -> SysResult {
+            Ok(seek_offset(to))
         }
         fn validate(&self, _fd: i32) -> SysResult {
             Ok(0)
@@ -1313,8 +1322,8 @@ mod tests {
         fn dup(&self, _fd: i32) -> SysResult {
             Ok(9)
         }
-        fn seek(&self, _fd: i32, offset: isize, _from: ops::SeekFrom) -> SysResult {
-            Ok(offset)
+        fn seek(&self, _fd: i32, to: ops::SeekFrom) -> SysResult {
+            Ok(seek_offset(to))
         }
         fn validate(&self, fd: i32) -> SysResult {
             if fd < 0 { Err(ops::EBADF) } else { Ok(0) }

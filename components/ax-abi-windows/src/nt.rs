@@ -348,8 +348,11 @@ mod tests {
         fn dup(&self, _fd: i32) -> ax_abi_port::SysResult {
             Ok(0)
         }
-        fn seek(&self, _fd: i32, o: isize, _f: ax_abi_port::SeekFrom) -> ax_abi_port::SysResult {
-            Ok(o)
+        fn seek(&self, _fd: i32, to: ax_abi_port::SeekFrom) -> ax_abi_port::SysResult {
+            Ok(match to {
+                ax_abi_port::SeekFrom::Start(at) => at as isize,
+                ax_abi_port::SeekFrom::Current(by) | ax_abi_port::SeekFrom::End(by) => by as isize,
+            })
         }
         fn validate(&self, _fd: i32) -> ax_abi_port::SysResult {
             Ok(0)
