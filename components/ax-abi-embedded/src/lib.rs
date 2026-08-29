@@ -21,8 +21,8 @@
 #![cfg_attr(not(test), no_std)]
 
 use ax_binfmt::{
-    Abi, AbiError, AbiResult, CustomHandler, Dispatch, LoadEnv, LoadRequest, Loaded, Personality,
-    Prot, TrapEnv,
+    Abi, AbiError, AbiResult, CustomHandler, Dispatch, LoadEnv, LoadRequest, Loaded, Loader,
+    Personality, Prot, TrapEnv,
 };
 
 /// A handler for one trapped index. A bare function pointer, so a vector table
@@ -73,6 +73,16 @@ impl Personality for VectorTable<'_> {
         false
     }
 
+    fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
+        self.dispatch(env)
+    }
+
+    fn loader(&self) -> Option<&dyn Loader> {
+        Some(self)
+    }
+}
+
+impl Loader for VectorTable<'_> {
     /// Load a flat image: map the opaque blob at [`base`](Self::base) and start
     /// there. Mapped read-write-execute because a flat binary interleaves code
     /// and mutable data with no section table to separate them - matching how a
@@ -92,10 +102,6 @@ impl Personality for VectorTable<'_> {
             entry: self.base,
             stack: 0,
         })
-    }
-
-    fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
-        self.dispatch(env)
     }
 }
 
@@ -243,9 +249,6 @@ mod tests {
         }
         fn recognizes(&self, _: &[u8]) -> bool {
             false
-        }
-        fn load(&self, _: &LoadRequest<'_>, _: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-            Err(AbiError::Unsupported)
         }
         fn handle_syscall(&self, _: &mut dyn TrapEnv) -> Dispatch {
             Dispatch::Passthrough
