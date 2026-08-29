@@ -199,14 +199,15 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         #[cfg(feature = "mm")]
         Sysno::brk => sys_brk(host.mem()?, arg(0)),
         #[cfg(feature = "mm")]
-        Sysno::mmap => host.mem()?.mmap(
+        Sysno::mmap => sys_mmap(
+            host.mem()?,
             arg(0),
             arg(1),
-            arg(2) as i32,
-            arg(3) as i32,
+            arg(2) as u32,
+            arg(3) as u32,
             arg(4) as i32,
-            arg(5),
-        ),
+            arg(5) as isize,
+        )?,
         #[cfg(feature = "mm")]
         Sysno::munmap => sys_munmap(host.mem()?, arg(0), arg(1)),
         #[cfg(feature = "mm")]
@@ -328,6 +329,89 @@ fn sys_madvise(mem: &dyn ops::Mem, addr: usize, len: usize, advice: i32) -> SysR
     mem.advise(addr, len, advice)
 }
 
+/// Translate the ABI's `PROT_*` bits, refusing an unknown one.
+#[cfg(feature = "mm")]
+fn prot_from_abi(prot: u32) -> Result<ops::Prot, i32> {
+    use linux_raw_sys::general::{PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE};
+    let known = PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN | PROT_GROWSUP;
+    if prot & !known != 0 {
+        return Err(ops::EINVAL);
+    }
+    let mut bits = ops::Prot::empty();
+    for (abi, port) in [
+        (PROT_READ, ops::Prot::READ),
+        (PROT_WRITE, ops::Prot::WRITE),
+        (PROT_EXEC, ops::Prot::EXEC),
+        (PROT_GROWSDOWN, ops::Prot::GROWS_DOWN),
+        (PROT_GROWSUP, ops::Prot::GROWS_UP),
+    ] {
+        bits.set(port, prot & abi != 0);
+    }
+    Ok(bits)
+}
+
+/// `mmap(addr, len, prot, flags, fd, offset)`: the domain claims the mapping
+/// shapes every ABI shares. Anything else in `flags` - huge pages, populate,
+/// the validated-shared variant - is Linux's own and goes back to the caller,
+/// which still implements it in full.
+#[cfg(feature = "mm")]
+fn sys_mmap(
+    mem: &dyn ops::Mem,
+    addr: usize,
+    len: usize,
+    prot: u32,
+    flags: u32,
+    fd: i32,
+    offset: isize,
+) -> Option<SysResult> {
+    use linux_raw_sys::general::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED};
+    if flags & !(MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED) != 0 {
+        return None;
+    }
+    Some(map_request(mem, addr, len, prot, flags, fd, offset))
+}
+
+#[cfg(feature = "mm")]
+fn map_request(
+    mem: &dyn ops::Mem,
+    addr: usize,
+    len: usize,
+    prot: u32,
+    flags: u32,
+    fd: i32,
+    offset: isize,
+) -> SysResult {
+    use linux_raw_sys::general::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED};
+    if len == 0 {
+        return Err(ops::EINVAL);
+    }
+    let bits = prot_from_abi(prot)?;
+    let shared = match (flags & MAP_SHARED != 0, flags & MAP_PRIVATE != 0) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return Err(ops::EINVAL),
+    };
+    let offset = usize::try_from(offset).map_err(|_| ops::EINVAL)?;
+    if !offset.is_multiple_of(PAGE_SIZE) {
+        return Err(ops::EINVAL);
+    }
+    let source = if flags & MAP_ANONYMOUS != 0 {
+        ops::MapSource::Anonymous
+    } else if fd < 0 {
+        return Err(ops::EBADF);
+    } else {
+        ops::MapSource::File { fd, offset }
+    };
+    mem.map(&ops::MapRequest {
+        addr,
+        len,
+        prot: bits,
+        fixed: flags & MAP_FIXED != 0,
+        shared,
+        source,
+    })
+}
+
 /// `munmap(addr, len)`: a zero length is `EINVAL`, which is the ABI's rule
 /// rather than the host's.
 #[cfg(feature = "mm")]
@@ -425,21 +509,7 @@ fn sys_msync(mem: &dyn ops::Mem, addr: usize, len: usize, flags: u32) -> SysResu
 /// A zero length succeeds without touching anything.
 #[cfg(feature = "mm")]
 fn sys_mprotect(mem: &dyn ops::Mem, addr: usize, len: usize, prot: u32) -> SysResult {
-    use linux_raw_sys::general::{PROT_EXEC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE};
-    let known = PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN | PROT_GROWSUP;
-    if prot & !known != 0 {
-        return Err(ops::EINVAL);
-    }
-    let mut bits = ops::Prot::empty();
-    for (abi, port) in [
-        (PROT_READ, ops::Prot::READ),
-        (PROT_WRITE, ops::Prot::WRITE),
-        (PROT_EXEC, ops::Prot::EXEC),
-        (PROT_GROWSDOWN, ops::Prot::GROWS_DOWN),
-        (PROT_GROWSUP, ops::Prot::GROWS_UP),
-    ] {
-        bits.set(port, prot & abi != 0);
-    }
+    let bits = prot_from_abi(prot)?;
     if bits.contains(ops::Prot::GROWS_DOWN | ops::Prot::GROWS_UP) {
         return Err(ops::EINVAL);
     }
@@ -730,7 +800,7 @@ mod tests {
         fn set_brk(&self, _addr: usize) -> SysResult {
             Ok(0)
         }
-        fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
+        fn map(&self, _req: &ops::MapRequest) -> SysResult {
             Ok(0)
         }
         fn unmap(&self, _a: usize, _l: usize) -> SysResult {
@@ -848,6 +918,7 @@ mod tests {
         exited: RefCell<Option<(i32, bool)>>,
         synced: RefCell<Option<bool>>,
         heap: RefCell<usize>,
+        mapped: RefCell<Option<ops::MapRequest>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Mock {}
@@ -966,7 +1037,8 @@ mod tests {
             *self.heap.borrow_mut() = addr;
             Ok(0)
         }
-        fn mmap(&self, _a: usize, _l: usize, _p: i32, _f: i32, _fd: i32, _o: usize) -> SysResult {
+        fn map(&self, req: &ops::MapRequest) -> SysResult {
+            *self.mapped.borrow_mut() = Some(*req);
             Ok(0x1000)
         }
         fn unmap(&self, _a: usize, _l: usize) -> SysResult {
@@ -1432,6 +1504,105 @@ mod tests {
         assert_eq!(
             dispatch(&host, &Trap::new(Sysno::brk, [0x10, 0, 0, 0, 0, 0])),
             Ok(0x8000)
+        );
+    }
+
+    #[test]
+    fn mmap_claims_the_shapes_every_abi_shares() {
+        use linux_raw_sys::general::{
+            MAP_ANONYMOUS, MAP_FIXED, MAP_HUGETLB, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE,
+        };
+        let host = Mock::default();
+        // An anonymous private mapping arrives as a request the host can place.
+        let r = dispatch(
+            &host,
+            &Trap::new(
+                Sysno::mmap,
+                [
+                    0,
+                    0x2000,
+                    (PROT_READ | PROT_WRITE) as usize,
+                    (MAP_PRIVATE | MAP_ANONYMOUS) as usize,
+                    -1i32 as usize,
+                    0,
+                ],
+            ),
+        );
+        assert_eq!(r, Ok(0x1000));
+        assert_eq!(
+            *host.mapped.borrow(),
+            Some(ops::MapRequest {
+                addr: 0,
+                len: 0x2000,
+                prot: ops::Prot::READ | ops::Prot::WRITE,
+                fixed: false,
+                shared: false,
+                source: ops::MapSource::Anonymous,
+            })
+        );
+        // A file mapping carries its descriptor and offset.
+        let r = dispatch(
+            &host,
+            &Trap::new(
+                Sysno::mmap,
+                [
+                    0x8000,
+                    0x1000,
+                    PROT_READ as usize,
+                    (MAP_SHARED | MAP_FIXED) as usize,
+                    7,
+                    0x1000,
+                ],
+            ),
+        );
+        assert_eq!(r, Ok(0x1000));
+        assert_eq!(
+            host.mapped.borrow().unwrap().source,
+            ops::MapSource::File {
+                fd: 7,
+                offset: 0x1000
+            }
+        );
+        assert!(host.mapped.borrow().unwrap().fixed);
+        assert!(host.mapped.borrow().unwrap().shared);
+        // Neither shared nor private, and an unaligned offset, are refused.
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(
+                    Sysno::mmap,
+                    [0, 0x1000, PROT_READ as usize, 0, -1i32 as usize, 0]
+                )
+            ),
+            Err(ops::EINVAL)
+        );
+        assert_eq!(
+            dispatch(
+                &host,
+                &Trap::new(
+                    Sysno::mmap,
+                    [0, 0x1000, PROT_READ as usize, (MAP_SHARED) as usize, 7, 1]
+                )
+            ),
+            Err(ops::EINVAL)
+        );
+        // A Linux-only shape goes back to the caller untouched.
+        assert!(
+            route(
+                &host,
+                &Trap::new(
+                    Sysno::mmap,
+                    [
+                        0,
+                        0x1000,
+                        PROT_READ as usize,
+                        (MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB) as usize,
+                        -1i32 as usize,
+                        0
+                    ]
+                )
+            )
+            .is_none()
         );
     }
 
