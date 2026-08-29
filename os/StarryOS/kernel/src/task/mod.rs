@@ -901,6 +901,10 @@ pub struct ProcessData {
     pub envp: RwLock<Arc<Vec<String>>>,
     /// Auxiliary vector entries exported via `/proc/[pid]/auxv`.
     pub auxv: RwLock<Vec<AuxEntry>>,
+    /// Which syscall ABI this process's image speaks, as the neutral tag
+    /// `ax_binfmt` reads. Set when the image is loaded and read on every trap,
+    /// so it is a plain word rather than anything the trap path must lock.
+    pub abi_tag: core::sync::atomic::AtomicU32,
     /// The root directory path, exported via `/proc/[pid]/root`.
     pub root_path: RwLock<String>,
     /// The current working directory path, exported via `/proc/[pid]/cwd`.
@@ -1124,6 +1128,9 @@ impl ProcessData {
             cmdline: RwLock::new(image.cmdline),
             envp: RwLock::new(image.envp),
             auxv: RwLock::new(image.auxv),
+            // An ELF is the format the kernel loads itself; anything else is
+            // retagged by the personality that claimed it.
+            abi_tag: core::sync::atomic::AtomicU32::new(ax_binfmt::Abi::Linux.as_tag()),
             root_path: RwLock::new(image.root_path),
             cwd_path: RwLock::new(image.cwd_path),
             aspace: IrqMutex::new(aspace),

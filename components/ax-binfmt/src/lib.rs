@@ -41,6 +41,26 @@ pub enum Abi {
     Embedded,
 }
 
+impl Abi {
+    /// A non-zero tag a host can keep in a plain word, so a per-task ABI costs
+    /// an atomic load on the trap path rather than a lock.
+    pub const fn as_tag(self) -> u32 {
+        self as u32 + 1
+    }
+
+    /// The ABI a tag names, or `None` for the zero a host uses to say it does
+    /// not track one.
+    pub const fn from_tag(tag: u32) -> Option<Abi> {
+        Some(match tag {
+            1 => Abi::Linux,
+            2 => Abi::Windows,
+            3 => Abi::Darwin,
+            4 => Abi::Embedded,
+            _ => return None,
+        })
+    }
+}
+
 /// Errors surfaced while recognizing, loading or running a foreign binary.
 ///
 /// Kept small and `Copy` so integration glue can translate each variant to the
@@ -120,6 +140,12 @@ pub trait TrapEnv {
     fn nr(&self) -> usize;
     /// Positional syscall argument `i` (0-based).
     fn arg(&self, i: usize) -> usize;
+    /// The ABI the trapping task speaks, when the host tracks one. A host that
+    /// does not offers the call to every linked personality in turn.
+    fn abi(&self) -> Option<Abi> {
+        None
+    }
+
     /// Write the syscall's return value into the trap frame.
     fn set_result(&mut self, value: usize);
 
@@ -270,8 +296,16 @@ pub fn registered() -> &'static [Registration] {
 /// first that claims it.
 /// Offer a trapped index to each linked personality until one claims it.
 pub fn dispatch_registered_trap(env: &mut dyn TrapEnv) -> Dispatch {
+    // Call numbers collide across ABIs - NT's WriteFile and Linux's write are
+    // both 1 on x86-64 - so a host that knows which ABI the task speaks says
+    // so, and only that personality is offered the call.
+    let speaks = env.abi();
     for entry in registered() {
-        if entry.personality().handle_syscall(env) == Dispatch::Handled {
+        let personality = entry.personality();
+        if speaks.is_some_and(|abi| personality.abi() != abi) {
+            continue;
+        }
+        if personality.handle_syscall(env) == Dispatch::Handled {
             return Dispatch::Handled;
         }
     }
@@ -429,6 +463,95 @@ pub fn detect(image: &[u8]) -> Option<Abi> {
 
 #[cfg(test)]
 mod tests {
+    // Two ABIs that both claim index 1 - NT's WriteFile and Linux's write on
+    // x86-64 - so only the task's own ABI may answer it.
+    struct Speaks(Abi, usize);
+    impl Personality for Speaks {
+        fn abi(&self) -> Abi {
+            self.0
+        }
+        fn recognizes(&self, _image: &[u8]) -> bool {
+            false
+        }
+        fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
+            if env.nr() == 1 {
+                env.set_result(self.1);
+                Dispatch::Handled
+            } else {
+                Dispatch::Passthrough
+            }
+        }
+    }
+
+    struct Caller {
+        abi: Option<Abi>,
+        result: Option<usize>,
+    }
+    impl TrapEnv for Caller {
+        fn nr(&self) -> usize {
+            1
+        }
+        fn arg(&self, _i: usize) -> usize {
+            0
+        }
+        fn abi(&self) -> Option<Abi> {
+            self.abi
+        }
+        fn set_result(&mut self, value: usize) {
+            self.result = Some(value);
+        }
+    }
+
+    fn offer(personalities: &[&dyn Personality], env: &mut Caller) -> Dispatch {
+        let speaks = env.abi();
+        for &personality in personalities {
+            if speaks.is_some_and(|abi| personality.abi() != abi) {
+                continue;
+            }
+            if personality.handle_syscall(env) == Dispatch::Handled {
+                return Dispatch::Handled;
+            }
+        }
+        Dispatch::Passthrough
+    }
+
+    #[test]
+    fn the_tasks_own_abi_answers_a_number_two_of_them_claim() {
+        let linux = Speaks(Abi::Linux, 0xA1);
+        let windows = Speaks(Abi::Windows, 0xB2);
+        let both: [&dyn Personality; 2] = [&linux, &windows];
+
+        let mut win_task = Caller {
+            abi: Some(Abi::Windows),
+            result: None,
+        };
+        assert_eq!(offer(&both, &mut win_task), Dispatch::Handled);
+        assert_eq!(win_task.result, Some(0xB2));
+
+        let mut linux_task = Caller {
+            abi: Some(Abi::Linux),
+            result: None,
+        };
+        assert_eq!(offer(&both, &mut linux_task), Dispatch::Handled);
+        assert_eq!(linux_task.result, Some(0xA1));
+
+        // A host that tracks no ABI falls back to registration order.
+        let mut untracked = Caller {
+            abi: None,
+            result: None,
+        };
+        assert_eq!(offer(&both, &mut untracked), Dispatch::Handled);
+        assert_eq!(untracked.result, Some(0xA1));
+    }
+
+    #[test]
+    fn a_tag_round_trips_and_zero_means_untracked() {
+        for abi in [Abi::Linux, Abi::Windows, Abi::Darwin, Abi::Embedded] {
+            assert_eq!(Abi::from_tag(abi.as_tag()), Some(abi));
+        }
+        assert_eq!(Abi::from_tag(0), None);
+    }
+
     use super::*;
 
     #[test]

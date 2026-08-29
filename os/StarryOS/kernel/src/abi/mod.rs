@@ -18,23 +18,37 @@
 mod port;
 
 use ax_abi_port::{Clock, Creds, CurrentHost, Files, Host, Mem, Platform, Random, Signals, System, Tasks};
-use ax_binfmt::TrapEnv;
+use ax_binfmt::{Abi, TrapEnv};
 use ax_crate_interface::call_interface;
 use ax_runtime::hal::cpu::uspace::UserContext;
 
-use crate::{StarryError, StarryResult};
+use ax_task::current;
+
+use crate::{StarryError, StarryResult, task::AsThread};
 
 /// Borrows a trapped [`UserContext`] and presents it as the ABI-neutral
 /// [`TrapEnv`] the personality domains consume.
 pub struct TrapCtx<'a> {
     uctx: &'a mut UserContext,
     entry_ip: usize,
+    abi: Option<Abi>,
 }
 
 impl<'a> TrapCtx<'a> {
     pub fn new(uctx: &'a mut UserContext) -> Self {
         let entry_ip = uctx.ip();
-        Self { uctx, entry_ip }
+        let abi = Abi::from_tag(
+            current()
+                .as_thread()
+                .proc_data
+                .abi_tag
+                .load(core::sync::atomic::Ordering::Relaxed),
+        );
+        Self {
+            uctx,
+            entry_ip,
+            abi,
+        }
     }
 }
 
@@ -52,6 +66,10 @@ impl TrapEnv for TrapCtx<'_> {
             4 => self.uctx.arg4(),
             _ => self.uctx.arg5(),
         }
+    }
+
+    fn abi(&self) -> Option<Abi> {
+        self.abi
     }
 
     fn set_result(&mut self, value: usize) {
