@@ -66,6 +66,9 @@ pub struct LoadRequest<'a> {
     /// The raw executable bytes, as much of them as the host read to recognize
     /// the format. A loader that maps from the file uses [`file`](Self::file).
     pub image: &'a [u8],
+    /// Where the host wants the image placed, for a format whose addresses are
+    /// relative. A format with fixed addresses ignores it.
+    pub load_base: u64,
     /// Program arguments (`argv`), personality-neutral.
     pub args: &'a [&'a str],
     /// Environment strings (`envp`), personality-neutral.
@@ -133,6 +136,37 @@ pub trait LoadEnv {
     /// Discard what is mapped before laying out a new image, as an exec does.
     fn reset(&mut self) -> AbiResult<()> {
         Err(AbiError::Unsupported)
+    }
+
+    /// Write `bytes` at `va`, which must already be mapped writable. A format
+    /// that relocates an image, or that lays out the initial stack itself,
+    /// needs this after mapping rather than at map time.
+    fn write(&mut self, _va: u64, _bytes: &[u8]) -> AbiResult<()> {
+        Err(AbiError::Unsupported)
+    }
+
+    /// How long the image being loaded is, for a format that has to bound a
+    /// file offset its own headers gave it.
+    fn image_len(&self) -> u64 {
+        0
+    }
+
+    /// The highest address anything is mapped at so far, so a format placing a
+    /// second image - an interpreter - can pick a base clear of the first.
+    fn mapped_end(&self) -> u64 {
+        0
+    }
+
+    /// The top of the stack the host prepared. A format lays out whatever its
+    /// ABI puts there and reports the resulting pointer in [`Loaded::stack`].
+    fn stack_top(&self) -> u64 {
+        0
+    }
+
+    /// What the processor can do, as the host reports it. Formats that hand a
+    /// program a capability word (`AT_HWCAP`) pass this through.
+    fn cpu_capabilities(&self) -> u64 {
+        0
     }
 }
 
