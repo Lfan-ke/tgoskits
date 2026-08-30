@@ -9,7 +9,7 @@
 //! with the carry flag set, which is why the trap frame carries
 //! [`TrapEnv::set_error`] alongside the value.
 
-use ax_abi_port::{Host, MapRequest, MapSource, Prot, SeekFrom, SysResult};
+use ax_abi_port::{Advice, Host, MapRequest, MapSource, Prot, SeekFrom, SysResult};
 use ax_dispatch::{Dispatch, TrapEnv};
 
 /// Where the call class sits in a Darwin system-call number.
@@ -146,12 +146,23 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
 fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
     let fd = a[0] as i32;
     Some(match call {
+        // XNU's `exit` encodes the status the same way, through W_EXITCODE.
         nr::EXIT => host.tasks()?.exit_group((a[0] as i32) << 8),
         nr::READ => host.files()?.read(fd, a[1], a[2]),
         nr::WRITE => host.files()?.write(fd, a[1], a[2]),
         nr::CLOSE => host.files()?.close(fd),
         nr::DUP => host.files()?.dup(fd),
-        nr::DUP2 => host.files()?.dup_onto(fd, a[1] as i32, false),
+        nr::DUP2 => {
+            // XNU's dup2 checks the descriptor and then returns the target
+            // unchanged when the two are the same, rather than closing and
+            // reopening it.
+            let to = a[1] as i32;
+            if fd == to {
+                host.files()?.validate(fd).map(|_| to as isize)
+            } else {
+                host.files()?.dup_onto(fd, to, false)
+            }
+        }
         nr::FSYNC => host.files()?.fsync(fd, false),
         nr::FTRUNCATE => {
             let len = a[1] as i64;
@@ -196,7 +207,8 @@ fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
         nr::GETEGID => Ok(host.creds()?.gids().1 as isize),
         nr::MMAP => return map(host, a),
         nr::MUNMAP => {
-            if a[1] == 0 {
+            // XNU refuses an unaligned address as well as a zero length.
+            if a[1] == 0 || !a[0].is_multiple_of(PAGE_SIZE) {
                 Err(EINVAL)
             } else {
                 host.mem()?.unmap(a[0], a[1])
@@ -215,9 +227,42 @@ fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
                 host.mem()?.protect(a[0], a[1], prot)
             }
         }
-        nr::MADVISE => host.mem()?.advise(a[0], a[1], a[2] as i32),
-        nr::MSYNC => {
+        nr::MADVISE => {
+            // XNU's `sys/mman.h`. These part company with Linux's from five
+            // onward - MADV_FREE is 5 here and 8 there - so the number is
+            // translated rather than passed on.
+            let meaning = match a[2] {
+                0 => Advice::Normal,
+                1 => Advice::Random,
+                2 => Advice::Sequential,
+                3 => Advice::WillNeed,
+                4 => Advice::DontNeed,
+                5 => Advice::Free,
+                // MADV_ZERO_WIRED_PAGES, the FREE_REUSABLE/REUSE pair,
+                // CAN_REUSE and PAGEOUT: asking is valid, and there is
+                // nothing here that acts on them.
+                6..=10 => Advice::Ignored,
+                _ => return Some(Err(EINVAL)),
+            };
             if !a[0].is_multiple_of(PAGE_SIZE) {
+                Err(EINVAL)
+            } else if a[1] == 0 {
+                Ok(0)
+            } else {
+                host.mem()?.advise(a[0], a[1], meaning)
+            }
+        }
+        nr::MSYNC => {
+            // XNU's flags, whose values are its own: MS_ASYNC is 1 and
+            // MS_INVALIDATE 2 as elsewhere, but MS_SYNC is 0x10 rather than
+            // Linux's 4. Asking for both kinds of sync at once is a
+            // contradiction.
+            const MS_ASYNC: usize = 0x1;
+            const MS_INVALIDATE: usize = 0x2;
+            const MS_SYNC: usize = 0x10;
+            let flags_bad = a[2] & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+                || a[2] & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC;
+            if flags_bad || !a[0].is_multiple_of(PAGE_SIZE) {
                 Err(EINVAL)
             } else if a[1] == 0 {
                 Ok(0)
@@ -231,6 +276,52 @@ fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn madvise_translates_darwins_numbering_not_linuxs() {
+        let host = MockHost::default();
+        // MADV_FREE is 5 on Darwin and 8 on Linux; passing the number through
+        // would mean something else entirely on the host.
+        let mut env = Trap::at(nr::MADVISE, [0x1000, 0x1000, 5, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(*host.advised.borrow(), Some(Advice::Free));
+
+        // The values above the shared range are Darwin's own and have no
+        // action here, which is not a failure.
+        let mut reuse = Trap::at(nr::MADVISE, [0x1000, 0x1000, 7, 0, 0, 0]);
+        assert_eq!(dispatch(&mut reuse, &host), Dispatch::Handled);
+        assert_eq!(*host.advised.borrow(), Some(Advice::Ignored));
+
+        // Anything past what Darwin defines is refused.
+        let mut bad = Trap::at(nr::MADVISE, [0x1000, 0x1000, 99, 0, 0, 0]);
+        assert_eq!(dispatch(&mut bad, &host), Dispatch::Handled);
+        assert_eq!(bad.failed, Some(true));
+    }
+
+    #[test]
+    fn msync_takes_darwins_flag_values() {
+        let host = MockHost::default();
+        // MS_SYNC is 0x10 here, where Linux writes 4.
+        let mut ok = Trap::at(nr::MSYNC, [0x1000, 0x1000, 0x10, 0, 0, 0]);
+        assert_eq!(dispatch(&mut ok, &host), Dispatch::Handled);
+        assert_eq!(ok.failed, Some(false));
+
+        // Both kinds of sync at once is a contradiction, and an undefined bit
+        // is refused rather than ignored.
+        for flags in [0x1 | 0x10, 0x40] {
+            let mut bad = Trap::at(nr::MSYNC, [0x1000, 0x1000, flags, 0, 0, 0]);
+            assert_eq!(dispatch(&mut bad, &host), Dispatch::Handled);
+            assert_eq!(bad.failed, Some(true), "flags {flags:#x}");
+        }
+    }
+
+    #[test]
+    fn munmap_wants_a_page_aligned_address() {
+        let host = MockHost::default();
+        let mut bad = Trap::at(nr::MUNMAP, [0x1001, 0x1000, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut bad, &host), Dispatch::Handled);
+        assert_eq!(bad.failed, Some(true));
+    }
+
     use core::cell::RefCell;
 
     use ax_abi_port::{Creds, Files, Mem, Platform, Tasks};
@@ -249,6 +340,18 @@ mod tests {
         result: Option<usize>,
         failed: Option<bool>,
     }
+    impl Trap {
+        /// A BSD call, with the class the number carries.
+        fn at(call: usize, args: [usize; 6]) -> Self {
+            Self {
+                nr: unix_call(call),
+                args,
+                result: None,
+                failed: None,
+            }
+        }
+    }
+
     impl TrapEnv for Trap {
         fn nr(&self) -> usize {
             self.nr
@@ -268,6 +371,7 @@ mod tests {
     struct MockHost {
         wrote: RefCell<Option<(i32, usize, usize)>>,
         mapped: RefCell<Option<MapRequest>>,
+        advised: RefCell<Option<Advice>>,
     }
     // Single-threaded tests; the ports ask for Sync on a real host.
     unsafe impl Sync for MockHost {}
@@ -354,7 +458,8 @@ mod tests {
         fn protect(&self, _a: usize, _l: usize, _p: Prot) -> SysResult {
             Ok(0)
         }
-        fn advise(&self, _a: usize, _l: usize, _adv: i32) -> SysResult {
+        fn advise(&self, _a: usize, _l: usize, adv: Advice) -> SysResult {
+            *self.advised.borrow_mut() = Some(adv);
             Ok(0)
         }
         fn writeback(&self, _a: usize, _l: usize) -> SysResult {

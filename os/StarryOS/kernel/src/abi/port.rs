@@ -11,7 +11,7 @@ use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
-    Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
+    Advice, Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
 };
 use ax_runtime::hal;
 use ax_task::current;
@@ -234,8 +234,24 @@ impl Mem for KernelHost {
         port_result(syscall::protect_range(addr, len, flags))
     }
 
-    fn advise(&self, addr: usize, len: usize, advice: i32) -> SysResult {
-        port_result(syscall::advise_range(addr, len, advice))
+    fn advise(&self, addr: usize, len: usize, advice: Advice) -> SysResult {
+        // The kernel's own range advice speaks Linux's numbering, which is one
+        // ABI's spelling of these; translate at the boundary rather than
+        // letting a domain write that spelling.
+        use linux_raw_sys::general::{
+            MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
+        };
+        let advice = match advice {
+            Advice::Normal => MADV_NORMAL,
+            Advice::Random => MADV_RANDOM,
+            Advice::Sequential => MADV_SEQUENTIAL,
+            Advice::WillNeed => MADV_WILLNEED,
+            Advice::DontNeed => MADV_DONTNEED,
+            Advice::Free => MADV_FREE,
+            // Nothing to do, and saying so is not a failure.
+            Advice::Ignored => return Ok(0),
+        };
+        port_result(syscall::advise_range(addr, len, advice as i32))
     }
 
     fn writeback(&self, addr: usize, len: usize) -> SysResult {

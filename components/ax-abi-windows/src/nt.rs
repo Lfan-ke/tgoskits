@@ -518,7 +518,12 @@ mod tests {
         fn protect(&self, _a: usize, _l: usize, _p: Prot) -> ax_abi_port::SysResult {
             Ok(0)
         }
-        fn advise(&self, _a: usize, _l: usize, _adv: i32) -> ax_abi_port::SysResult {
+        fn advise(
+            &self,
+            _addr: usize,
+            _len: usize,
+            _advice: ax_abi_port::Advice,
+        ) -> ax_abi_port::SysResult {
             Ok(0)
         }
         fn writeback(&self, _a: usize, _l: usize) -> ax_abi_port::SysResult {
