@@ -73,9 +73,7 @@ impl TrapDispatch for Dispatcher {
 
 /// The ABI implementations this build linked in, in registration order.
 pub fn personalities() -> impl Iterator<Item = &'static dyn SysAbi> {
-    ax_dispatch::registered()
-        .iter()
-        .map(ax_dispatch::Registration::sysabi)
+    ax_dispatch::SYSABIS.iter().map(|get| get())
 }
 
 /// Route `image` to the first compiled-in personality that recognizes it.

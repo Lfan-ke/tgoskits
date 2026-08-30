@@ -708,13 +708,14 @@ dependencies = [
  "ax-abi-windows",
  "ax-binfmt",
  "ax-crate-interface",
+ "ax-dispatch",
 ]
 
 [[package]]
 name = "ax-abi-custom"
 version = "0.1.0"
 dependencies = [
- "ax-binfmt",
+ "ax-dispatch",
 ]
 
 [[package]]
@@ -724,6 +725,7 @@ dependencies = [
  "ax-abi-port",
  "ax-binfmt",
  "ax-crate-interface",
+ "ax-dispatch",
 ]
 
 [[package]]
@@ -735,6 +737,7 @@ name = "ax-abi-embedded"
 version = "0.1.0"
 dependencies = [
  "ax-binfmt",
+ "ax-dispatch",
 ]
 
 [[package]]
@@ -742,8 +745,8 @@ name = "ax-abi-linux"
 version = "0.1.0"
 dependencies = [
  "ax-abi-port",
- "ax-binfmt",
  "ax-crate-interface",
+ "ax-dispatch",
  "linux-raw-sys 0.12.1",
  "syscalls",
 ]
@@ -757,6 +760,7 @@ name = "ax-abi-port"
 version = "0.1.0"
 dependencies = [
  "ax-crate-interface",
+ "ax-io",
  "bitflags 2.13.1",
 ]
 
@@ -767,6 +771,7 @@ dependencies = [
  "ax-abi-port",
  "ax-binfmt",
  "ax-crate-interface",
+ "ax-dispatch",
 ]
 
 [[package]]
@@ -819,8 +824,9 @@ dependencies = [
 name = "ax-binfmt"
 version = "0.1.0"
 dependencies = [
- "ax-crate-interface",
+ "ax-dispatch",
  "bitflags 2.13.1",
+ "linkme",
  "thiserror 2.0.20",
 ]
 
@@ -884,6 +890,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "ax-dispatch"
+version = "0.1.0"
+dependencies = [
+ "ax-crate-interface",
+ "linkme",
 ]
 
 [[package]]
@@ -4946,6 +4960,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "linkme"
+version = "0.3.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045e122bd98aef8ec3ad58ce84f0791f64e70163d1a02710af4aa11a4d54cc5"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77060ebe535362c3da75682cd17b0431017b6e7c5661e714fc69a7ad017d1301"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7932,6 +7966,7 @@ dependencies = [
  "ax-cgroup",
  "ax-cpu",
  "ax-crate-interface",
+ "ax-dispatch",
  "ax-display",
  "ax-driver",
  "ax-fs-ng",

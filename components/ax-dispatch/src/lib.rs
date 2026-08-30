@@ -18,6 +18,7 @@
 #![feature(used_with_arg)]
 
 use ax_crate_interface::def_interface;
+pub use linkme;
 
 /// The OS personality a user binary targets.
 ///
@@ -103,94 +104,28 @@ pub trait SysAbi: Sync {
     }
 }
 
-/// The entries the linker gathered between two section-bound symbols.
+/// Every ABI implementation this build linked in.
 ///
-/// Every registry here is the same shape - a section the linker fills from
-/// whatever was linked in, bounded by a pair of symbols - so the pointer
-/// arithmetic lives once rather than once per registry. The workspace's driver
-/// registry computes the same thing by hand in `axruntime`.
-///
-/// # Safety
-///
-/// `start` and `stop` must bound one array of `T` that the linker filled, and
-/// the entries must live for the program's lifetime.
-pub unsafe fn section_entries<T>(start: usize, stop: usize) -> &'static [T] {
-    // SAFETY: the caller states the two addresses bound one array of `T`.
-    unsafe { core::slice::from_raw_parts(start as *const T, (stop - start) / size_of::<T>()) }
-}
+/// The linker gathers the entries: an implementation appears by being linked
+/// in and disappears by being dropped from the dependency list, and nobody
+/// keeps a list. The workspace's driver registry works the same way; this uses
+/// `linkme` for it, so an empty registry is legal and no placeholder entry has
+/// to exist to keep the section bounded.
+#[linkme::distributed_slice]
+pub static SYSABIS: [fn() -> &'static dyn SysAbi];
 
-/// One personality's entry in the registry.
-///
-/// The entries live in their own linker section, so a personality appears by
-/// being linked in and disappears by being dropped from the dependency list -
-/// nobody keeps a list. This is how drivers register in this workspace too.
-#[repr(C)]
-pub struct Registration {
-    get: fn() -> &'static dyn SysAbi,
-}
-
-impl Registration {
-    /// Wrap the accessor a registration hands out.
-    pub const fn new(get: fn() -> &'static dyn SysAbi) -> Self {
-        Self { get }
-    }
-
-    /// The personality this entry registers.
-    pub fn sysabi(&self) -> &'static dyn SysAbi {
-        (self.get)()
-    }
-}
-
-/// Register a personality with the platform.
+/// Register an ABI implementation with the platform.
 ///
 /// Takes a path to a `fn() -> &'static dyn SysAbi`.
 #[macro_export]
 macro_rules! register_sysabi {
     ($get:path) => {
         const _: () = {
-            #[used(linker)]
-            #[unsafe(link_section = "abi_register")]
-            static REGISTRATION: $crate::Registration = $crate::Registration::new($get);
+            #[$crate::linkme::distributed_slice($crate::SYSABIS)]
+            #[linkme(crate = $crate::linkme)]
+            static REGISTRATION: fn() -> &'static dyn $crate::SysAbi = $get;
         };
     };
-}
-
-/// A personality that claims nothing, registered so the section always exists
-/// and its bounds are always defined, however few personalities are linked in.
-struct NoSysAbi;
-
-impl SysAbi for NoSysAbi {
-    fn abi(&self) -> Abi {
-        Abi::Embedded
-    }
-    fn handle_syscall(&self, _env: &mut dyn TrapEnv) -> Dispatch {
-        Dispatch::Passthrough
-    }
-}
-
-fn no_sysabi() -> &'static dyn SysAbi {
-    static IT: NoSysAbi = NoSysAbi;
-    &IT
-}
-
-register_sysabi!(no_sysabi);
-
-/// Every personality this build linked in.
-pub fn registered() -> &'static [Registration] {
-    // Declared as opaque symbols: only their addresses matter, and a function
-    // item keeps the declaration free of a type the linker never sees.
-    unsafe extern "C" {
-        fn __start_abi_register();
-        fn __stop_abi_register();
-    }
-    // SAFETY: the two symbols bound one array of `Registration`, which the
-    // linker fills from the `abi_register` section of every linked crate.
-    unsafe {
-        section_entries(
-            __start_abi_register as *const () as usize,
-            __stop_abi_register as *const () as usize,
-        )
-    }
 }
 
 /// Where in the registry the implementation for `abi` sits, resolved once so a
@@ -199,9 +134,7 @@ pub fn registered() -> &'static [Registration] {
 /// A host resolves this when a task's ABI is settled - at exec - and keeps the
 /// slot, so servicing a trap is an index rather than a scan.
 pub fn slot_of(abi: Abi) -> Option<usize> {
-    registered()
-        .iter()
-        .position(|entry| entry.sysabi().abi() == abi)
+    SYSABIS.iter().position(|get| get().abi() == abi)
 }
 
 /// Service a trapped index at the implementation a host already resolved.
@@ -210,8 +143,8 @@ pub fn slot_of(abi: Abi) -> Option<usize> {
 /// stale slot means the build changed under a saved value, and refusing the
 /// call is the safe reading.
 pub fn dispatch_at(slot: usize, env: &mut dyn TrapEnv) -> Dispatch {
-    match registered().get(slot) {
-        Some(entry) => entry.sysabi().handle_syscall(env),
+    match SYSABIS.get(slot) {
+        Some(get) => get().handle_syscall(env),
         None => Dispatch::Passthrough,
     }
 }
@@ -221,8 +154,8 @@ pub fn dispatch_registered_trap(env: &mut dyn TrapEnv) -> Dispatch {
     // Call numbers collide across ABIs - NT's WriteFile and Linux's write are
     // both 1 on x86-64 - so this order is only safe for a host that does not
     // know which ABI its task speaks. One that does resolves a slot instead.
-    for entry in registered() {
-        if entry.sysabi().handle_syscall(env) == Dispatch::Handled {
+    for get in SYSABIS {
+        if get().handle_syscall(env) == Dispatch::Handled {
             return Dispatch::Handled;
         }
     }
@@ -230,9 +163,7 @@ pub fn dispatch_registered_trap(env: &mut dyn TrapEnv) -> Dispatch {
 }
 
 pub fn route_registered(env: &dyn TrapEnv) -> TrapOutcome {
-    registered()
-        .iter()
-        .find_map(|entry| entry.sysabi().route(env))
+    SYSABIS.iter().find_map(|get| get().route(env))
 }
 
 /// A user-registered handler for a trapped index - the extension point for
@@ -246,26 +177,10 @@ pub trait CustomHandler: Sync {
     fn handle(&self, env: &mut dyn TrapEnv) -> Dispatch;
 }
 
-/// One extension's entry in the registry, alongside the ABI implementations.
-///
-/// A reserved index range is claimed the same way an ABI is: by being linked
-/// in. Nobody passes a list of extensions to the dispatcher.
-#[repr(C)]
-pub struct CustomRegistration {
-    get: fn() -> &'static dyn CustomHandler,
-}
-
-impl CustomRegistration {
-    /// Wrap the accessor a registration hands out.
-    pub const fn new(get: fn() -> &'static dyn CustomHandler) -> Self {
-        Self { get }
-    }
-
-    /// The extension this entry registers.
-    pub fn handler(&self) -> &'static dyn CustomHandler {
-        (self.get)()
-    }
-}
+/// Every extension this build linked in, claiming reserved index ranges
+/// alongside the ABI implementations.
+#[linkme::distributed_slice]
+pub static CUSTOMS: [fn() -> &'static dyn CustomHandler];
 
 /// Register an extension for a reserved index range.
 ///
@@ -274,50 +189,17 @@ impl CustomRegistration {
 macro_rules! register_custom {
     ($get:path) => {
         const _: () = {
-            #[used(linker)]
-            #[unsafe(link_section = "custom_register")]
-            static REGISTRATION: $crate::CustomRegistration = $crate::CustomRegistration::new($get);
+            #[$crate::linkme::distributed_slice($crate::CUSTOMS)]
+            #[linkme(crate = $crate::linkme)]
+            static REGISTRATION: fn() -> &'static dyn $crate::CustomHandler = $get;
         };
     };
 }
 
-/// An extension that claims nothing, registered so the section always exists
-/// and its bounds are always defined, however few extensions are linked in.
-struct NoCustom;
-
-impl CustomHandler for NoCustom {
-    fn handle(&self, _env: &mut dyn TrapEnv) -> Dispatch {
-        Dispatch::Passthrough
-    }
-}
-
-fn no_custom() -> &'static dyn CustomHandler {
-    static IT: NoCustom = NoCustom;
-    &IT
-}
-
-register_custom!(no_custom);
-
-/// Every extension this build linked in.
-pub fn registered_custom() -> &'static [CustomRegistration] {
-    unsafe extern "C" {
-        fn __start_custom_register();
-        fn __stop_custom_register();
-    }
-    // SAFETY: the two symbols bound one array of `CustomRegistration`, which
-    // the linker fills from the `custom_register` section of every linked crate.
-    unsafe {
-        section_entries(
-            __start_custom_register as *const () as usize,
-            __stop_custom_register as *const () as usize,
-        )
-    }
-}
-
 /// Offer a trapped index to every registered extension, in registration order.
 pub fn dispatch_registered_custom(env: &mut dyn TrapEnv) -> Dispatch {
-    for entry in registered_custom() {
-        if entry.handler().handle(env) == Dispatch::Handled {
+    for get in CUSTOMS {
+        if get().handle(env) == Dispatch::Handled {
             return Dispatch::Handled;
         }
     }
@@ -462,9 +344,13 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_keeps_the_section_bounded() {
-        // However few implementations are linked, the registry is walkable.
-        assert!(!registered().is_empty());
-        assert!(slot_of(Abi::Embedded).is_some());
+    fn an_empty_registry_is_legal() {
+        // Nothing registers in this crate's own test binary, and the registry
+        // is still walkable - no placeholder entry has to exist to keep the
+        // section bounded, which is what made the old hand-rolled version
+        // claim an ABI it did not implement.
+        assert!(SYSABIS.is_empty());
+        assert!(slot_of(Abi::Embedded).is_none());
+        assert_eq!(dispatch_at(0, &mut Caller(None)), Dispatch::Passthrough);
     }
 }

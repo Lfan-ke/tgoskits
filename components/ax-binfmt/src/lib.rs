@@ -19,6 +19,7 @@ extern crate alloc;
 
 pub use ax_dispatch::Abi;
 use bitflags::bitflags;
+pub use linkme;
 
 pub mod macho;
 pub mod pe;
@@ -135,27 +136,13 @@ pub trait LoadEnv {
     }
 }
 
-/// One format's entry in the registry.
+/// Every executable format this build linked in.
 ///
-/// As with `ax-dispatch`, the entries live in their own linker section: a
-/// format appears by being linked in and disappears by being dropped from the
-/// dependency list, and nobody keeps a list.
-#[repr(C)]
-pub struct Registration {
-    get: fn() -> &'static dyn ImageFormat,
-}
-
-impl Registration {
-    /// Wrap the accessor a registration hands out.
-    pub const fn new(get: fn() -> &'static dyn ImageFormat) -> Self {
-        Self { get }
-    }
-
-    /// The format this entry registers.
-    pub fn format(&self) -> &'static dyn ImageFormat {
-        (self.get)()
-    }
-}
+/// As with the ABI registry, the linker gathers the entries: a format appears
+/// by being linked in and disappears by being dropped from the dependency
+/// list, and nobody keeps a list.
+#[linkme::distributed_slice]
+pub static BINFMTS: [fn() -> &'static dyn ImageFormat];
 
 /// Register an executable format with the platform.
 ///
@@ -164,52 +151,11 @@ impl Registration {
 macro_rules! register_binfmt {
     ($get:path) => {
         const _: () = {
-            #[used(linker)]
-            #[unsafe(link_section = "binfmt_register")]
-            static REGISTRATION: $crate::Registration = $crate::Registration::new($get);
+            #[$crate::linkme::distributed_slice($crate::BINFMTS)]
+            #[linkme(crate = $crate::linkme)]
+            static REGISTRATION: fn() -> &'static dyn $crate::ImageFormat = $get;
         };
     };
-}
-
-/// A format that claims nothing, registered so the section always exists and
-/// its bounds are always defined, however few formats are linked in.
-struct NoFormat;
-
-impl ImageFormat for NoFormat {
-    fn abi(&self) -> Abi {
-        Abi::Embedded
-    }
-    fn recognizes(&self, _image: &[u8]) -> bool {
-        false
-    }
-    fn load(&self, _req: &LoadRequest<'_>, _env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-        Err(AbiError::UnknownFormat)
-    }
-}
-
-fn no_format() -> &'static dyn ImageFormat {
-    static IT: NoFormat = NoFormat;
-    &IT
-}
-
-register_binfmt!(no_format);
-
-/// Every format this build linked in.
-pub fn registered() -> &'static [Registration] {
-    // Declared as opaque symbols: only their addresses matter, and a function
-    // item keeps the declaration free of a type the linker never sees.
-    unsafe extern "C" {
-        fn __start_binfmt_register();
-        fn __stop_binfmt_register();
-    }
-    // SAFETY: the two symbols bound one array of `Registration`, which the
-    // linker fills from the `binfmt_register` section of every linked crate.
-    unsafe {
-        ax_dispatch::section_entries(
-            __start_binfmt_register as *const () as usize,
-            __stop_binfmt_register as *const () as usize,
-        )
-    }
 }
 
 /// Hand `image` to the first registered format that claims it, the analogue of
@@ -219,9 +165,9 @@ pub fn registered() -> &'static [Registration] {
 ///
 /// [`AbiError::UnknownFormat`] when none does.
 pub fn dispatch_image(image: &[u8]) -> AbiResult<&'static dyn ImageFormat> {
-    registered()
+    BINFMTS
         .iter()
-        .map(Registration::format)
+        .map(|get| get())
         .find(|f| f.recognizes(image))
         .ok_or(AbiError::UnknownFormat)
 }

@@ -28,22 +28,16 @@ SECTIONS {
         __stop_kmod_export = .;
     }
 
-    abi_register : {
-        __start_abi_register = .;
-        KEEP(*(abi_register))
-        __stop_abi_register = .;
+    linkme_SYSABIS : {
+        KEEP(*(linkme_SYSABIS))
     }
 
-    binfmt_register : {
-        __start_binfmt_register = .;
-        KEEP(*(binfmt_register))
-        __stop_binfmt_register = .;
+    linkme_BINFMTS : {
+        KEEP(*(linkme_BINFMTS))
     }
 
-    custom_register : {
-        __start_custom_register = .;
-        KEEP(*(custom_register))
-        __stop_custom_register = .;
+    linkme_CUSTOMS : {
+        KEEP(*(linkme_CUSTOMS))
     }
 
     .kallsyms : ALIGN(4K) {
