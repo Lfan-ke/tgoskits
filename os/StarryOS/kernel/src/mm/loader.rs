@@ -451,9 +451,12 @@ fn load_user_app_with_depth(
             .store(slot as u32 + 1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    Ok((
-        VirtAddr::from_usize(loaded.entry as usize),
-        VirtAddr::from_usize(loaded.stack as usize),
-        auxv,
-    ))
+    // A format that laid out the initial stack itself reports where it left
+    // the pointer; one that did not reports zero and takes the stack the host
+    // prepared, as its top.
+    let sp = match loaded.stack {
+        0 => VirtAddr::from_usize(crate::config::USER_STACK_TOP),
+        at => VirtAddr::from_usize(at as usize),
+    };
+    Ok((VirtAddr::from_usize(loaded.entry as usize), sp, auxv))
 }

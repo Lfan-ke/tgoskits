@@ -70,6 +70,10 @@ impl TrapEnv for TrapCtx<'_> {
         }
     }
 
+    fn stack_pointer(&self) -> usize {
+        self.uctx.sp()
+    }
+
     fn slot(&self) -> Option<usize> {
         self.slot
     }

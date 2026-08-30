@@ -128,13 +128,22 @@ fn read_pointer(host: &dyn Host, at: usize) -> Result<usize, Ntstatus> {
     Ok(u64::from_le_bytes(buf) as usize)
 }
 
+/// The `PAGE_*` protections a caller may ask for.
+const PAGE_READONLY: usize = 0x02;
+const PAGE_READWRITE: usize = 0x04;
+const PAGE_EXECUTE: usize = 0x10;
+const PAGE_EXECUTE_READ: usize = 0x20;
+const PAGE_EXECUTE_READWRITE: usize = 0x40;
+
+/// The `MEM_*` allocation and release kinds.
+const MEM_COMMIT: usize = 0x1000;
+const MEM_RESERVE: usize = 0x2000;
+const MEM_DECOMMIT: usize = 0x4000;
+const MEM_RELEASE: usize = 0x8000;
+const MEM_TOP_DOWN: usize = 0x0010_0000;
+
 /// Translate the `PAGE_*` protection constants a Windows caller passes.
 fn prot_from_page(protect: usize) -> Prot {
-    const PAGE_READONLY: usize = 0x02;
-    const PAGE_READWRITE: usize = 0x04;
-    const PAGE_EXECUTE: usize = 0x10;
-    const PAGE_EXECUTE_READ: usize = 0x20;
-    const PAGE_EXECUTE_READWRITE: usize = 0x40;
     match protect & 0xFF {
         PAGE_READONLY => Prot::READ,
         PAGE_READWRITE => Prot::READ | Prot::WRITE,
@@ -164,7 +173,28 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     let Some(call) = NtSyscall::from_nr(env.nr() as u32) else {
         return Dispatch::Passthrough;
     };
-    let a = |i| env.arg(i);
+    // An NT call takes up to eleven arguments. The first four arrive in the
+    // registers the trap frame exposes; the rest are on the caller's stack,
+    // which is where a Windows kernel reads them from too. A host that cannot
+    // say where the stack is gets a call that needs one refused rather than
+    // served with whatever happened to be in a register.
+    let sp = env.stack_pointer();
+    let a = |i: usize| -> usize {
+        if i < 4 {
+            env.arg(i)
+        } else if sp == 0 {
+            0
+        } else {
+            let mut word = [0u8; size_of::<usize>()];
+            match host
+                .platform()
+                .read_user(sp + (i - 4) * size_of::<usize>(), &mut word)
+            {
+                Ok(_) => usize::from_ne_bytes(word),
+                Err(_) => 0,
+            }
+        }
+    };
     let status = match call {
         NtSyscall::Close => match (descriptor(a(0)), host.files()) {
             (Ok(fd), Some(files)) => files
@@ -173,15 +203,35 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             (Err(status), _) => status,
             (_, None) => Ntstatus::NOT_IMPLEMENTED,
         },
+        // NtReadFile/NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
+        // IoStatusBlock, Buffer, Length, ByteOffset, Key). The completion
+        // arguments describe asynchronous delivery, which nothing here can do,
+        // so a caller asking for it is refused rather than served synchronously
+        // behind its back.
+        NtSyscall::WriteFile | NtSyscall::ReadFile if sp == 0 => Ntstatus::NOT_IMPLEMENTED,
         NtSyscall::WriteFile | NtSyscall::ReadFile => {
+            if a(1) != 0 || a(2) != 0 {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            }
             let (Some(files), Ok(fd)) = (host.files(), descriptor(a(0))) else {
                 return finish(env, Ntstatus::INVALID_HANDLE);
             };
-            let (buffer, length, io_status) = (a(1), a(2), a(3));
-            let transferred = if matches!(call, NtSyscall::WriteFile) {
-                files.write(fd, buffer, length)
+            let (io_status, buffer, length, offset_ptr) = (a(4), a(5), a(6), a(7));
+            // A null ByteOffset means "wherever the file is now"; otherwise it
+            // points at the offset to transfer at.
+            let at = if offset_ptr == 0 {
+                None
             } else {
-                files.read(fd, buffer, length)
+                match read_pointer(host, offset_ptr) {
+                    Ok(offset) => Some(offset as u64),
+                    Err(status) => return finish(env, status),
+                }
+            };
+            let transferred = match (matches!(call, NtSyscall::WriteFile), at) {
+                (true, None) => files.write(fd, buffer, length),
+                (true, Some(at)) => files.pwrite(fd, buffer, length, at),
+                (false, None) => files.read(fd, buffer, length),
+                (false, Some(at)) => files.pread(fd, buffer, length, at),
             };
             match transferred {
                 Ok(n) => write_io_status(host, io_status, Ntstatus::SUCCESS, n as usize),
@@ -192,9 +242,20 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             let Some(mem) = host.mem() else {
                 return finish(env, Ntstatus::NOT_IMPLEMENTED);
             };
-            let (base_ptr, size, protect) = (a(1), a(2), a(3));
+            // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits,
+            // *RegionSize, AllocationType, Protect). Both the base and the size
+            // are in-out: the caller passes what it wants and reads back what
+            // it got.
+            let (base_ptr, size_ptr, alloc_type, protect) = (a(1), a(3), a(4), a(5));
+            if alloc_type & !(MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN) != 0 {
+                return finish(env, Ntstatus::INVALID_PARAMETER);
+            }
             let base = match read_pointer(host, base_ptr) {
                 Ok(base) => base,
+                Err(status) => return finish(env, status),
+            };
+            let size = match read_pointer(host, size_ptr) {
+                Ok(size) => size,
                 Err(status) => return finish(env, status),
             };
             let request = MapRequest {
@@ -220,23 +281,58 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             let Some(mem) = host.mem() else {
                 return finish(env, Ntstatus::NOT_IMPLEMENTED);
             };
-            let base = match read_pointer(host, a(1)) {
+            // NtProtectVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize,
+            // NewProtect, *OldProtect). The old protection is an output the
+            // caller relies on to put things back.
+            let (base_ptr, size_ptr, new_protect, old_ptr) = (a(1), a(2), a(3), a(4));
+            let base = match read_pointer(host, base_ptr) {
                 Ok(base) => base,
                 Err(status) => return finish(env, status),
             };
-            mem.protect(base, a(2), prot_from_page(a(3)))
-                .map_or_else(status_from_errno, |_| Ntstatus::SUCCESS)
+            let size = match read_pointer(host, size_ptr) {
+                Ok(size) => size,
+                Err(status) => return finish(env, status),
+            };
+            match mem.protect(base, size, prot_from_page(new_protect)) {
+                Ok(_) => {
+                    // The port does not report what the protection was, so say
+                    // the most permissive thing that cannot mislead a caller
+                    // into restoring less than it had.
+                    if old_ptr != 0
+                        && let Err(errno) = host
+                            .platform()
+                            .write_user(old_ptr, &PAGE_EXECUTE_READWRITE.to_le_bytes())
+                    {
+                        return finish(env, status_from_errno(errno));
+                    }
+                    Ntstatus::SUCCESS
+                }
+                Err(errno) => status_from_errno(errno),
+            }
         }
         NtSyscall::FreeVirtualMemory => {
             let Some(mem) = host.mem() else {
                 return finish(env, Ntstatus::NOT_IMPLEMENTED);
             };
-            let base = match read_pointer(host, a(1)) {
+            // NtFreeVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize,
+            // FreeType). MEM_RELEASE gives the range back and requires a zero
+            // size; MEM_DECOMMIT only drops the pages, which this unmaps too.
+            let (base_ptr, size_ptr, free_type) = (a(1), a(2), a(3));
+            let base = match read_pointer(host, base_ptr) {
                 Ok(base) => base,
                 Err(status) => return finish(env, status),
             };
-            mem.unmap(base, a(2))
-                .map_or_else(status_from_errno, |_| Ntstatus::SUCCESS)
+            let size = match read_pointer(host, size_ptr) {
+                Ok(size) => size,
+                Err(status) => return finish(env, status),
+            };
+            match free_type {
+                MEM_RELEASE if size != 0 => Ntstatus::INVALID_PARAMETER,
+                MEM_RELEASE | MEM_DECOMMIT => mem
+                    .unmap(base, size)
+                    .map_or_else(status_from_errno, |_| Ntstatus::SUCCESS),
+                _ => Ntstatus::INVALID_PARAMETER,
+            }
         }
         NtSyscall::TerminateProcess => match host.tasks() {
             Some(tasks) => tasks
@@ -285,7 +381,10 @@ mod tests {
     // A trap frame with preset syscall number and arguments.
     struct FakeTrap {
         nr: usize,
-        args: [usize; 9],
+        /// The four the registers carry.
+        args: [usize; 4],
+        /// Where the rest of them are, as a real caller leaves them.
+        sp: usize,
         result: Option<usize>,
     }
     impl TrapEnv for FakeTrap {
@@ -294,6 +393,9 @@ mod tests {
         }
         fn arg(&self, i: usize) -> usize {
             self.args[i]
+        }
+        fn stack_pointer(&self) -> usize {
+            self.sp
         }
         fn set_result(&mut self, value: usize) {
             self.result = Some(value);
@@ -461,10 +563,34 @@ mod tests {
         }
     }
 
-    fn trap(call: NtSyscall, args: [usize; 9]) -> FakeTrap {
+    fn trap(call: NtSyscall, args: [usize; 4]) -> FakeTrap {
         FakeTrap {
             nr: call.nr() as usize,
             args,
+            sp: 0,
+            result: None,
+        }
+    }
+
+    /// The same, with the arguments past the fourth left on a stack the host
+    /// can read, which is where a caller puts them.
+    fn trap_with_stack(
+        call: NtSyscall,
+        args: [usize; 4],
+        stack: &[usize],
+        host: &MockHost,
+    ) -> FakeTrap {
+        let sp = 0xC0;
+        let mut mem = host.mem.borrow_mut();
+        for (i, word) in stack.iter().enumerate() {
+            let at = sp + i * size_of::<usize>();
+            mem[at..at + size_of::<usize>()].copy_from_slice(&word.to_ne_bytes());
+        }
+        drop(mem);
+        FakeTrap {
+            nr: call.nr() as usize,
+            args,
+            sp,
             result: None,
         }
     }
@@ -475,8 +601,14 @@ mod tests {
             mem: RefCell::new(vec![0u8; 0x100]),
             ..MockHost::default()
         };
-        // NtWriteFile(handle 4 = descriptor 0, buffer 0x40, 8 bytes, iosb 0x80).
-        let mut env = trap(NtSyscall::WriteFile, [4, 0x40, 8, 0x80, 0, 0, 0, 0, 0]);
+        // NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext | IoStatusBlock,
+        // Buffer, Length, ByteOffset, Key). Handle 4 is descriptor 0.
+        let mut env = trap_with_stack(
+            NtSyscall::WriteFile,
+            [4, 0, 0, 0],
+            &[0x80, 0x40, 8, 0, 0],
+            &host,
+        );
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
         assert_eq!(*host.wrote.borrow(), Some((0, 0x40, 8)));
@@ -490,11 +622,11 @@ mod tests {
     fn close_takes_the_descriptor_the_handle_names() {
         let host = MockHost::default();
         // Handle 8 is the second slot, which is descriptor 1.
-        let mut env = trap(NtSyscall::Close, [8, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut env = trap(NtSyscall::Close, [8, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(*host.closed.borrow(), Some(1));
         // A misaligned handle is not a descriptor.
-        let mut bad = trap(NtSyscall::Close, [3, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut bad = trap(NtSyscall::Close, [3, 0, 0, 0]);
         assert_eq!(dispatch(&mut bad, &host), Dispatch::Handled);
         assert_eq!(bad.result, Some(Ntstatus::INVALID_HANDLE.0 as usize));
     }
@@ -505,10 +637,15 @@ mod tests {
             mem: RefCell::new(vec![0u8; 0x100]),
             ..MockHost::default()
         };
-        // *base = 0 asks the host to choose; PAGE_READWRITE is 0x04.
-        let mut env = trap(
+        // NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits,
+        // *RegionSize | AllocationType, Protect). *base = 0 asks the host to
+        // choose; the size is read through its own pointer.
+        host.mem.borrow_mut()[0x20..0x28].copy_from_slice(&0x2000usize.to_ne_bytes());
+        let mut env = trap_with_stack(
             NtSyscall::AllocateVirtualMemory,
-            [0, 0x10, 0x2000, 0x04, 0, 0, 0, 0, 0],
+            [0, 0x10, 0, 0x20],
+            &[MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE],
+            &host,
         );
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
@@ -529,7 +666,7 @@ mod tests {
     fn a_call_without_a_port_stays_with_the_caller() {
         let host = MockHost::default();
         // Opening by name needs a capability this platform has no port for.
-        let mut env = trap(NtSyscall::CreateFile, [0; 9]);
+        let mut env = trap(NtSyscall::CreateFile, [0; 4]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Passthrough);
         assert_eq!(env.result, None);
     }

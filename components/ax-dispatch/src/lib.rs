@@ -49,6 +49,14 @@ pub trait TrapEnv {
     fn nr(&self) -> usize;
     /// Positional syscall argument `i` (0-based).
     fn arg(&self, i: usize) -> usize;
+    /// The trapping task's stack pointer, for an ABI whose calls take more
+    /// arguments than the registers carry. Windows' NT calls take up to
+    /// eleven, and everything past the fourth is on the stack; a host that
+    /// cannot say where the stack is reports zero and such a call is refused.
+    fn stack_pointer(&self) -> usize {
+        0
+    }
+
     /// Where in the registry the implementation serving this task sits, when
     /// the host resolved it in advance. A host that did not has the call
     /// offered to every linked implementation in turn instead.
