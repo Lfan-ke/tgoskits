@@ -123,6 +123,7 @@ mod tests {
     struct RecordingEnv {
         maps: Vec<(u64, Prot, Vec<u8>)>,
         from_file: Vec<(u64, u64)>,
+        reset: bool,
         sizes: Vec<u64>,
     }
 
@@ -160,6 +161,10 @@ mod tests {
 
         fn read_image(&mut self, _at: u64, _out: &mut [u8]) -> AbiResult<usize> {
             Ok(0)
+        }
+        fn reset(&mut self) -> AbiResult<()> {
+            self.reset = true;
+            Ok(())
         }
     }
 
@@ -377,6 +382,10 @@ impl ImageFormat for WindowsAbi {
             // Only PE32+ is in scope; a 32-bit image is a distinct ABI.
             return Err(AbiError::Unsupported);
         }
+        // The image is this package's from here, so the space it goes into is
+        // torn down and prepared. Doing it after the header checks is what
+        // lets a malformed image be refused without destroying the caller's.
+        env.reset()?;
         // Honor the image's preferred base, so a well-formed image needs no
         // relocation; relocation is exercised only when the base must change.
         let base = pe.image_base;

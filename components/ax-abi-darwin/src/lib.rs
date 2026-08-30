@@ -58,6 +58,7 @@ mod tests {
     struct RecordingEnv {
         maps: Vec<(u64, Prot, usize)>,
         from_file: Vec<(u64, u64)>,
+        reset: bool,
     }
 
     impl LoadEnv for RecordingEnv {
@@ -87,6 +88,10 @@ mod tests {
 
         fn read_image(&mut self, _at: u64, _out: &mut [u8]) -> AbiResult<usize> {
             Ok(0)
+        }
+        fn reset(&mut self) -> AbiResult<()> {
+            self.reset = true;
+            Ok(())
         }
     }
 
@@ -253,6 +258,11 @@ impl ImageFormat for DarwinAbi {
         let macho = macho::parse(req.image).ok_or(AbiError::MalformedImage)?;
         // No LC_MAIN means a legacy LC_UNIXTHREAD entry, which is out of scope.
         let entry = macho.entry(req.image).ok_or(AbiError::Unsupported)?;
+
+        // The image is this package's from here, so the space it goes into is
+        // torn down and prepared. Doing it after the header checks is what
+        // lets a malformed image be refused without destroying the caller's.
+        env.reset()?;
 
         for seg in macho.segments(req.image) {
             // __PAGEZERO and other no-access reservations are address-space
