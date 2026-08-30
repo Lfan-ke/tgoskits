@@ -19,10 +19,15 @@ task = ["ax-abi-port/task"]
 signal = ["ax-abi-port/signal"]
 time = ["ax-abi-port/time"]
 random = ["ax-abi-port/random"]
+# ELF as a format this domain owns, rather than one the kernel parses itself.
+elf = ["dep:kernel-elf-parser", "dep:xmas-elf", "dep:ax-binfmt"]
 system = ["ax-abi-port/system"]
 creds = ["ax-abi-port/creds"]
 
 [dependencies]
+kernel-elf-parser = { version = "0.3.4", optional = true }
+xmas-elf = { version = "0.9", optional = true }
+ax-binfmt = { workspace = true, optional = true }
 ax-dispatch = { workspace = true }
 ax-abi-port = { workspace = true }
 ax-crate-interface = { workspace = true }

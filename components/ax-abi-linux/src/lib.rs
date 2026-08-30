@@ -17,8 +17,11 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(used_with_arg)]
 
-#[cfg(feature = "fs")]
+#[cfg(any(feature = "fs", feature = "elf"))]
 extern crate alloc;
+
+#[cfg(feature = "elf")]
+pub mod elf;
 
 #[cfg(not(any(
     feature = "fs",

@@ -840,6 +840,32 @@ impl ax_binfmt::LoadEnv for ExecSpace<'_> {
         self.uspace.clear();
         Ok(())
     }
+
+    fn write(&mut self, va: u64, bytes: &[u8]) -> ax_binfmt::AbiResult<()> {
+        self.uspace
+            .write(VirtAddr::from_usize(va as usize), bytes)
+            .map_err(|_| ax_binfmt::AbiError::MapFailed)
+    }
+
+    fn image_len(&self) -> u64 {
+        self.image.location().len().unwrap_or(0)
+    }
+
+    fn mapped_end(&self) -> u64 {
+        self.uspace
+            .areas()
+            .map(|area| area.end().as_usize() as u64)
+            .max()
+            .unwrap_or(crate::config::USER_SPACE_BASE as u64)
+    }
+
+    fn stack_top(&self) -> u64 {
+        crate::config::USER_STACK_TOP as u64
+    }
+
+    fn cpu_capabilities(&self) -> u64 {
+        ax_runtime::hal::cpu::cap::elf_hwcap() as u64
+    }
 }
 
 /// The mapping flags a neutral protection asks for.
@@ -947,6 +973,7 @@ fn load_user_app_with_depth(
                 .load(
                     &ax_binfmt::LoadRequest {
                         image: &data,
+                        load_base: crate::config::USER_SPACE_BASE as u64,
                         args: &args,
                         envs: &envs,
                     },

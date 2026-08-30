@@ -136,6 +136,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    load_base: 0,
                     args: &[],
                     envs: &[],
                 },
@@ -198,6 +199,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &b,
+                    load_base: 0,
                     args: &[],
                     envs: &[],
                 },
@@ -227,6 +229,7 @@ mod tests {
             DarwinAbi.load(
                 &LoadRequest {
                     image: b"\x7fELF",
+                    load_base: 0,
                     args: &[],
                     envs: &[]
                 },

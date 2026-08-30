@@ -230,6 +230,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    load_base: 0,
                     args: &[],
                     envs: &[],
                 },
@@ -322,6 +323,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    load_base: 0,
                     args: &[],
                     envs: &[],
                 },
@@ -349,6 +351,7 @@ mod tests {
             WindowsAbi.load(
                 &LoadRequest {
                     image: b"not pe",
+                    load_base: 0,
                     args: &[],
                     envs: &[]
                 },
