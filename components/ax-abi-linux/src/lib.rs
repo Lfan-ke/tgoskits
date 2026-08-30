@@ -633,21 +633,28 @@ fn sys_pwrite64(
 #[cfg(feature = "mm")]
 fn sys_madvise(mem: &dyn ops::Mem, addr: usize, len: usize, advice: i32) -> SysResult {
     use linux_raw_sys::general::*;
-    match advice as u32 {
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED | MADV_FREE
-        | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
+    // Linux's own numbering, translated to what it means. An advice this
+    // kernel has no action for is still a valid thing to ask for.
+    let meaning = match advice as u32 {
+        MADV_NORMAL => ops::Advice::Normal,
+        MADV_RANDOM => ops::Advice::Random,
+        MADV_SEQUENTIAL => ops::Advice::Sequential,
+        MADV_WILLNEED => ops::Advice::WillNeed,
+        MADV_DONTNEED | MADV_DONTNEED_LOCKED => ops::Advice::DontNeed,
+        MADV_FREE => ops::Advice::Free,
+        MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
         | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK
         | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE
-        | MADV_DONTNEED_LOCKED | MADV_COLLAPSE | MADV_HWPOISON | MADV_SOFT_OFFLINE => {}
+        | MADV_COLLAPSE | MADV_HWPOISON | MADV_SOFT_OFFLINE => ops::Advice::Ignored,
         _ => return Err(ops::EINVAL),
-    }
+    };
     if !addr.is_multiple_of(PAGE_SIZE) {
         return Err(ops::EINVAL);
     }
     if len == 0 {
         return Ok(0);
     }
-    mem.advise(addr, len, advice)
+    mem.advise(addr, len, meaning)
 }
 
 /// Translate the ABI's `PROT_*` bits, refusing an unknown one.
@@ -1169,7 +1176,7 @@ mod tests {
         fn protect(&self, _a: usize, _l: usize, _p: ops::Prot) -> SysResult {
             Ok(0)
         }
-        fn advise(&self, _a: usize, _l: usize, _adv: i32) -> SysResult {
+        fn advise(&self, _addr: usize, _len: usize, _advice: ops::Advice) -> SysResult {
             Ok(0)
         }
         fn writeback(&self, _a: usize, _l: usize) -> SysResult {
@@ -1478,7 +1485,7 @@ mod tests {
         fn protect(&self, _a: usize, _l: usize, prot: ops::Prot) -> SysResult {
             Ok(prot.bits() as isize) // echo so a test sees what reached the host
         }
-        fn advise(&self, _a: usize, _l: usize, advice: i32) -> SysResult {
+        fn advise(&self, _addr: usize, _len: usize, advice: ops::Advice) -> SysResult {
             Ok(advice as isize) // echo so the test sees the delegated advice
         }
         fn writeback(&self, _a: usize, len: usize) -> SysResult {

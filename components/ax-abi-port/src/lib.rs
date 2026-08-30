@@ -79,6 +79,29 @@ pub trait Tasks: Sync {
     fn exit_group(&self, code: i32) -> SysResult;
 }
 
+/// What a program says it will do with a range, so the host can act on it.
+///
+/// The numbers each ABI uses for these disagree - Darwin's `MADV_FREE` is 5
+/// where Linux's is 8 - so the advice crosses the port as what it means rather
+/// than as the number one of them writes it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Advice {
+    /// No expectation; undo any earlier advice.
+    Normal,
+    /// Access will be random, so reading ahead is wasted.
+    Random,
+    /// Access will be sequential, so reading ahead pays.
+    Sequential,
+    /// The range will be needed soon.
+    WillNeed,
+    /// The range is not needed; a later read may see zeroes or the file again.
+    DontNeed,
+    /// The range's contents may be discarded, and the pages reclaimed.
+    Free,
+    /// Advice the host has no action for, which is not an error to give.
+    Ignored,
+}
+
 /// One run of user memory. An ABI decodes its own vector layout and names the
 /// runs it found this way, so the host never learns what an `iovec` looks like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,7 +235,7 @@ pub trait Mem: Sync {
     /// Apply `advice` to `[addr, addr+len)`. The caller has already checked the
     /// advice is one its ABI defines; whether this host acts on it is its own
     /// business.
-    fn advise(&self, addr: usize, len: usize, advice: i32) -> SysResult;
+    fn advise(&self, addr: usize, len: usize, advice: Advice) -> SysResult;
     /// Write back the file-backed parts of `[addr, addr+len)`.
     fn writeback(&self, addr: usize, len: usize) -> SysResult;
 }
