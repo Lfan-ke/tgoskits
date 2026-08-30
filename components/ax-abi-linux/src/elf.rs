@@ -85,6 +85,13 @@ impl ImageFormat for ElfFormat {
         auxv.push(AuxEntry::new(AuxType::EGID, 0));
         auxv.push(AuxEntry::new(AuxType::SECURE, 0));
 
+        // The host republishes these; Linux exposes them under procfs.
+        let pairs: Vec<(usize, usize)> = auxv
+            .iter()
+            .map(|e| (e.get_type() as usize, e.value()))
+            .collect();
+        env.record_metadata(&pairs);
+
         let stack = place_stack(req.args, req.envs, &auxv, env)?;
         Ok(Loaded {
             entry: entry as u64,

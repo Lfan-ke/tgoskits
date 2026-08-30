@@ -179,7 +179,7 @@ ax-abi-port = { workspace = true, features = [
     "system",
     "creds",
 ] }
-ax-abi = { workspace = true, features = ["linux", "auto-dispatch"] }
+ax-abi = { workspace = true, features = ["linux", "linux-elf", "auto-dispatch"] }
 ax-cgroup = { workspace = true }
 axfs-ng-vfs = { workspace = true }
 rdif-block = { workspace = true }

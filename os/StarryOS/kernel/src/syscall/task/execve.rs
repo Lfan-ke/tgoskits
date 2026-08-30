@@ -15,7 +15,6 @@ use core::{
 use ax_runtime::hal::cpu::uspace::UserContext;
 use ax_task::{current, future::block_on, yield_now};
 use axfs_ng_vfs::Location;
-use kernel_elf_parser::AuxType;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
 use starry_vm::{VmError, vm_load_until_nul};
 
@@ -363,7 +362,8 @@ fn do_execve(
     *proc_data.cmdline.write() = Arc::new(args);
     *proc_data.envp.write() = Arc::new(envs);
     let auxv_len = auxv.len();
-    let has_ldso = auxv.iter().any(|e| e.get_type() == AuxType::BASE);
+    // AT_BASE, which the format sets when an interpreter was mapped.
+    let has_ldso = auxv.iter().any(|(key, _)| *key == 7);
     *proc_data.auxv.write() = auxv;
 
     proc_data.set_heap_top(USER_HEAP_BASE);

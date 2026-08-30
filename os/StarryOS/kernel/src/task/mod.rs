@@ -30,7 +30,6 @@ use ax_runtime::hal::{cpu::uspace::UserContext, time::TimeValue};
 use ax_task::{TaskExt, TaskInner};
 use axpoll::{IoEvents, PollSet};
 use extern_trait::extern_trait;
-use kernel_elf_parser::AuxEntry;
 use scope_local::{ActiveScope, Scope};
 use starry_signal::{
     SignalInfo, SignalSet, Signo,
@@ -851,7 +850,7 @@ pub struct ProcessImage {
     pub exe_path: String,
     pub cmdline: Arc<Vec<String>>,
     pub envp: Arc<Vec<String>>,
-    pub auxv: Vec<AuxEntry>,
+    pub auxv: Vec<(usize, usize)>,
     pub root_path: String,
     pub cwd_path: String,
 }
@@ -861,7 +860,7 @@ impl ProcessImage {
         exe_path: String,
         cmdline: Arc<Vec<String>>,
         envp: Arc<Vec<String>>,
-        auxv: Vec<AuxEntry>,
+        auxv: Vec<(usize, usize)>,
         root_path: String,
         cwd_path: String,
     ) -> Self {
@@ -899,8 +898,10 @@ pub struct ProcessData {
     pub cmdline: RwLock<Arc<Vec<String>>>,
     /// The environment variables, exported via `/proc/[pid]/environ`.
     pub envp: RwLock<Arc<Vec<String>>>,
-    /// Auxiliary vector entries exported via `/proc/[pid]/auxv`.
-    pub auxv: RwLock<Vec<AuxEntry>>,
+    /// Key/value metadata the format that loaded this image asked to have
+    /// kept, exported via `/proc/[pid]/auxv`. The kernel republishes them and
+    /// does not interpret them.
+    pub auxv: RwLock<Vec<(usize, usize)>>,
     /// Where in the dispatch registry this process's ABI sits, plus one so
     /// zero means unresolved. Settled when the image is loaded, so servicing a
     /// trap is an index into the registry rather than a search through it.
