@@ -43,25 +43,26 @@ impl ImageFormat for ElfFormat {
         // caller's address space alone, which is what lets execve report
         // ENOEXEC and carry on.
         let head = read_headers(env)?;
-        let headers = build_headers(&head, env)?;
-
-        env.reset()?;
-
+        let table = read_ph_table(&head, env)?;
+        let headers = parse_headers(&head, &table)?;
         let elf = ELFParser::new(&headers, req.load_base as usize)
             .map_err(|_| AbiError::MalformedImage)?;
+
+        env.reset()?;
         map_segments(&elf, env)?;
         relocate_if_pie(&elf, req.load_base, env)?;
 
         // A dynamic image names the interpreter that should run it. Both stay
         // mapped: this one's segments are placed, then the interpreter's, at a
-        // base clear of everything already there.
-        let interpreter = interpreter_path(&elf, env)?;
-        let ldso_base = match interpreter {
+        // base clear of everything already there. The interpreter's buffers
+        // live only as long as reading it takes.
+        let ldso = match interpreter_path(&elf, env)? {
             Some(path) => {
                 env.interpret(&path)?;
                 let head = read_headers(env)?;
-                let headers = build_headers(&head, env)?;
-                let base = (env.mapped_end() as usize + 0x100000 - 1) & !(0x100000 - 1);
+                let table = read_ph_table(&head, env)?;
+                let headers = parse_headers(&head, &table)?;
+                let base = (env.mapped_end() as usize).next_multiple_of(0x100000);
                 let ldso = ELFParser::new(&headers, base).map_err(|_| AbiError::MalformedImage)?;
                 map_segments(&ldso, env)?;
                 relocate_if_pie(&ldso, base as u64, env)?;
@@ -70,9 +71,9 @@ impl ImageFormat for ElfFormat {
             None => None,
         };
 
-        let entry = ldso_base.map_or_else(|| elf.entry(), |(entry, _)| entry);
+        let entry = ldso.map_or_else(|| elf.entry(), |(entry, _)| entry);
         let mut auxv = elf
-            .aux_vector(PAGE_SIZE, ldso_base.map(|(_, base)| base))
+            .aux_vector(PAGE_SIZE, ldso.map(|(_, base)| base))
             .collect::<Vec<_>>();
         auxv.push(AuxEntry::new(
             AuxType::HWCAP,
@@ -107,23 +108,22 @@ fn read_headers(env: &mut dyn LoadEnv) -> AbiResult<Vec<u8>> {
     Ok(head)
 }
 
-/// Build the headers, reading the program-header table separately when it lies
-/// past the head window.
-fn build_headers(head: &[u8], env: &mut dyn LoadEnv) -> AbiResult<ELFHeaders<'static>> {
+/// Read the program-header table, which may lie past the head window.
+fn read_ph_table(head: &[u8], env: &mut dyn LoadEnv) -> AbiResult<Vec<u8>> {
     let builder = ELFHeadersBuilder::new(head).map_err(|_| AbiError::MalformedImage)?;
     let range = builder.ph_range();
-    let table = if range.end as usize <= head.len() {
-        head[range.start as usize..range.end as usize].to_vec()
-    } else {
-        let mut buf = vec![0u8; (range.end - range.start) as usize];
-        env.read_image(range.start, &mut buf)?;
-        buf
-    };
-    // The parser borrows both buffers for as long as it is used; leaking them
-    // for the duration of one exec keeps the borrow simple and the amount is
-    // bounded by the header window.
-    let head: &'static [u8] = Vec::leak(head.to_vec());
-    let table: &'static [u8] = Vec::leak(table);
+    if range.end as usize <= head.len() {
+        return Ok(head[range.start as usize..range.end as usize].to_vec());
+    }
+    let mut table = vec![0u8; (range.end - range.start) as usize];
+    env.read_image(range.start, &mut table)?;
+    Ok(table)
+}
+
+/// Parse the headers out of buffers the caller keeps alive. The parser borrows
+/// them, so they outlive it by living in the caller's frame rather than by
+/// being leaked.
+fn parse_headers<'a>(head: &'a [u8], table: &'a [u8]) -> AbiResult<ELFHeaders<'a>> {
     ELFHeadersBuilder::new(head)
         .map_err(|_| AbiError::MalformedImage)?
         .build(table)
@@ -412,5 +412,176 @@ mod riscv {
             .filter(|s| s.get_type() == Ok(xmas_elf::program::Type::Load))
             .find(|s| (s.virtual_addr..s.virtual_addr + s.file_size).contains(&vaddr))
             .map(|s| (s.offset + (vaddr - s.virtual_addr)) as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host with no demand paging: it records what was asked for, and serves
+    /// reads out of the image it was handed.
+    #[derive(Default)]
+    struct Recorder {
+        image: Vec<u8>,
+        /// (va, len, prot, file offset, file end)
+        mapped: Vec<(u64, u64, Prot, u64, u64)>,
+        written: Vec<(u64, usize)>,
+        end: u64,
+        interpreted: Option<String>,
+        reset: bool,
+    }
+
+    impl LoadEnv for Recorder {
+        fn map_region(
+            &mut self,
+            _va: u64,
+            _len: u64,
+            _p: Prot,
+            _i: Option<&[u8]>,
+        ) -> AbiResult<()> {
+            Ok(())
+        }
+        fn map_image(
+            &mut self,
+            va: u64,
+            len: u64,
+            prot: Prot,
+            offset: u64,
+            file_end: u64,
+        ) -> AbiResult<()> {
+            self.mapped.push((va, len, prot, offset, file_end));
+            self.end = self.end.max(va + len);
+            Ok(())
+        }
+        fn read_image(&mut self, at: u64, out: &mut [u8]) -> AbiResult<usize> {
+            let at = at as usize;
+            let n = out.len().min(self.image.len().saturating_sub(at));
+            out[..n].copy_from_slice(&self.image[at..at + n]);
+            Ok(n)
+        }
+        fn interpret(&mut self, path: &str) -> AbiResult<()> {
+            self.interpreted = Some(String::from(path));
+            Ok(())
+        }
+        fn reset(&mut self) -> AbiResult<()> {
+            self.reset = true;
+            Ok(())
+        }
+        fn write(&mut self, va: u64, bytes: &[u8]) -> AbiResult<()> {
+            self.written.push((va, bytes.len()));
+            Ok(())
+        }
+        fn image_len(&self) -> u64 {
+            self.image.len() as u64
+        }
+        fn mapped_end(&self) -> u64 {
+            self.end
+        }
+        fn stack_top(&self) -> u64 {
+            0x4000_0000
+        }
+        fn cpu_capabilities(&self) -> u64 {
+            0xcafe
+        }
+    }
+
+    const PT_LOAD: u32 = 1;
+    const PF_R: u32 = 4;
+    const PF_X: u32 = 1;
+
+    /// A 64-bit little-endian ELF executable with one read-execute PT_LOAD
+    /// whose memory size exceeds its file size, so the zero-fill tail shows up.
+    fn synth(entry: u64, filesz: u64, memsz: u64) -> Vec<u8> {
+        let ph_off = 64u64;
+        let mut b = vec![0u8; 0x2000];
+        b[..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2; // 64-bit
+        b[5] = 1; // little endian
+        b[6] = 1; // version
+        b[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // x86-64
+        b[20..24].copy_from_slice(&1u32.to_le_bytes());
+        b[24..32].copy_from_slice(&entry.to_le_bytes());
+        b[32..40].copy_from_slice(&ph_off.to_le_bytes());
+        b[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // phnum
+
+        let p = ph_off as usize;
+        b[p..p + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        b[p + 4..p + 8].copy_from_slice(&(PF_R | PF_X).to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes()); // offset
+        b[p + 16..p + 24].copy_from_slice(&0x1000u64.to_le_bytes()); // vaddr
+        b[p + 24..p + 32].copy_from_slice(&0x1000u64.to_le_bytes()); // paddr
+        b[p + 32..p + 40].copy_from_slice(&filesz.to_le_bytes());
+        b[p + 40..p + 48].copy_from_slice(&memsz.to_le_bytes());
+        b[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // align
+        b
+    }
+
+    #[test]
+    fn a_load_segment_is_mapped_from_the_file_not_copied() {
+        let mut env = Recorder {
+            image: synth(0x1000, 0x800, 0x2000),
+            ..Recorder::default()
+        };
+        let loaded = ElfFormat
+            .load(
+                &LoadRequest {
+                    image: &env.image.clone(),
+                    load_base: 0,
+                    args: &["/bin/x"],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .expect("load");
+
+        assert_eq!(loaded.entry, 0x1000);
+        // One segment, occupying its memory size, with only the file portion
+        // coming from the file - the rest is the host's zero fill.
+        assert_eq!(env.mapped.len(), 1);
+        let (va, len, prot, offset, file_end) = env.mapped[0];
+        assert_eq!(va, 0x1000);
+        assert_eq!(len, 0x2000);
+        assert_eq!(prot, Prot::READ | Prot::EXEC);
+        assert_eq!((offset, file_end), (0, 0x800));
+        // Nothing was torn down before the headers parsed, and the stack was
+        // written below its top.
+        assert!(env.reset);
+        assert_eq!(env.written.len(), 1);
+        assert!(loaded.stack < env.stack_top() && loaded.stack.is_multiple_of(16));
+    }
+
+    #[test]
+    fn a_segment_whose_offset_disagrees_with_its_address_is_refused() {
+        // ELF requires vaddr and file offset to agree modulo the page size.
+        let mut image = synth(0x1000, 0x800, 0x1000);
+        let p = 64 + 8;
+        image[p..p + 8].copy_from_slice(&1u64.to_le_bytes());
+        let mut env = Recorder {
+            image: image.clone(),
+            ..Recorder::default()
+        };
+        let err = ElfFormat
+            .load(
+                &LoadRequest {
+                    image: &image,
+                    load_base: 0,
+                    args: &["/bin/x"],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .unwrap_err();
+        assert_eq!(err, AbiError::MalformedImage);
+    }
+
+    #[test]
+    fn a_non_elf_image_is_not_claimed() {
+        assert!(!ElfFormat.recognizes(b"MZ\0\0"));
+        assert!(ElfFormat.recognizes(b"\x7fELF"));
+        assert_eq!(ElfFormat.abi(), Abi::Linux);
     }
 }
