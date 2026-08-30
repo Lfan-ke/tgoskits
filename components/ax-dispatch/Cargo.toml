@@ -10,4 +10,5 @@ categories = ["no-std", "os"]
 license.workspace = true
 
 [dependencies]
+linkme = { workspace = true }
 ax-crate-interface = { workspace = true }
