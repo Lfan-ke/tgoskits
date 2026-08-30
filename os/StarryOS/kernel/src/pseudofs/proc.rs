@@ -26,9 +26,7 @@ use ax_runtime::hal::{
 };
 use ax_task::{AxCpuMask, AxTaskRef, TaskState, WeakAxTaskRef, current};
 use axfs_ng_vfs::{DeviceId, Filesystem, NodePermission, NodeType, VfsError, VfsResult};
-use kernel_elf_parser::{AuxEntry, AuxType};
 use ksym::KallsymsMapped;
-use zerocopy::IntoBytes;
 
 use crate::{
     file::{FD_TABLE, PidFd},
@@ -1323,10 +1321,13 @@ fn render_thread_stat(
 
 fn render_thread_auxv(task: &AxTaskRef) -> Vec<u8> {
     let mut entries = task.as_thread().proc_data.auxv.read().clone();
-    entries.push(AuxEntry::new(AuxType::NULL, 0));
-    let mut bytes = Vec::with_capacity(entries.len() * size_of::<AuxEntry>());
-    for entry in entries {
-        bytes.extend_from_slice(entry.as_bytes());
+    // The terminator the reader stops at; the pairs themselves came from the
+    // format that loaded the image.
+    entries.push((0, 0));
+    let mut bytes = Vec::with_capacity(entries.len() * 2 * size_of::<usize>());
+    for (key, value) in entries {
+        bytes.extend_from_slice(&key.to_ne_bytes());
+        bytes.extend_from_slice(&value.to_ne_bytes());
     }
     bytes
 }

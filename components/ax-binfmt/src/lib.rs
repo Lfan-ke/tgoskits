@@ -133,7 +133,14 @@ pub trait LoadEnv {
         Err(AbiError::Unsupported)
     }
 
-    /// Discard what is mapped before laying out a new image, as an exec does.
+    /// Record key/value metadata the format wants kept, for a host that
+    /// republishes it. Linux exposes the auxiliary vector this way, under
+    /// procfs; a host with nowhere to put it ignores the call.
+    fn record_metadata(&mut self, _pairs: &[(usize, usize)]) {}
+
+    /// Discard what is mapped and put back whatever the host always maps -
+    /// its own fixed mappings, the stack, the heap - before a format lays out
+    /// a new image, as an exec does.
     fn reset(&mut self) -> AbiResult<()> {
         Err(AbiError::Unsupported)
     }

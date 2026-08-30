@@ -30,6 +30,8 @@ default = ["win", "mac", "auto-dispatch"]
 
 # Select which syscall personalities are compiled in (one or more).
 linux = ["dep:ax-abi-linux"]
+# ELF as a format the Linux package owns, rather than one the kernel parses.
+linux-elf = ["linux", "ax-abi-linux/elf"]
 win = ["dep:ax-abi-windows"]
 mac = ["dep:ax-abi-darwin"]
 # The embedded vector-table domain. An integrator supplies its own table, so it
