@@ -38,6 +38,9 @@ impl Ntstatus {
     /// `STATUS_NO_YIELD_PERFORMED`, which a yield reports when nothing else
     /// was waiting. It is a success code, not a failure.
     pub const NO_YIELD_PERFORMED: Ntstatus = Ntstatus(0x4000_0024);
+    /// `STATUS_INFO_LENGTH_MISMATCH`, for a buffer too small for the class
+    /// that was asked for.
+    pub const INFO_LENGTH_MISMATCH: Ntstatus = Ntstatus(0xC000_0004);
     /// `STATUS_INVALID_PARAMETER`.
     pub const INVALID_PARAMETER: Ntstatus = Ntstatus(0xC000_000D);
     /// `STATUS_ACCESS_VIOLATION`.
@@ -140,6 +143,12 @@ const PAGE_READWRITE: usize = 0x04;
 const PAGE_EXECUTE: usize = 0x10;
 const PAGE_EXECUTE_READ: usize = 0x20;
 const PAGE_EXECUTE_READWRITE: usize = 0x40;
+
+/// `ProcessBasicInformation`, the only information class answered here.
+const PROCESS_BASIC_INFORMATION: usize = 0;
+/// How long `PROCESS_BASIC_INFORMATION` is: exit status, PEB pointer, affinity
+/// mask, base priority, then the process id and its parent's.
+const PROCESS_BASIC_INFORMATION_LEN: usize = 48;
 
 /// The `MEM_*` allocation and release kinds.
 const MEM_COMMIT: usize = 0x1000;
@@ -355,9 +364,41 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                 .map_or_else(status_from_errno, |_| Ntstatus::SUCCESS),
             None => Ntstatus::NOT_IMPLEMENTED,
         },
-        // Opening by name needs a path capability, and the process-information
-        // classes need process metadata; neither port exists yet, so these stay
-        // with the caller rather than answering with something invented.
+        // NtQueryInformationProcess(ProcessHandle, InformationClass,
+        // Information, InformationLength, ReturnLength). Only the basic class
+        // is answered; the rest describe things this package does not have.
+        NtSyscall::QueryInformationProcess if a(1) == PROCESS_BASIC_INFORMATION => {
+            let Some(tasks) = host.tasks() else {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            };
+            let (buffer, length, returned) = (a(2), a(3), a(4));
+            if length < PROCESS_BASIC_INFORMATION_LEN {
+                return finish(env, Ntstatus::INFO_LENGTH_MISMATCH);
+            }
+            let (Ok(pid), Ok(parent)) = (tasks.getpid(), tasks.getppid()) else {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            };
+            // The identity is the host's; this only lays it out the way a
+            // Windows program reads it.
+            let mut block = [0u8; PROCESS_BASIC_INFORMATION_LEN];
+            block[32..40].copy_from_slice(&(pid as u64).to_le_bytes());
+            block[40..48].copy_from_slice(&(parent as u64).to_le_bytes());
+            if let Err(errno) = host.platform().write_user(buffer, &block) {
+                return finish(env, status_from_errno(errno));
+            }
+            if returned != 0
+                && let Err(errno) = host.platform().write_user(
+                    returned,
+                    &(PROCESS_BASIC_INFORMATION_LEN as u32).to_le_bytes(),
+                )
+            {
+                return finish(env, status_from_errno(errno));
+            }
+            Ntstatus::SUCCESS
+        }
+        // Opening by name needs a path capability, and the remaining
+        // information classes describe things this package does not have; both
+        // stay with the caller rather than answering with something invented.
         NtSyscall::CreateFile | NtSyscall::QueryInformationProcess => {
             return Dispatch::Passthrough;
         }

@@ -63,6 +63,13 @@ pub trait Platform: Sync {
 pub trait Tasks: Sync {
     /// The caller's process id. A host whose namespace cannot see the caller
     /// says so, so the port reports a result rather than a bare number.
+    ///
+    /// The identity is the host's and there is one of it, however many ABIs
+    /// are linked in: the host creates processes, schedules them and reaps
+    /// them, so it is the host that names them. An ABI presents that name the
+    /// way its programs expect to read it - the same division as descriptors,
+    /// which Windows presents as handles. A second allocator per ABI would be
+    /// the thing that made two processes share a name.
     fn getpid(&self) -> SysResult;
     /// The parent's process id, or the host's error when there is no parent
     /// it can name.

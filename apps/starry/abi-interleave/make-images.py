@@ -20,6 +20,7 @@ PE_BASE = 0x1_4000_0000
 NT_WRITE_FILE = 1
 NT_TERMINATE_PROCESS = 7
 NT_YIELD_EXECUTION = 9
+NT_QUERY_INFORMATION_PROCESS = 8
 STDOUT_HANDLE = 8
 
 
@@ -36,7 +37,22 @@ def nt_trap(number):
 
 def build_pe():
     code = bytearray()
-    code += b"\x48\x83\xec\x40"                                   # sub rsp, 0x40
+    # The imm8 form sign-extends, so 0x80 would be -128 and move the stack the
+    # wrong way; this is the imm32 form.
+    code += b"\x48\x81\xec" + struct.pack("<I", 0x80)            # sub rsp, 0x80
+    # NtQueryInformationProcess(handle, ProcessBasicInformation, buf, len, NULL)
+    # leaves the process id at buf+32, which the case reads back out.
+    code += b"\x48\xc7\xc1" + struct.pack("<i", -1)              # current process
+    code += b"\x48\x31\xd2"                                      # class 0
+    code += b"\x4c\x8d\x44\x24\x40"                             # r8 = rsp+0x40
+    code += b"\x41\xb9" + struct.pack("<I", 48)                   # r9 = 48
+    code += b"\x48\xc7\x04\x24" + struct.pack("<i", 0)          # ReturnLength NULL
+    code += nt_trap(NT_QUERY_INFORMATION_PROCESS)
+    # Make the query load-bearing: if it did not answer, print nothing, so the
+    # case's letter check catches it rather than it passing unnoticed.
+    code += b"\x85\xc0"                                           # test eax, eax
+    bail_at = len(code)
+    code += b"\x0f\x85" + b"\0\0\0\0"                           # jnz done
     code += b"\x41\xbc" + struct.pack("<I", REPEATS)              # mov r12d, REPEATS
     loop = len(code)
     code += b"\x48\xc7\xc1" + struct.pack("<i", STDOUT_HANDLE)    # mov rcx, handle
@@ -53,6 +69,8 @@ def build_pe():
     code += b"\x41\xff\xcc"                                       # dec r12d
     back = loop - (len(code) + 2)
     code += b"\x75" + struct.pack("<b", back)                     # jnz loop
+    done_at = len(code)
+    struct.pack_into("<i", code, bail_at + 2, done_at - (bail_at + 6))
     code += b"\x48\x31\xc9\x48\x31\xd2"                           # handle/status 0
     code += nt_trap(NT_TERMINATE_PROCESS)
     code += b"\x0f\x0b"

@@ -8,11 +8,19 @@ set -e
     # The shell has no yield, so a short sleep hands the processor on.
     while [ $i -lt 40 ]; do printf L; usleep 200 2>/dev/null || sleep 0; i=$((i + 1)); done
 } >> /tmp/abi-mix &
+elf_pid=$!
 /usr/bin/interleave.exe >> /tmp/abi-mix &
+pe_pid=$!
 /usr/bin/interleave.macho >> /tmp/abi-mix &
+macho_pid=$!
 wait
 echo
 echo "MIX: $(cat /tmp/abi-mix)"
+# One host, one identity allocator, three ABIs: the names it handed out have
+# to be distinct however many ABIs are linked in.
+echo "PIDS: $elf_pid $pe_pid $macho_pid"
+distinct=$(printf '%s\n' "$elf_pid" "$pe_pid" "$macho_pid" | sort -u | wc -l)
+[ "$distinct" -eq 3 ] || { echo "ABI-MIX-FAIL pids collided"; exit 1; }
 # Each ABI has to have run, and the letters have to change hands - a single
 # run of one letter would mean they ran one after another, not together.
 for letter in L W M; do
