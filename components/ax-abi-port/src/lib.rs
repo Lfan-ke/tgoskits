@@ -177,6 +177,68 @@ pub struct OpenHow {
     pub mode: u32,
 }
 
+/// What a file is, as every ABI has to describe it in its own layout.
+///
+/// Neutral because the three lay the same facts out differently - a Linux
+/// `struct stat`, an NT `FILE_BASIC_INFORMATION`, a Darwin `struct stat` whose
+/// fields are in another order - while agreeing on what the facts are. The
+/// times are since the epoch, which is the one origin all three count from.
+#[cfg(feature = "paths")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attributes {
+    /// What kind of node this is.
+    pub kind: NodeKind,
+    /// Permission bits, in the octal form all three ultimately carry.
+    pub mode: u32,
+    /// Size in bytes.
+    pub size: u64,
+    /// Filesystem block size for I/O.
+    pub block_size: u64,
+    /// Number of 512-byte blocks allocated.
+    pub blocks: u64,
+    /// The filesystem this node lives on.
+    pub device: u64,
+    /// The device this node *is*, for a character or block special.
+    pub rdev: u64,
+    /// Inode number, or whatever serves as one.
+    pub inode: u64,
+    /// How many names refer to it.
+    pub links: u64,
+    /// Owning user and group.
+    pub uid: u32,
+    /// Owning group.
+    pub gid: u32,
+    /// Last access, since the epoch.
+    pub accessed_ns: u64,
+    /// Last modification, since the epoch.
+    pub modified_ns: u64,
+    /// Last status change, since the epoch.
+    pub changed_ns: u64,
+}
+
+/// What kind of thing a name refers to.
+///
+/// The set every ABI distinguishes; one that does not care about a distinction
+/// simply does not look at it.
+#[cfg(feature = "paths")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    /// An ordinary file.
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic link.
+    Symlink,
+    /// A character device.
+    CharDevice,
+    /// A block device.
+    BlockDevice,
+    /// A named pipe.
+    Fifo,
+    /// A socket.
+    Socket,
+}
+
 /// Reaching a file by name.
 ///
 /// The name is the ABI's: it decodes it from user memory in whatever encoding
@@ -188,6 +250,19 @@ pub trait Paths: Sync {
     /// Open `path`, relative to `at` when it is not absolute, and report the
     /// descriptor it was installed at.
     fn open(&self, at: At, path: &str, how: &OpenHow) -> SysResult;
+
+    /// Describe what `path` refers to, without opening it.
+    ///
+    /// An interpreter asks this of every candidate path as it resolves an
+    /// import, far more often than it opens anything, which is why it is here
+    /// rather than left to open-then-describe.
+    ///
+    /// When `follow` is false a symbolic link describes itself rather than
+    /// what it points at.
+    fn attributes(&self, at: At, path: &str, follow: bool) -> Result<Attributes, i32>;
+
+    /// Describe what an open descriptor refers to.
+    fn attributes_of(&self, fd: i32) -> Result<Attributes, i32>;
 }
 
 /// One run of user memory. An ABI decodes its own vector layout and names the

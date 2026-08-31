@@ -10,7 +10,8 @@
 //! [`TrapEnv::set_error`] alongside the value.
 
 use ax_abi_port::{
-    Advice, At, Create, Host, MapRequest, MapSource, OpenHow, Prot, SeekFrom, SysResult,
+    Advice, At, Attributes, Create, Host, MapRequest, MapSource, NodeKind, OpenHow, Prot, SeekFrom,
+    SysResult,
 };
 use ax_dispatch::{Dispatch, TrapEnv};
 
@@ -76,6 +77,12 @@ mod nr {
     pub const FSYNC: usize = 95;
     pub const PREAD: usize = 153;
     pub const OPENAT: usize = 463;
+    // The 64-bit inode variants, which is what everything has used since
+    // 10.6; the older numbers describe a `struct stat` with a 32-bit inode
+    // that no current binary asks for.
+    pub const STAT64: usize = 338;
+    pub const FSTAT64: usize = 339;
+    pub const LSTAT64: usize = 340;
     pub const PWRITE: usize = 154;
     pub const MMAP: usize = 197;
     pub const LSEEK: usize = 199;
@@ -179,6 +186,49 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
 
 /// Service a Mach trap.
 ///
+/// Lay attributes out as Darwin's `struct stat64`, which orders its fields its
+/// own way and carries each timestamp as a `timespec` pair.
+fn write_stat(host: &dyn Host, at: usize, attr: &Attributes) -> SysResult {
+    const STAT64_LEN: usize = 144;
+    let mut buf = [0u8; STAT64_LEN];
+    let mode = attr.mode
+        | match attr.kind {
+            NodeKind::File => 0o100000,
+            NodeKind::Directory => 0o040000,
+            NodeKind::Symlink => 0o120000,
+            NodeKind::CharDevice => 0o020000,
+            NodeKind::BlockDevice => 0o060000,
+            NodeKind::Fifo => 0o010000,
+            NodeKind::Socket => 0o140000,
+        };
+    let put32 =
+        |buf: &mut [u8], at: usize, v: u32| buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |buf: &mut [u8], at: usize, v: u64| buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    let put_time = |buf: &mut [u8], at: usize, ns: u64| {
+        buf[at..at + 8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
+    };
+    put32(&mut buf, 0, attr.device as u32); // st_dev
+    put32(&mut buf, 4, mode & 0xFFFF); // st_mode is 16 bits here
+    put32(&mut buf, 6, attr.links as u32); // st_nlink, packed after st_mode
+    put64(&mut buf, 8, attr.inode); // st_ino
+    put32(&mut buf, 16, attr.uid);
+    put32(&mut buf, 20, attr.gid);
+    put32(&mut buf, 24, attr.rdev as u32);
+    put_time(&mut buf, 32, attr.accessed_ns);
+    put_time(&mut buf, 48, attr.modified_ns);
+    put_time(&mut buf, 64, attr.changed_ns);
+    // st_birthtimespec has no counterpart in what the host reports, so it
+    // carries the status-change time rather than a made-up value.
+    put_time(&mut buf, 80, attr.changed_ns);
+    put64(&mut buf, 96, attr.size);
+    put64(&mut buf, 104, attr.blocks);
+    put32(&mut buf, 112, attr.block_size as u32);
+    host.platform().write_user(at, &buf)?;
+    Ok(0)
+}
+
 /// Turn a Darwin `open` flag word into the neutral request the host resolves.
 fn open_request(flags: usize, mode: u32) -> Result<OpenHow, i32> {
     let (read, write) = match flags & oflag::ACCMODE {
@@ -266,6 +316,24 @@ fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
                 Err(errno) => return Some(Err(errno)),
             }
         }
+        // stat(path, buf), lstat(path, buf) and fstat(fd, buf). The layout is
+        // this ABI's; what is in it is the host's.
+        nr::STAT64 | nr::LSTAT64 => {
+            let paths = host.paths()?;
+            let mut buf = [0u8; PATH_MAX];
+            let path = match read_path(host, a[0], &mut buf) {
+                Ok(path) => path,
+                Err(errno) => return Some(Err(errno)),
+            };
+            match paths.attributes(At::Cwd, path, call == nr::STAT64) {
+                Ok(attr) => write_stat(host, a[1], &attr),
+                Err(errno) => Err(errno),
+            }
+        }
+        nr::FSTAT64 => match host.paths()?.attributes_of(fd) {
+            Ok(attr) => write_stat(host, a[1], &attr),
+            Err(errno) => Err(errno),
+        },
         nr::EXIT => host.tasks()?.exit_group((a[0] as i32) << 8),
         nr::READ => host.files()?.read(fd, a[1], a[2]),
         nr::WRITE => host.files()?.write(fd, a[1], a[2]),
@@ -499,6 +567,8 @@ mod tests {
         /// User memory, as one flat buffer starting at address zero.
         mem: RefCell<Vec<u8>>,
         opened: RefCell<Option<(At, String, OpenHow)>>,
+        asked: RefCell<Option<(String, bool)>>,
+        describes: Option<Attributes>,
     }
     // Single-threaded tests; the ports ask for Sync on a real host.
     unsafe impl Sync for MockHost {}
@@ -513,7 +583,13 @@ mod tests {
             out.copy_from_slice(&mem[uaddr..end]);
             Ok(0)
         }
-        fn write_user(&self, _u: usize, _d: &[u8]) -> SysResult {
+        fn write_user(&self, uaddr: usize, data: &[u8]) -> SysResult {
+            let mut mem = self.mem.borrow_mut();
+            let end = uaddr + data.len();
+            if end > mem.len() {
+                return Err(EFAULT);
+            }
+            mem[uaddr..end].copy_from_slice(data);
             Ok(0)
         }
         fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
@@ -643,10 +719,19 @@ mod tests {
             (20, 20, 0)
         }
     }
+    type SysResultAttr = Result<Attributes, i32>;
+
     impl Paths for MockHost {
         fn open(&self, at: At, path: &str, how: &OpenHow) -> SysResult {
             *self.opened.borrow_mut() = Some((at, path.to_string(), *how));
             Ok(5)
+        }
+        fn attributes(&self, _at: At, path: &str, follow: bool) -> SysResultAttr {
+            *self.asked.borrow_mut() = Some((path.to_string(), follow));
+            self.describes.clone().ok_or(ax_abi_port::ENOENT)
+        }
+        fn attributes_of(&self, _fd: i32) -> SysResultAttr {
+            self.describes.clone().ok_or(ax_abi_port::EBADF)
         }
     }
 
@@ -862,5 +947,89 @@ mod tests {
         assert_eq!(env.failed, Some(true));
         assert_eq!(env.result, Some(EINVAL as usize));
         assert!(host.opened.borrow().is_none());
+    }
+
+    fn sample_attributes() -> Attributes {
+        Attributes {
+            kind: NodeKind::File,
+            mode: 0o644,
+            size: 1234,
+            block_size: 4096,
+            blocks: 8,
+            device: 1,
+            rdev: 0,
+            inode: 42,
+            links: 3,
+            uid: 501,
+            gid: 20,
+            accessed_ns: 1_000_000_000_500_000_000,
+            modified_ns: 1_000_000_001_250_000_000,
+            changed_ns: 1_000_000_002_750_000_000,
+        }
+    }
+
+    #[test]
+    fn stat_lays_the_answer_out_the_way_darwin_reads_it() {
+        let (mut host, at) = host_with_path("/lib/python3.14/os.py");
+        host.describes = Some(sample_attributes());
+        let mut env = Trap::at(nr::STAT64, [at, 0x80, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.failed, Some(false));
+
+        let asked = host.asked.borrow();
+        let (name, follow) = asked.as_ref().unwrap();
+        assert_eq!(name, "/lib/python3.14/os.py");
+        assert!(
+            *follow,
+            "stat follows a link; lstat is the one that does not"
+        );
+
+        let mem = host.mem.borrow();
+        let at32 = |o: usize| u32::from_le_bytes(mem[0x80 + o..0x84 + o].try_into().unwrap());
+        let at64 = |o: usize| u64::from_le_bytes(mem[0x80 + o..0x88 + o].try_into().unwrap());
+        // st_mode carries the node type in its top bits and is 16 bits wide
+        // here, with st_nlink packed directly after it.
+        assert_eq!(at32(4) & 0xFFFF, 0o100644);
+        assert_eq!(at64(8), 42, "st_ino");
+        assert_eq!(at32(16), 501, "st_uid");
+        assert_eq!(at32(20), 20, "st_gid");
+        assert_eq!(at64(96), 1234, "st_size");
+        assert_eq!(at64(104), 8, "st_blocks");
+        assert_eq!(at32(112), 4096, "st_blksize");
+        // Each timestamp is a seconds/nanoseconds pair, not one number.
+        assert_eq!(at64(48), 1_000_000_001, "st_mtimespec.tv_sec");
+        assert_eq!(at64(56), 250_000_000, "st_mtimespec.tv_nsec");
+    }
+
+    #[test]
+    fn lstat_asks_about_the_link_itself() {
+        let (mut host, at) = host_with_path("/tmp/link");
+        host.describes = Some(sample_attributes());
+        let mut env = Trap::at(nr::LSTAT64, [at, 0x80, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert!(!host.asked.borrow().as_ref().unwrap().1);
+    }
+
+    #[test]
+    fn a_name_that_is_not_there_is_reported_as_such() {
+        let (host, at) = host_with_path("/nope");
+        let mut env = Trap::at(nr::STAT64, [at, 0x80, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.failed, Some(true));
+        assert_eq!(env.result, Some(ax_abi_port::ENOENT as usize));
+    }
+
+    #[test]
+    fn a_directory_keeps_its_kind_in_the_mode() {
+        let (mut host, at) = host_with_path("/lib");
+        let mut dir = sample_attributes();
+        dir.kind = NodeKind::Directory;
+        dir.mode = 0o755;
+        host.describes = Some(dir);
+        let mut env = Trap::at(nr::STAT64, [at, 0x80, 0, 0, 0, 0]);
+        dispatch(&mut env, &host);
+        let mem = host.mem.borrow();
+        let mode = u32::from_le_bytes(mem[0x84..0x88].try_into().unwrap()) & 0xFFFF;
+        assert_eq!(mode, 0o040755);
     }
 }
