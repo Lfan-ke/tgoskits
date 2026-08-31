@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
-    At, OpenHow, Paths,
+    At, Attributes, NodeKind, OpenHow, Paths,
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
     Advice, Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
 };
@@ -20,12 +20,12 @@ use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
 use starry_signal::SignalSet;
 use starry_vm::{vm_load_until_nul, vm_read_slice, vm_write_slice};
 
-use linux_raw_sys::general::AT_FDCWD;
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
 
 use super::{KernelHost, errno, port_result};
 use crate::{
-    StarryError,
-    file::{add_file_like, close_file_like, get_file_like},
+    StarryError, StarryResult,
+    file::{ResolveAtResult, add_file_like, close_file_like, get_file_like, resolve_at},
     mm::VmBytesMut,
     syscall,
     syscall::{KillTarget, MmapFlags, MmapProt, open_path},
@@ -124,6 +124,53 @@ impl Paths for KernelHost {
         };
         port_result(open_path(dirfd, path, how))
     }
+
+    fn attributes(&self, at: At, path: &str, follow: bool) -> Result<Attributes, i32> {
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let flags = if follow { 0 } else { AT_SYMLINK_NOFOLLOW };
+        describe(resolve_at(dirfd, Some(path), flags))
+    }
+
+    fn attributes_of(&self, fd: i32) -> Result<Attributes, i32> {
+        describe(resolve_at(fd, None, AT_EMPTY_PATH))
+    }
+}
+
+/// Restate what the filesystem said in the neutral shape the port speaks.
+fn describe(resolved: StarryResult<ResolveAtResult>) -> Result<Attributes, i32> {
+    let stat = resolved.and_then(|r| r.stat()).map_err(errno)?;
+    // The mode carries the node type in its top bits, which is where every
+    // caller of this reads it from; naming it separately saves each ABI from
+    // decoding the same octal.
+    const IFMT: u32 = 0o170000;
+    let kind = match stat.mode & IFMT {
+        0o040000 => NodeKind::Directory,
+        0o120000 => NodeKind::Symlink,
+        0o020000 => NodeKind::CharDevice,
+        0o060000 => NodeKind::BlockDevice,
+        0o010000 => NodeKind::Fifo,
+        0o140000 => NodeKind::Socket,
+        _ => NodeKind::File,
+    };
+    Ok(Attributes {
+        kind,
+        mode: stat.mode & !IFMT,
+        size: stat.size,
+        block_size: u64::from(stat.blksize),
+        blocks: stat.blocks,
+        device: stat.dev,
+        rdev: u64::from(stat.rdev.major()) << 32 | u64::from(stat.rdev.minor()),
+        inode: stat.ino,
+        links: u64::from(stat.nlink),
+        uid: stat.uid,
+        gid: stat.gid,
+        accessed_ns: stat.atime.as_nanos() as u64,
+        modified_ns: stat.mtime.as_nanos() as u64,
+        changed_ns: stat.ctime.as_nanos() as u64,
+    })
 }
 
 impl Files for KernelHost {

@@ -17,7 +17,7 @@
 //! Argument positions follow the NT syscall signatures (`ntdll` prototypes /
 //! ReactOS `ntoskrnl/io`,`mm`), read via the ABI-neutral [`TrapEnv`].
 
-use ax_abi_port::{At, Create, Host, MapRequest, MapSource, OpenHow, Prot};
+use ax_abi_port::{At, Attributes, Create, Host, MapRequest, MapSource, NodeKind, OpenHow, Prot};
 use ax_dispatch::{Dispatch, TrapEnv};
 
 use crate::handle::Handle;
@@ -81,6 +81,10 @@ pub enum NtSyscall {
     QueryInformationProcess,
     /// `NtYieldExecution()`.
     YieldExecution,
+    /// `NtQueryAttributesFile(ObjectAttributes, FileInformation)`.
+    QueryAttributesFile,
+    /// `NtQueryInformationFile(...)`.
+    QueryInformationFile,
 }
 
 impl NtSyscall {
@@ -97,6 +101,8 @@ impl NtSyscall {
             7 => NtSyscall::TerminateProcess,
             8 => NtSyscall::QueryInformationProcess,
             9 => NtSyscall::YieldExecution,
+            10 => NtSyscall::QueryAttributesFile,
+            11 => NtSyscall::QueryInformationFile,
             _ => return None,
         })
     }
@@ -290,6 +296,59 @@ fn open_request(
         },
         information,
     ))
+}
+
+/// `FILE_BASIC_INFORMATION`: four timestamps and the attribute word.
+const FILE_BASIC_INFORMATION_LEN: usize = 40;
+/// `FILE_STANDARD_INFORMATION`: allocation, size, links, and two flags.
+const FILE_STANDARD_INFORMATION_LEN: usize = 24;
+/// The information classes `NtQueryInformationFile` answers.
+const FILE_BASIC_INFORMATION_CLASS: usize = 4;
+const FILE_STANDARD_INFORMATION_CLASS: usize = 5;
+
+/// `FILE_ATTRIBUTE_*`, the ones a node's kind and mode decide.
+const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Convert an epoch time to NT's, which counts 100-nanosecond intervals from
+/// 1601 rather than seconds from 1970.
+fn nt_time(ns: u64) -> u64 {
+    const EPOCH_DIFFERENCE_100NS: u64 = 116_444_736_000_000_000;
+    EPOCH_DIFFERENCE_100NS + ns / 100
+}
+
+/// The attribute word a node's kind and mode amount to.
+fn file_attributes(attr: &Attributes) -> u32 {
+    let mut flags = match attr.kind {
+        NodeKind::Directory => FILE_ATTRIBUTE_DIRECTORY,
+        NodeKind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
+        _ => FILE_ATTRIBUTE_NORMAL,
+    };
+    // Nothing here has an access-control list, so "can the owner write it"
+    // is the closest thing to the read-only attribute a caller asks about.
+    if attr.mode & 0o200 == 0 {
+        flags |= FILE_ATTRIBUTE_READONLY;
+    }
+    flags
+}
+
+/// Lay attributes out as `FILE_BASIC_INFORMATION`.
+fn basic_information(attr: &Attributes) -> [u8; FILE_BASIC_INFORMATION_LEN] {
+    let mut buf = [0u8; FILE_BASIC_INFORMATION_LEN];
+    // Creation time has no counterpart in what the host reports, so it carries
+    // the status-change time rather than an invented one.
+    for (at, ns) in [
+        (0, attr.changed_ns),
+        (8, attr.accessed_ns),
+        (16, attr.modified_ns),
+        (24, attr.changed_ns),
+    ] {
+        buf[at..at + 8].copy_from_slice(&nt_time(ns).to_le_bytes());
+    }
+    buf[32..36].copy_from_slice(&file_attributes(attr).to_le_bytes());
+    buf
 }
 
 /// The `PAGE_*` protections a caller may ask for.
@@ -617,6 +676,86 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             }
             write_io_status(host, io_status, Ntstatus::SUCCESS, information)
         }
+        // NtQueryAttributesFile(ObjectAttributes, FileInformation) answers
+        // without opening anything, which is what a caller probing a path does.
+        NtSyscall::QueryAttributesFile => {
+            let Some(paths) = host.paths() else {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            };
+            let (object_attributes, out) = (a(0), a(1));
+            if object_attributes == 0 || out == 0 {
+                return finish(env, Ntstatus::INVALID_PARAMETER);
+            }
+            let mut oa = [0u8; OBJECT_ATTRIBUTES_LEN];
+            if let Err(errno) = host.platform().read_user(object_attributes, &mut oa) {
+                return finish(env, status_from_errno(errno));
+            }
+            let name =
+                u64::from_le_bytes(oa[OA_OBJECT_NAME..OA_OBJECT_NAME + 8].try_into().unwrap())
+                    as usize;
+            if name == 0 {
+                return finish(env, Ntstatus::OBJECT_NAME_INVALID);
+            }
+            let mut buf = [0u8; PATH_MAX];
+            let path = match read_nt_path(host, name, &mut buf) {
+                Ok(path) => path,
+                Err(status) => return finish(env, status),
+            };
+            match paths.attributes(At::Cwd, path, true) {
+                Ok(attr) => match host.platform().write_user(out, &basic_information(&attr)) {
+                    Ok(_) => Ntstatus::SUCCESS,
+                    Err(errno) => status_from_errno(errno),
+                },
+                Err(errno) => status_from_errno(errno),
+            }
+        }
+        // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+        // Length, FileInformationClass). Only the two classes that describe
+        // what the file is are answered.
+        NtSyscall::QueryInformationFile => {
+            let Some(paths) = host.paths() else {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            };
+            let (io_status, out, length, class) = (a(1), a(2), a(3), a(4));
+            let Ok(fd) = descriptor(a(0)) else {
+                return finish(env, Ntstatus::INVALID_HANDLE);
+            };
+            let attr = match paths.attributes_of(fd) {
+                Ok(attr) => attr,
+                Err(errno) => return finish(env, status_from_errno(errno)),
+            };
+            let written = match class {
+                FILE_BASIC_INFORMATION_CLASS => {
+                    if length < FILE_BASIC_INFORMATION_LEN {
+                        return finish(env, Ntstatus::INFO_LENGTH_MISMATCH);
+                    }
+                    host.platform()
+                        .write_user(out, &basic_information(&attr))
+                        .map(|_| FILE_BASIC_INFORMATION_LEN)
+                }
+                FILE_STANDARD_INFORMATION_CLASS => {
+                    if length < FILE_STANDARD_INFORMATION_LEN {
+                        return finish(env, Ntstatus::INFO_LENGTH_MISMATCH);
+                    }
+                    let mut buf = [0u8; FILE_STANDARD_INFORMATION_LEN];
+                    // AllocationSize is what the file occupies, which is the
+                    // block count rather than the length.
+                    buf[0..8].copy_from_slice(&(attr.blocks * 512).to_le_bytes());
+                    buf[8..16].copy_from_slice(&attr.size.to_le_bytes());
+                    buf[16..20].copy_from_slice(&(attr.links as u32).to_le_bytes());
+                    buf[21] = u8::from(attr.kind == NodeKind::Directory);
+                    host.platform()
+                        .write_user(out, &buf)
+                        .map(|_| FILE_STANDARD_INFORMATION_LEN)
+                }
+                // The rest describe things this package does not have.
+                _ => return Dispatch::Passthrough,
+            };
+            match written {
+                Ok(n) => write_io_status(host, io_status, Ntstatus::SUCCESS, n),
+                Err(errno) => status_from_errno(errno),
+            }
+        }
         // The remaining information classes describe things this package does
         // not have, and stay with the caller rather than being invented.
         NtSyscall::QueryInformationProcess => {
@@ -652,10 +791,17 @@ mod tests {
 
     #[test]
     fn syscall_numbers_round_trip() {
-        for nr in 0..10 {
-            assert_eq!(NtSyscall::from_nr(nr).unwrap().nr(), nr);
+        // Every number the table claims maps back to itself, and the first one
+        // it does not claim is refused - found by walking rather than written
+        // down, so adding a call does not need this test edited.
+        let mut nr = 0;
+        while let Some(call) = NtSyscall::from_nr(nr) {
+            assert_eq!(call.nr(), nr);
+            nr += 1;
         }
-        assert_eq!(NtSyscall::from_nr(10), None);
+        assert!(nr > 0, "the table claims nothing");
+        assert_eq!(NtSyscall::from_nr(nr), None);
+        assert_eq!(NtSyscall::from_nr(u32::MAX), None);
     }
 
     // A trap frame with preset syscall number and arguments.
@@ -690,6 +836,9 @@ mod tests {
         closed: RefCell<Option<i32>>,
         mapped: RefCell<Option<MapRequest>>,
         opened: RefCell<Option<(At, String, OpenHow)>>,
+        asked: RefCell<Option<String>>,
+        /// What the paths port describes a name as, or nothing for absent.
+        describes: Option<Attributes>,
         /// What the paths port answers with, or the error it reports.
         opens_at: Result<i32, i32>,
         /// Whether the host offers a paths port at all.
@@ -703,6 +852,8 @@ mod tests {
                 closed: RefCell::default(),
                 mapped: RefCell::default(),
                 opened: RefCell::default(),
+                asked: RefCell::default(),
+                describes: None,
                 opens_at: Ok(0),
                 has_paths: false,
             }
@@ -846,6 +997,18 @@ mod tests {
         fn open(&self, at: At, path: &str, how: &OpenHow) -> ax_abi_port::SysResult {
             *self.opened.borrow_mut() = Some((at, path.to_string(), *how));
             self.opens_at.map(|fd| fd as isize)
+        }
+        fn attributes(&self, _at: At, path: &str, _follow: bool) -> Result<Attributes, i32> {
+            self.describes
+                .clone()
+                .map(|attr| {
+                    *self.asked.borrow_mut() = Some(String::from(path));
+                    attr
+                })
+                .ok_or(ax_abi_port::ENOENT)
+        }
+        fn attributes_of(&self, _fd: i32) -> Result<Attributes, i32> {
+            self.describes.clone().ok_or(ax_abi_port::EBADF)
         }
     }
 
@@ -1161,5 +1324,124 @@ mod tests {
         };
         let env = create_file(&host, r"\??\C:\f", GENERIC_READ, FILE_OPEN);
         assert_eq!(env.result, Some(Ntstatus::NOT_IMPLEMENTED.0 as usize));
+    }
+
+    fn sample_attributes() -> Attributes {
+        Attributes {
+            kind: NodeKind::File,
+            mode: 0o644,
+            size: 1234,
+            block_size: 4096,
+            blocks: 8,
+            device: 1,
+            rdev: 0,
+            inode: 42,
+            links: 1,
+            uid: 0,
+            gid: 0,
+            // 2001-09-09T01:46:40Z, a time with no zero bytes to hide a bug in.
+            accessed_ns: 1_000_000_000_000_000_000,
+            modified_ns: 1_000_000_001_000_000_000,
+            changed_ns: 1_000_000_002_000_000_000,
+        }
+    }
+
+    #[test]
+    fn describes_a_name_without_opening_it() {
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x500]),
+            has_paths: true,
+            describes: Some(sample_attributes()),
+            ..MockHost::default()
+        };
+        let oa = object_attributes(&host, r"\??\C:\lib\os.py", 0);
+        let mut env = trap(NtSyscall::QueryAttributesFile, [oa, 0x400, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
+        assert_eq!(host.asked.borrow().as_deref(), Some("/lib/os.py"));
+        // Nothing was opened: this answers about the name itself.
+        assert!(host.opened.borrow().is_none());
+
+        let mem = host.mem.borrow();
+        // NT counts 100-nanosecond intervals from 1601, not seconds from 1970.
+        let modified = u64::from_le_bytes(mem[0x410..0x418].try_into().unwrap());
+        assert_eq!(modified, 116_444_736_000_000_000 + 10_000_000_010_000_000);
+        let flags = u32::from_le_bytes(mem[0x420..0x424].try_into().unwrap());
+        assert_eq!(flags, FILE_ATTRIBUTE_NORMAL);
+    }
+
+    #[test]
+    fn a_directory_and_a_read_only_file_say_so_in_the_attribute_word() {
+        let mut dir = sample_attributes();
+        dir.kind = NodeKind::Directory;
+        assert_eq!(file_attributes(&dir), FILE_ATTRIBUTE_DIRECTORY);
+
+        let mut link = sample_attributes();
+        link.kind = NodeKind::Symlink;
+        assert_eq!(file_attributes(&link), FILE_ATTRIBUTE_REPARSE_POINT);
+
+        // With no access-control list anywhere, whether the owner may write is
+        // the closest thing to the read-only attribute a caller asks about.
+        let mut ro = sample_attributes();
+        ro.mode = 0o444;
+        assert_eq!(
+            file_attributes(&ro),
+            FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
+        );
+    }
+
+    #[test]
+    fn answers_the_standard_class_and_declines_the_rest() {
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x500]),
+            has_paths: true,
+            describes: Some(sample_attributes()),
+            ..MockHost::default()
+        };
+        // NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+        // Length | FileInformationClass on the stack).
+        let mut env = trap_with_stack(
+            NtSyscall::QueryInformationFile,
+            [4, 0x400, 0x410, FILE_STANDARD_INFORMATION_LEN],
+            &[FILE_STANDARD_INFORMATION_CLASS],
+            &host,
+        );
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
+        let mem = host.mem.borrow();
+        // AllocationSize is what the file occupies, which is its blocks, not
+        // its length.
+        assert_eq!(
+            u64::from_le_bytes(mem[0x410..0x418].try_into().unwrap()),
+            8 * 512
+        );
+        assert_eq!(
+            u64::from_le_bytes(mem[0x418..0x420].try_into().unwrap()),
+            1234
+        );
+        assert_eq!(mem[0x415 + 12], 0, "a file is not a directory");
+        drop(mem);
+
+        // A buffer too small for the class is refused rather than truncated.
+        let mut short = trap_with_stack(
+            NtSyscall::QueryInformationFile,
+            [4, 0x400, 0x410, FILE_STANDARD_INFORMATION_LEN - 1],
+            &[FILE_STANDARD_INFORMATION_CLASS],
+            &host,
+        );
+        dispatch(&mut short, &host);
+        assert_eq!(
+            short.result,
+            Some(Ntstatus::INFO_LENGTH_MISMATCH.0 as usize)
+        );
+
+        // A class this package has nothing to say about stays with the caller.
+        let mut other = trap_with_stack(
+            NtSyscall::QueryInformationFile,
+            [4, 0x400, 0x410, 64],
+            &[99],
+            &host,
+        );
+        assert_eq!(dispatch(&mut other, &host), Dispatch::Passthrough);
     }
 }
