@@ -479,6 +479,13 @@ impl SocketOps for UdpSocket {
     }
 
     /// Receives one datagram while honoring peer filters and recv flags.
+    fn recv_available(&self) -> NetResult<usize> {
+        // `udp_ioctl` reports the length of the first datagram, not the total
+        // queued: one receive returns one datagram and drops the rest of it.
+        request_poll();
+        self.with_smol_socket(|socket| Ok(socket.peek().map_or(0, |(data, _)| data.len())))
+    }
+
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> NetResult<usize> {
         enum ExpectedRemote<'a> {
             Any(&'a mut SocketAddrEx),
