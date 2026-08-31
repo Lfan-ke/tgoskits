@@ -16,6 +16,10 @@ use ax_dispatch::{Dispatch, TrapEnv};
 const CLASS_SHIFT: usize = 24;
 /// The class BSD calls carry.
 const CLASS_UNIX: usize = 2;
+/// The class Mach traps carry. They are a separate call space from the BSD
+/// one, reached through the same instruction, and a Darwin program uses both -
+/// `sched_yield` in libc is the Mach trap `swtch_pri`, not a BSD call.
+const CLASS_MACH: usize = 1;
 /// The call number, once the class is stripped.
 const NUMBER_MASK: usize = (1 << CLASS_SHIFT) - 1;
 /// The page size Darwin's alignment rules are written against.
@@ -115,7 +119,11 @@ fn map(host: &dyn Host, a: &[usize; 6]) -> Option<SysResult> {
 /// Service one trapped BSD call, or report that it is not this personality's.
 pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     let nr = env.nr();
-    if nr >> CLASS_SHIFT != CLASS_UNIX {
+    let class = nr >> CLASS_SHIFT;
+    if class == CLASS_MACH {
+        return mach(env, host);
+    }
+    if class != CLASS_UNIX {
         return Dispatch::Passthrough;
     }
     let a = [
@@ -141,6 +149,34 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         }
     }
     Dispatch::Handled
+}
+
+/// Service a Mach trap.
+///
+/// Mach's calls are the other half of the Darwin ABI, and a program reaches
+/// both through the same instruction with the class in the top byte. Only the
+/// two that give up the processor are here; the rest of Mach - ports, messages,
+/// virtual memory - is its own object model and is not this package's yet.
+fn mach(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
+    /// `swtch_pri`, which libc's `sched_yield` issues.
+    const SWTCH_PRI: usize = 59;
+    /// `swtch`, its older sibling.
+    const SWTCH: usize = 60;
+
+    let Some(tasks) = host.tasks() else {
+        return Dispatch::Passthrough;
+    };
+    match env.nr() & NUMBER_MASK {
+        SWTCH_PRI | SWTCH => {
+            let _ = tasks.sched_yield();
+            // Both report whether anything else was waiting; saying nothing
+            // was is honest here and is what a caller treats as "keep going".
+            env.set_error(false);
+            env.set_result(0);
+            Dispatch::Handled
+        }
+        _ => Dispatch::Passthrough,
+    }
 }
 
 fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {

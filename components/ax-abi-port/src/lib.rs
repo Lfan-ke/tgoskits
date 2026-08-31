@@ -98,6 +98,9 @@ pub enum Advice {
     DontNeed,
     /// The range's contents may be discarded, and the pages reclaimed.
     Free,
+    /// Punch the range out of whatever backs it, so a later read sees zeroes.
+    /// Only a shared file-backed range can be removed this way.
+    Remove,
     /// Advice the host has no action for, which is not an error to give.
     Ignored,
 }

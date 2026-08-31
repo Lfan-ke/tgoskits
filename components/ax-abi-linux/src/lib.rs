@@ -642,10 +642,11 @@ fn sys_madvise(mem: &dyn ops::Mem, addr: usize, len: usize, advice: i32) -> SysR
         MADV_WILLNEED => ops::Advice::WillNeed,
         MADV_DONTNEED | MADV_DONTNEED_LOCKED => ops::Advice::DontNeed,
         MADV_FREE => ops::Advice::Free,
-        MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
-        | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK
-        | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE
-        | MADV_COLLAPSE | MADV_HWPOISON | MADV_SOFT_OFFLINE => ops::Advice::Ignored,
+        MADV_REMOVE => ops::Advice::Remove,
+        MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK | MADV_KEEPONFORK
+        | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE | MADV_COLLAPSE
+        | MADV_HWPOISON | MADV_SOFT_OFFLINE => ops::Advice::Ignored,
         _ => return Err(ops::EINVAL),
     };
     if !addr.is_multiple_of(PAGE_SIZE) {

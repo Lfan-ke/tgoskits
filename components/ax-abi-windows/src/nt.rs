@@ -35,6 +35,9 @@ impl Ntstatus {
     pub const NOT_IMPLEMENTED: Ntstatus = Ntstatus(0xC000_0002);
     /// `STATUS_INVALID_HANDLE`.
     pub const INVALID_HANDLE: Ntstatus = Ntstatus(0xC000_0008);
+    /// `STATUS_NO_YIELD_PERFORMED`, which a yield reports when nothing else
+    /// was waiting. It is a success code, not a failure.
+    pub const NO_YIELD_PERFORMED: Ntstatus = Ntstatus(0x4000_0024);
     /// `STATUS_INVALID_PARAMETER`.
     pub const INVALID_PARAMETER: Ntstatus = Ntstatus(0xC000_000D);
     /// `STATUS_ACCESS_VIOLATION`.
@@ -69,6 +72,8 @@ pub enum NtSyscall {
     TerminateProcess,
     /// `NtQueryInformationProcess(...)`.
     QueryInformationProcess,
+    /// `NtYieldExecution()`.
+    YieldExecution,
 }
 
 impl NtSyscall {
@@ -84,6 +89,7 @@ impl NtSyscall {
             6 => NtSyscall::FreeVirtualMemory,
             7 => NtSyscall::TerminateProcess,
             8 => NtSyscall::QueryInformationProcess,
+            9 => NtSyscall::YieldExecution,
             _ => return None,
         })
     }
@@ -334,6 +340,15 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                 _ => Ntstatus::INVALID_PARAMETER,
             }
         }
+        // NtYieldExecution() gives up the rest of the time slice. It reports
+        // whether anything else was waiting; saying nothing was is honest and
+        // is what a caller treats as "keep going".
+        NtSyscall::YieldExecution => match host.tasks() {
+            Some(tasks) => tasks
+                .sched_yield()
+                .map_or_else(status_from_errno, |_| Ntstatus::NO_YIELD_PERFORMED),
+            None => Ntstatus::NOT_IMPLEMENTED,
+        },
         NtSyscall::TerminateProcess => match host.tasks() {
             Some(tasks) => tasks
                 .exit_group(a(1) as i32)
@@ -372,10 +387,10 @@ mod tests {
 
     #[test]
     fn syscall_numbers_round_trip() {
-        for nr in 0..9 {
+        for nr in 0..10 {
             assert_eq!(NtSyscall::from_nr(nr).unwrap().nr(), nr);
         }
-        assert_eq!(NtSyscall::from_nr(9), None);
+        assert_eq!(NtSyscall::from_nr(10), None);
     }
 
     // A trap frame with preset syscall number and arguments.

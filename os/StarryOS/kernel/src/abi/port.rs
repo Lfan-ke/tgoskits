@@ -239,7 +239,8 @@ impl Mem for KernelHost {
         // ABI's spelling of these; translate at the boundary rather than
         // letting a domain write that spelling.
         use linux_raw_sys::general::{
-            MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
+            MADV_DONTNEED, MADV_FREE, MADV_NORMAL, MADV_RANDOM, MADV_REMOVE, MADV_SEQUENTIAL,
+            MADV_WILLNEED,
         };
         let advice = match advice {
             Advice::Normal => MADV_NORMAL,
@@ -248,6 +249,7 @@ impl Mem for KernelHost {
             Advice::WillNeed => MADV_WILLNEED,
             Advice::DontNeed => MADV_DONTNEED,
             Advice::Free => MADV_FREE,
+            Advice::Remove => MADV_REMOVE,
             // Nothing to do, and saying so is not a failure.
             Advice::Ignored => return Ok(0),
         };

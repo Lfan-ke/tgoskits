@@ -431,7 +431,15 @@ fn load_user_app_with_depth(
         )
         .map_err(|err| {
             warn!("exec {path}: {err}");
-            StarryError::InvalidExecutable
+            match err {
+                // A format claimed the image and found it broken. That is not
+                // the same as nothing claiming it, and execve tells them apart:
+                // only the latter falls back to running the file as a script.
+                ax_binfmt::AbiError::MalformedImage | ax_binfmt::AbiError::Unsupported => {
+                    StarryError::MalformedExecutable
+                }
+                _ => StarryError::InvalidExecutable,
+            }
         })?;
     let auxv = space.metadata;
 
