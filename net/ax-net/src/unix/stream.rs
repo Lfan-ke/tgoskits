@@ -502,6 +502,17 @@ impl TransportOps for StreamTransport {
         })
     }
 
+    fn recv_available(&self) -> NetResult<usize> {
+        // `unix_inq_len` refuses a listening socket, whose receive queue holds
+        // connection requests rather than bytes, and otherwise sums what is
+        // queued - a stream has no record boundary to stop at.
+        if self.is_listening() {
+            return Err(NetError::InvalidInput);
+        }
+        let channel = self.channel.lock();
+        Ok(channel.as_ref().map_or(0, |chan| chan.rx.occupied_len()))
+    }
+
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> NetResult<usize> {
         let dontwait = options.flags.contains(crate::RecvFlags::DONTWAIT);
         let peek = options.flags.contains(crate::RecvFlags::PEEK);

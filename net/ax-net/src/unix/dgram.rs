@@ -598,6 +598,24 @@ impl TransportOps for DgramTransport {
         Ok(len)
     }
 
+    fn recv_available(&self) -> NetResult<usize> {
+        if self.is_listening() {
+            return Err(NetError::InvalidInput);
+        }
+        // `unix_inq_len` reports the first datagram's length here, not the
+        // total queued, because that is what one receive will return. The
+        // channel has no peek, so the packet is parked in the slot the
+        // MSG_PEEK path already uses and the next receive takes it from there.
+        let mut peeked = self.peeked.lock();
+        if peeked.is_none()
+            && let Some((rx, _)) = self.data_rx.lock().as_mut()
+            && let Ok(packet) = rx.try_recv()
+        {
+            *peeked = Some(packet);
+        }
+        Ok(peeked.as_ref().map_or(0, |packet| packet.data.len()))
+    }
+
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> NetResult<usize> {
         // Unix datagram/seqpacket sockets do not carry out-of-band data.
         // Linux `unix_dgram_recvmsg` rejects MSG_OOB with EOPNOTSUPP.

@@ -48,6 +48,7 @@ apps/starry/python-lang/
     t19_cli.py                 # the `python3` CLI: every --help option + -m stdlib + REPL (-i) + multi-entry + PYTHON* env + exit codes
     t20_dash_m.py              # every `python3 -m` stdlib CLI tool (json.tool/base64/dis/tokenize/pydoc/zipfile/tarfile/gzip/timeit/cProfile/unittest/…)
     t21_stdlib_import.py       # docs library-index breadth: every public stdlib module import-reachable + subpackage entry points
+    t22_net_devices.py         # sockets (TCP/UDP/unix over loopback, select/poll, getaddrinfo) + character devices (/dev/null,zero,urandom, isatty, fcntl/ioctl)
     test_lang.py               # cross-cutting smoke + `python3 -m venv`
 ```
 

@@ -92,6 +92,12 @@ pub trait TransportOps: Configurable + Pollable + Send + Sync {
     /// Receive data from the transport.
     fn recv(&self, dst: impl Write, options: RecvOptions<'_>) -> NetResult<usize>;
 
+    /// How many bytes the next receive can take without blocking, as
+    /// `SIOCINQ`/`FIONREAD` reports it.
+    fn recv_available(&self) -> NetResult<usize> {
+        Ok(0)
+    }
+
     /// Shutdown the transport.
     fn shutdown(&self, _how: Shutdown) -> NetResult {
         Ok(())
@@ -280,6 +286,10 @@ impl SocketOps for UnixSocket {
 
     fn recv(&self, dst: impl Write, options: RecvOptions<'_>) -> NetResult<usize> {
         self.transport.recv(dst, options)
+    }
+
+    fn recv_available(&self) -> NetResult<usize> {
+        self.transport.recv_available()
     }
 
     fn local_addr(&self) -> NetResult<SocketAddrEx> {
