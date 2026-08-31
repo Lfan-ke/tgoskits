@@ -745,10 +745,13 @@ name = "ax-abi-linux"
 version = "0.1.0"
 dependencies = [
  "ax-abi-port",
+ "ax-binfmt",
  "ax-crate-interface",
  "ax-dispatch",
+ "kernel-elf-parser",
  "linux-raw-sys 0.12.1",
  "syscalls",
+ "xmas-elf",
 ]
 
 [[package]]

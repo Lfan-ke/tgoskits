@@ -11,6 +11,7 @@ use ax_task::current;
 use axfs_ng_vfs::{DirEntry, FileNode, Location, NodeOps, NodeType, Reference, VfsError};
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
+use ax_abi_port::{Create, OpenHow as OpenRequest};
 use starry_vm::{VmMutPtr, VmPtr, vm_load};
 
 use crate::{
@@ -548,6 +549,45 @@ pub fn sys_openat(
         crate::file::inotify::notify_create_path(file.path().as_ref(), false);
     }
     Ok(fd as isize)
+}
+
+/// Open `path` with an already-decoded request, and install the result.
+///
+/// The flag vocabulary an ABI writes the request in stays with that ABI. What
+/// is left here is resolving the name and installing what came back, in terms
+/// of the flags this filesystem happens to be written in.
+pub(crate) fn open_path(dirfd: c_int, path: &str, how: &OpenRequest) -> StarryResult<isize> {
+    let mut flags = match (how.read, how.write) {
+        (true, true) => O_RDWR,
+        (false, true) => O_WRONLY,
+        _ => O_RDONLY,
+    } as i32;
+    for (wanted, bit) in [
+        (how.append, O_APPEND),
+        (how.truncate, O_TRUNC),
+        (how.directory, O_DIRECTORY),
+        (how.close_on_exec, O_CLOEXEC),
+        (!how.follow, O_NOFOLLOW),
+        (how.create != Create::Never, O_CREAT),
+        (how.create == Create::Exclusive, O_EXCL),
+    ] {
+        if wanted {
+            flags |= bit as i32;
+        }
+    }
+
+    let curr = current();
+    let cred = curr.as_thread().cred();
+    let mode = how.mode & !curr.as_thread().proc_data.umask();
+    let options = flags_to_options(flags, mode, (cred.fsuid, cred.fsgid));
+    let dirfd = if path.starts_with('/') {
+        AT_FDCWD as _
+    } else {
+        dirfd
+    };
+    let result = with_fs(dirfd, |fs| Ok(options.open(fs, path)?))?;
+    let namespace = mount_table_namespace(&result);
+    Ok(add_to_fd(result, flags as _, namespace)? as isize)
 }
 
 pub fn sys_openat2(

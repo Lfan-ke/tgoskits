@@ -44,6 +44,9 @@ pub const EINVAL: i32 = 22;
 pub const EBADF: i32 = 9;
 /// `ESRCH` - no such process.
 pub const ESRCH: i32 = 3;
+
+/// No such file or directory.
+pub const ENOENT: i32 = 2;
 /// `ESPIPE` - the descriptor does not admit positional io.
 pub const ESPIPE: i32 = 29;
 /// `EOPNOTSUPP` - the operation is not one this build carries out.
@@ -57,6 +60,20 @@ pub const EINTR: i32 = 4;
 pub trait Platform: Sync {
     fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult;
     fn write_user(&self, uaddr: usize, data: &[u8]) -> SysResult;
+
+    /// Read a NUL-terminated byte string starting at `uaddr` into `out`, and
+    /// report its length without the terminator.
+    ///
+    /// Reading `out.len()` bytes outright would fault on a string that ends
+    /// near the end of a mapping, and how far it is safe to read is something
+    /// only the host knows. What the bytes mean stays with the ABI: this
+    /// reports them as they are, with no encoding assumed.
+    ///
+    /// # Errors
+    ///
+    /// Reports the host's fault error for an unreadable address, and its
+    /// name-too-long error for a string that does not end within `out`.
+    fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult;
 }
 
 #[cfg(feature = "task")]
@@ -110,6 +127,67 @@ pub enum Advice {
     Remove,
     /// Advice the host has no action for, which is not an error to give.
     Ignored,
+}
+
+/// Where a name that is not absolute starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum At {
+    /// The process's working directory.
+    Cwd,
+    /// An open directory.
+    Dir(i32),
+}
+
+/// Whether a name that is not there may be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Create {
+    /// Fail if it is not there.
+    Never,
+    /// Make it if it is not there.
+    IfAbsent,
+    /// Make it, and fail if it is already there.
+    Exclusive,
+}
+
+/// What opening a name should do.
+///
+/// Each ABI spells these differently - Linux and Darwin in `O_*` bits that do
+/// not agree on their values, Windows in an access mask and a disposition - so
+/// the request crosses the port as what it asks for rather than as one ABI's
+/// spelling of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenHow {
+    /// Readable.
+    pub read: bool,
+    /// Writable.
+    pub write: bool,
+    /// Writes go to the end.
+    pub append: bool,
+    /// Existing contents are dropped.
+    pub truncate: bool,
+    /// Whether a missing name may be made.
+    pub create: Create,
+    /// The name has to be a directory.
+    pub directory: bool,
+    /// Follow a symbolic link in the last component.
+    pub follow: bool,
+    /// The descriptor does not survive into a new image.
+    pub close_on_exec: bool,
+    /// Permissions for a name this call makes.
+    pub mode: u32,
+}
+
+/// Reaching a file by name.
+///
+/// The name is the ABI's: it decodes it from user memory in whatever encoding
+/// its programs write it in, and applies its own rules about which
+/// combinations of request mean anything. What the host does is resolve the
+/// name and install the result as a descriptor.
+#[cfg(feature = "paths")]
+pub trait Paths: Sync {
+    /// Open `path`, relative to `at` when it is not absolute, and report the
+    /// descriptor it was installed at.
+    fn open(&self, at: At, path: &str, how: &OpenHow) -> SysResult;
 }
 
 /// One run of user memory. An ABI decodes its own vector layout and names the
@@ -381,6 +459,11 @@ pub trait Host: Sync {
     }
     #[cfg(feature = "system")]
     fn system(&self) -> Option<&dyn System> {
+        None
+    }
+    /// The name-resolution port, when the host has one.
+    #[cfg(feature = "paths")]
+    fn paths(&self) -> Option<&dyn Paths> {
         None
     }
     #[cfg(feature = "creds")]

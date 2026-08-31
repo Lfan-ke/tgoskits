@@ -108,6 +108,19 @@ mod tests {
         fn write_user(&self, _uaddr: usize, _data: &[u8]) -> SysResult {
             Ok(0)
         }
+        fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
+            // Reads one byte at a time so it stops at the terminator, which
+            // is what a host with real mappings has to do anyway.
+            for (i, slot) in out.iter_mut().enumerate() {
+                let mut byte = [0u8; 1];
+                self.read_user(uaddr + i, &mut byte)?;
+                if byte[0] == 0 {
+                    return Ok(i as isize);
+                }
+                *slot = byte[0];
+            }
+            Ok(out.len() as isize)
+        }
     }
     impl Host for BareHost {
         fn platform(&self) -> &dyn Platform {
