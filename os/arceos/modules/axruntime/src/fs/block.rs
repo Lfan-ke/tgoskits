@@ -18,7 +18,10 @@ struct RuntimeTimeProvider;
 
 impl BlockTimeProvider for RuntimeTimeProvider {
     fn wall_time(&self) -> Duration {
-        ax_hal::time::monotonic_time()
+        // Timestamps on files are wall-clock, not time since boot. Reporting
+        // the monotonic clock here left every file stamped in 1970, which is
+        // before the epoch a ZIP archive can express, so writing one failed.
+        ax_hal::time::wall_time()
     }
 }
 
