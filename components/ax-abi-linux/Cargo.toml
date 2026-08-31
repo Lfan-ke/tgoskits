@@ -12,7 +12,7 @@ license.workspace = true
 [features]
 # Which syscall families this personality offers, matched to the host
 # capabilities they need.
-default = ["fs", "mm", "task", "signal", "time", "random", "system", "creds"]
+default = ["fs", "mm", "task", "signal", "time", "random", "system", "creds", "paths"]
 fs = ["ax-abi-port/fs"]
 mm = ["ax-abi-port/mm"]
 task = ["ax-abi-port/task"]
@@ -23,6 +23,7 @@ random = ["ax-abi-port/random"]
 elf = ["dep:kernel-elf-parser", "dep:xmas-elf", "dep:ax-binfmt"]
 system = ["ax-abi-port/system"]
 creds = ["ax-abi-port/creds"]
+paths = ["ax-abi-port/paths"]
 
 [dependencies]
 kernel-elf-parser = { version = "0.3.4", optional = true }

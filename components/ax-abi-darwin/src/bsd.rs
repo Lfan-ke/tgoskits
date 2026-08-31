@@ -9,7 +9,9 @@
 //! with the carry flag set, which is why the trap frame carries
 //! [`TrapEnv::set_error`] alongside the value.
 
-use ax_abi_port::{Advice, Host, MapRequest, MapSource, Prot, SeekFrom, SysResult};
+use ax_abi_port::{
+    Advice, At, Create, Host, MapRequest, MapSource, OpenHow, Prot, SeekFrom, SysResult,
+};
 use ax_dispatch::{Dispatch, TrapEnv};
 
 /// Where the call class sits in a Darwin system-call number.
@@ -31,10 +33,33 @@ const EINVAL: i32 = 22;
 const EBADF: i32 = 9;
 
 /// The BSD calls this personality services, from `syscalls.master`.
+/// The `O_*` bits XNU's `<sys/fcntl.h>` defines. The low bits agree with other
+/// systems and the rest do not, so this ABI names its own rather than assume.
+mod oflag {
+    pub const ACCMODE: usize = 0x0003;
+    pub const RDONLY: usize = 0x0000;
+    pub const WRONLY: usize = 0x0001;
+    pub const RDWR: usize = 0x0002;
+    pub const CREAT: usize = 0x0200;
+    pub const EXCL: usize = 0x0800;
+    pub const TRUNC: usize = 0x0400;
+    pub const APPEND: usize = 0x0008;
+    pub const NOFOLLOW: usize = 0x0100;
+    pub const DIRECTORY: usize = 0x0010_0000;
+    pub const CLOEXEC: usize = 0x0100_0000;
+}
+
+/// `AT_FDCWD` is -2 on Darwin, where other systems use -100.
+const AT_FDCWD: i32 = -2;
+
+/// The longest path this ABI resolves, matching XNU's `PATH_MAX`.
+const PATH_MAX: usize = 1024;
+
 mod nr {
     pub const EXIT: usize = 1;
     pub const READ: usize = 3;
     pub const WRITE: usize = 4;
+    pub const OPEN: usize = 5;
     pub const CLOSE: usize = 6;
     pub const GETPID: usize = 20;
     pub const GETUID: usize = 24;
@@ -50,6 +75,7 @@ mod nr {
     pub const DUP2: usize = 90;
     pub const FSYNC: usize = 95;
     pub const PREAD: usize = 153;
+    pub const OPENAT: usize = 463;
     pub const PWRITE: usize = 154;
     pub const MMAP: usize = 197;
     pub const LSEEK: usize = 199;
@@ -153,6 +179,39 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
 
 /// Service a Mach trap.
 ///
+/// Turn a Darwin `open` flag word into the neutral request the host resolves.
+fn open_request(flags: usize, mode: u32) -> Result<OpenHow, i32> {
+    let (read, write) = match flags & oflag::ACCMODE {
+        oflag::RDONLY => (true, false),
+        oflag::WRONLY => (false, true),
+        oflag::RDWR => (true, true),
+        _ => return Err(EINVAL),
+    };
+    Ok(OpenHow {
+        read,
+        write,
+        append: flags & oflag::APPEND != 0,
+        truncate: flags & oflag::TRUNC != 0,
+        create: match (flags & oflag::CREAT != 0, flags & oflag::EXCL != 0) {
+            (true, true) => Create::Exclusive,
+            (true, false) => Create::IfAbsent,
+            // O_EXCL without O_CREAT is undefined on Darwin as elsewhere, and
+            // is treated as the plain open it reads as.
+            (false, _) => Create::Never,
+        },
+        directory: flags & oflag::DIRECTORY != 0,
+        follow: flags & oflag::NOFOLLOW == 0,
+        close_on_exec: flags & oflag::CLOEXEC != 0,
+        mode: mode & 0o7777,
+    })
+}
+
+/// Read a path argument, which Darwin writes as a NUL-terminated byte string.
+fn read_path<'a>(host: &dyn Host, at: usize, out: &'a mut [u8; PATH_MAX]) -> Result<&'a str, i32> {
+    let len = host.platform().read_user_cstr(at, out)? as usize;
+    core::str::from_utf8(&out[..len]).map_err(|_| EINVAL)
+}
+
 /// Mach's calls are the other half of the Darwin ABI, and a program reaches
 /// both through the same instruction with the class in the top byte. Only the
 /// two that give up the processor are here; the rest of Mach - ports, messages,
@@ -183,6 +242,30 @@ fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
     let fd = a[0] as i32;
     Some(match call {
         // XNU's `exit` encodes the status the same way, through W_EXITCODE.
+        // open(path, flags, mode) and openat(fd, path, flags, mode). The flag
+        // word and the encoding of the name are this ABI's; resolving the name
+        // is the host's.
+        nr::OPEN | nr::OPENAT => {
+            let paths = host.paths()?;
+            let at_dir = if call == nr::OPENAT {
+                match a[0] as i32 {
+                    AT_FDCWD => At::Cwd,
+                    fd => At::Dir(fd),
+                }
+            } else {
+                At::Cwd
+            };
+            let base = usize::from(call == nr::OPENAT);
+            let mut buf = [0u8; PATH_MAX];
+            let path = match read_path(host, a[base], &mut buf) {
+                Ok(path) => path,
+                Err(errno) => return Some(Err(errno)),
+            };
+            match open_request(a[base + 1], a[base + 2] as u32) {
+                Ok(how) => paths.open(at_dir, path, &how),
+                Err(errno) => return Some(Err(errno)),
+            }
+        }
         nr::EXIT => host.tasks()?.exit_group((a[0] as i32) << 8),
         nr::READ => host.files()?.read(fd, a[1], a[2]),
         nr::WRITE => host.files()?.write(fd, a[1], a[2]),
@@ -358,9 +441,14 @@ mod tests {
         assert_eq!(bad.failed, Some(true));
     }
 
+    use alloc::{
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
     use core::cell::RefCell;
 
-    use ax_abi_port::{Creds, Files, Mem, Platform, Tasks};
+    use ax_abi_port::{Creds, EFAULT, Files, Mem, Paths, Platform, Tasks};
 
     use super::*;
 
@@ -408,16 +496,38 @@ mod tests {
         wrote: RefCell<Option<(i32, usize, usize)>>,
         mapped: RefCell<Option<MapRequest>>,
         advised: RefCell<Option<Advice>>,
+        /// User memory, as one flat buffer starting at address zero.
+        mem: RefCell<Vec<u8>>,
+        opened: RefCell<Option<(At, String, OpenHow)>>,
     }
     // Single-threaded tests; the ports ask for Sync on a real host.
     unsafe impl Sync for MockHost {}
 
     impl Platform for MockHost {
-        fn read_user(&self, _u: usize, _o: &mut [u8]) -> SysResult {
+        fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
+            let mem = self.mem.borrow();
+            let end = uaddr + out.len();
+            if end > mem.len() {
+                return Err(EFAULT);
+            }
+            out.copy_from_slice(&mem[uaddr..end]);
             Ok(0)
         }
         fn write_user(&self, _u: usize, _d: &[u8]) -> SysResult {
             Ok(0)
+        }
+        fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
+            // Reads one byte at a time so it stops at the terminator, which
+            // is what a host with real mappings has to do anyway.
+            for (i, slot) in out.iter_mut().enumerate() {
+                let mut byte = [0u8; 1];
+                self.read_user(uaddr + i, &mut byte)?;
+                if byte[0] == 0 {
+                    return Ok(i as isize);
+                }
+                *slot = byte[0];
+            }
+            Ok(out.len() as isize)
         }
     }
     impl Files for MockHost {
@@ -533,9 +643,19 @@ mod tests {
             (20, 20, 0)
         }
     }
+    impl Paths for MockHost {
+        fn open(&self, at: At, path: &str, how: &OpenHow) -> SysResult {
+            *self.opened.borrow_mut() = Some((at, path.to_string(), *how));
+            Ok(5)
+        }
+    }
+
     impl Host for MockHost {
         fn platform(&self) -> &dyn Platform {
             self
+        }
+        fn paths(&self) -> Option<&dyn Paths> {
+            Some(self)
         }
         fn files(&self) -> Option<&dyn Files> {
             Some(self)
@@ -560,6 +680,19 @@ mod tests {
         }
         fn write_user(&self, _u: usize, _d: &[u8]) -> SysResult {
             Ok(0)
+        }
+        fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
+            // Reads one byte at a time so it stops at the terminator, which
+            // is what a host with real mappings has to do anyway.
+            for (i, slot) in out.iter_mut().enumerate() {
+                let mut byte = [0u8; 1];
+                self.read_user(uaddr + i, &mut byte)?;
+                if byte[0] == 0 {
+                    return Ok(i as isize);
+                }
+                *slot = byte[0];
+            }
+            Ok(out.len() as isize)
         }
     }
     impl Host for StaticHost {
@@ -653,5 +786,81 @@ mod tests {
             ..Trap::default()
         };
         assert_eq!(dispatch(&mut exotic, &host), Dispatch::Passthrough);
+    }
+
+    /// A host whose user memory holds `path` as a NUL-terminated string at 0x40.
+    fn host_with_path(path: &str) -> (MockHost, usize) {
+        const AT: usize = 0x40;
+        let mut mem = vec![0u8; 0x200];
+        mem[AT..AT + path.len()].copy_from_slice(path.as_bytes());
+        (
+            MockHost {
+                mem: RefCell::new(mem),
+                ..MockHost::default()
+            },
+            AT,
+        )
+    }
+
+    #[test]
+    fn open_resolves_a_name_through_the_paths_port() {
+        let (host, at) = host_with_path("/lib/python3.14/os.py");
+        // open(path, O_RDONLY | O_CLOEXEC, 0)
+        let mut env = Trap::at(nr::OPEN, [at, oflag::RDONLY | oflag::CLOEXEC, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(5));
+        assert_eq!(env.failed, Some(false));
+
+        let opened = host.opened.borrow();
+        let (dir, name, how) = opened.as_ref().unwrap();
+        assert_eq!(*dir, At::Cwd);
+        assert_eq!(name, "/lib/python3.14/os.py");
+        assert!(how.read && !how.write && how.close_on_exec);
+        assert_eq!(how.create, Create::Never);
+    }
+
+    #[test]
+    fn openat_names_the_directory_it_is_relative_to() {
+        let (host, at) = host_with_path("os.py");
+        // openat(9, path, O_RDWR, 0)
+        let mut env = Trap::at(nr::OPENAT, [9, at, oflag::RDWR, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        let opened = host.opened.borrow();
+        let (dir, name, how) = opened.as_ref().unwrap();
+        assert_eq!(*dir, At::Dir(9));
+        assert_eq!(name, "os.py");
+        assert!(how.read && how.write);
+
+        // AT_FDCWD is -2 here, not the -100 other systems use, and names the
+        // working directory rather than a descriptor.
+        let (host, at) = host_with_path("os.py");
+        let mut env = Trap::at(nr::OPENAT, [AT_FDCWD as usize, at, oflag::RDONLY, 0, 0, 0]);
+        dispatch(&mut env, &host);
+        assert_eq!(host.opened.borrow().as_ref().unwrap().0, At::Cwd);
+    }
+
+    #[test]
+    fn creation_flags_carry_their_darwin_values() {
+        // O_CREAT is 0x200 and O_EXCL 0x800 here, where Linux uses 0x40 and
+        // 0x80: reading them with the wrong table would create the wrong file.
+        let (host, at) = host_with_path("/tmp/new");
+        let flags = oflag::WRONLY | oflag::CREAT | oflag::EXCL | oflag::TRUNC;
+        let mut env = Trap::at(nr::OPEN, [at, flags, 0o644, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        let opened = host.opened.borrow();
+        let how = &opened.as_ref().unwrap().2;
+        assert_eq!(how.create, Create::Exclusive);
+        assert!(how.truncate && how.write && !how.read);
+        assert_eq!(how.mode, 0o644);
+    }
+
+    #[test]
+    fn refuses_an_access_mode_that_names_nothing() {
+        let (host, at) = host_with_path("/tmp/f");
+        let mut env = Trap::at(nr::OPEN, [at, oflag::ACCMODE, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.failed, Some(true));
+        assert_eq!(env.result, Some(EINVAL as usize));
+        assert!(host.opened.borrow().is_none());
     }
 }

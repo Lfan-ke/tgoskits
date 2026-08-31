@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
+    At, OpenHow, Paths,
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
     Advice, Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
 };
@@ -17,7 +18,9 @@ use ax_runtime::hal;
 use ax_task::current;
 use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
 use starry_signal::SignalSet;
-use starry_vm::{vm_read_slice, vm_write_slice};
+use starry_vm::{vm_load_until_nul, vm_read_slice, vm_write_slice};
+
+use linux_raw_sys::general::AT_FDCWD;
 
 use super::{KernelHost, errno, port_result};
 use crate::{
@@ -25,7 +28,7 @@ use crate::{
     file::{add_file_like, close_file_like, get_file_like},
     mm::VmBytesMut,
     syscall,
-    syscall::{KillTarget, MmapFlags, MmapProt},
+    syscall::{KillTarget, MmapFlags, MmapProt, open_path},
     task::{AsThread, PgidNumber, TgidNumber, current_pid_view, do_exit},
 };
 
@@ -37,6 +40,16 @@ impl Platform for KernelHost {
             unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<MaybeUninit<u8>>(), out.len()) };
         vm_read_slice(uaddr as *const u8, buf).map_err(|e| errno(StarryError::from(e)))?;
         Ok(0)
+    }
+
+    fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
+        let bytes = vm_load_until_nul(uaddr as *const u8)
+            .map_err(|e| errno(StarryError::from(e)))?;
+        if bytes.len() > out.len() {
+            return Err(errno(StarryError::NameTooLong));
+        }
+        out[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len() as isize)
     }
 
     fn write_user(&self, uaddr: usize, data: &[u8]) -> SysResult {
@@ -97,6 +110,20 @@ impl Tasks for KernelHost {
 /// The kernel names a run by a plain pair.
 fn runs(segs: &[Segment]) -> Vec<(usize, usize)> {
     segs.iter().map(|s| (s.uaddr, s.len)).collect()
+}
+
+impl Paths for KernelHost {
+    fn open(&self, at: At, path: &str, how: &OpenHow) -> SysResult {
+        // Every ABI words a request differently - `O_*` bits, a Windows
+        // `CreateDisposition`, a Darwin flag set - and each decodes its own
+        // before it gets here. What the host does with what is left is resolve
+        // the name and install the result.
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        port_result(open_path(dirfd, path, how))
+    }
 }
 
 impl Files for KernelHost {

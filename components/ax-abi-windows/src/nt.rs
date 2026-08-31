@@ -17,7 +17,7 @@
 //! Argument positions follow the NT syscall signatures (`ntdll` prototypes /
 //! ReactOS `ntoskrnl/io`,`mm`), read via the ABI-neutral [`TrapEnv`].
 
-use ax_abi_port::{Host, MapRequest, MapSource, Prot};
+use ax_abi_port::{At, Create, Host, MapRequest, MapSource, OpenHow, Prot};
 use ax_dispatch::{Dispatch, TrapEnv};
 
 use crate::handle::Handle;
@@ -47,6 +47,10 @@ impl Ntstatus {
     pub const ACCESS_VIOLATION: Ntstatus = Ntstatus(0xC000_0005);
     /// `STATUS_UNSUCCESSFUL`.
     pub const UNSUCCESSFUL: Ntstatus = Ntstatus(0xC000_0001);
+    /// `STATUS_OBJECT_NAME_INVALID`: the name is not one this namespace can express.
+    pub const OBJECT_NAME_INVALID: Ntstatus = Ntstatus(0xC000_0033);
+    /// `STATUS_NAME_TOO_LONG`: the name is longer than this package will resolve.
+    pub const NAME_TOO_LONG: Ntstatus = Ntstatus(0xC000_0106);
 
     /// Whether the status denotes success (top bit clear).
     pub const fn is_success(self) -> bool {
@@ -119,7 +123,7 @@ fn write_io_status(host: &dyn Host, at: usize, status: Ntstatus, information: us
     if at == 0 {
         return status;
     }
-    let mut block = [0u8; 16];
+    let mut block = [0u8; IO_STATUS_BLOCK_LEN];
     block[..8].copy_from_slice(&u64::from(status.0).to_le_bytes());
     block[8..].copy_from_slice(&(information as u64).to_le_bytes());
     match host.platform().write_user(at, &block) {
@@ -135,6 +139,157 @@ fn read_pointer(host: &dyn Host, at: usize) -> Result<usize, Ntstatus> {
         .read_user(at, &mut buf)
         .map_err(status_from_errno)?;
     Ok(u64::from_le_bytes(buf) as usize)
+}
+
+/// `OBJECT_ATTRIBUTES` as x64 lays it out: `Length`, `RootDirectory`,
+/// `ObjectName`, `Attributes`, and two pointers this package does not read.
+const OBJECT_ATTRIBUTES_LEN: usize = 48;
+const OA_ROOT_DIRECTORY: usize = 8;
+const OA_OBJECT_NAME: usize = 16;
+
+/// `UNICODE_STRING`: a UTF-16 run given by byte length, not by a terminator.
+const UNICODE_STRING_LEN: usize = 16;
+
+/// `IO_STATUS_BLOCK`: the status, then what the operation did.
+const IO_STATUS_BLOCK_LEN: usize = 16;
+/// The `Information` values `NtCreateFile` reports.
+const FILE_SUPERSEDED: usize = 0;
+const FILE_OPENED: usize = 1;
+const FILE_CREATED: usize = 2;
+const FILE_OVERWRITTEN: usize = 3;
+
+/// `CreateDisposition`: what to do about the file already existing, or not.
+const FILE_SUPERSEDE: usize = 0;
+const FILE_OPEN: usize = 1;
+const FILE_CREATE: usize = 2;
+const FILE_OPEN_IF: usize = 3;
+const FILE_OVERWRITE: usize = 4;
+const FILE_OVERWRITE_IF: usize = 5;
+
+/// `CreateOptions` bits that change what is opened rather than how it is cached.
+const FILE_DIRECTORY_FILE: usize = 0x0000_0001;
+const FILE_OPEN_REPARSE_POINT: usize = 0x0020_0000;
+
+/// `DesiredAccess` bits that decide which way the file is opened.
+const FILE_READ_DATA: usize = 0x0000_0001;
+const FILE_WRITE_DATA: usize = 0x0000_0002;
+const FILE_APPEND_DATA: usize = 0x0000_0004;
+const GENERIC_WRITE: usize = 0x4000_0000;
+const GENERIC_READ: usize = 0x8000_0000;
+const GENERIC_ALL: usize = 0x1000_0000;
+
+/// `OBJ_INHERIT`, which decides whether the handle survives a spawn.
+const OBJ_INHERIT: u32 = 0x0000_0002;
+
+/// The longest path this package resolves, in bytes of UTF-8. Windows itself
+/// stops at 32767 UTF-16 units; a smaller bound keeps the buffer on the stack,
+/// and a name past it is refused rather than truncated.
+const PATH_MAX: usize = 1024;
+
+/// Decode a UTF-16 path from user memory into `out`, and hand back the part of
+/// it that names a file.
+///
+/// The caller writes an NT path: the object namespace prefix `\??\`, then a DOS
+/// drive, then the path itself with backslashes. Windows does the DOS-to-NT
+/// rewrite in user space before the call, so what arrives is already in this
+/// form. What comes back is the path with a single root, which is what every
+/// host here means by the same name.
+fn read_nt_path<'a>(
+    host: &dyn Host,
+    at: usize,
+    out: &'a mut [u8; PATH_MAX],
+) -> Result<&'a str, Ntstatus> {
+    let mut header = [0u8; UNICODE_STRING_LEN];
+    host.platform()
+        .read_user(at, &mut header)
+        .map_err(status_from_errno)?;
+    let len = u16::from_le_bytes([header[0], header[1]]) as usize;
+    let buffer = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+    if len == 0 || buffer == 0 || !len.is_multiple_of(2) {
+        return Err(Ntstatus::OBJECT_NAME_INVALID);
+    }
+    if len / 2 > PATH_MAX {
+        return Err(Ntstatus::NAME_TOO_LONG);
+    }
+
+    // Read the UTF-16 in place at the tail of the output buffer, so decoding
+    // into the front of it needs no second buffer: UTF-8 is never longer than
+    // UTF-16 for the ASCII a path is written in, and a non-ASCII name that
+    // would grow is refused below rather than overrunning.
+    let (utf8, utf16) = out.split_at_mut(PATH_MAX - len);
+    host.platform()
+        .read_user(buffer, &mut utf16[..len])
+        .map_err(status_from_errno)?;
+
+    let units = (0..len / 2).map(|i| u16::from_le_bytes([utf16[i * 2], utf16[i * 2 + 1]]));
+    let mut written = 0;
+    for unit in char::decode_utf16(units) {
+        let ch = unit.map_err(|_| Ntstatus::OBJECT_NAME_INVALID)?;
+        // A backslash separates in the caller's namespace and in no other, so
+        // it becomes the separator the host resolves with.
+        let ch = if ch == '\\' { '/' } else { ch };
+        let room = utf8.len().saturating_sub(written);
+        if ch.len_utf8() > room {
+            return Err(Ntstatus::NAME_TOO_LONG);
+        }
+        written += ch.encode_utf8(&mut utf8[written..]).len();
+    }
+
+    let path = core::str::from_utf8(&utf8[..written]).map_err(|_| Ntstatus::OBJECT_NAME_INVALID)?;
+    // Strip the object-namespace prefix and the DOS drive behind it. There is
+    // one filesystem here, so a drive letter names its root and nothing else.
+    let path = path.strip_prefix("/??/").unwrap_or(path);
+    let path = match path.as_bytes() {
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => &path[2..],
+        _ => path,
+    };
+    if path.is_empty() {
+        return Ok("/");
+    }
+    Ok(path)
+}
+
+/// Turn `DesiredAccess`, `CreateDisposition` and `CreateOptions` into the
+/// neutral request the host resolves, or say why the combination means nothing.
+fn open_request(
+    access: usize,
+    disposition: usize,
+    options: usize,
+    attributes: u32,
+) -> Result<(OpenHow, usize), Ntstatus> {
+    let read = access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) != 0;
+    let write = access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL) != 0;
+    let (create, truncate, information) = match disposition {
+        FILE_OPEN => (Create::Never, false, FILE_OPENED),
+        FILE_CREATE => (Create::Exclusive, false, FILE_CREATED),
+        FILE_OPEN_IF => (Create::IfAbsent, false, FILE_OPENED),
+        FILE_OVERWRITE => (Create::Never, true, FILE_OVERWRITTEN),
+        FILE_OVERWRITE_IF => (Create::IfAbsent, true, FILE_OVERWRITTEN),
+        FILE_SUPERSEDE => (Create::IfAbsent, true, FILE_SUPERSEDED),
+        _ => return Err(Ntstatus::INVALID_PARAMETER),
+    };
+    // Creating or truncating without having asked to write is a contradiction,
+    // not something to paper over by opening read-only.
+    if (truncate || create != Create::Never) && !write {
+        return Err(Ntstatus::INVALID_PARAMETER);
+    }
+    Ok((
+        OpenHow {
+            read: read || !write,
+            write,
+            append: access & FILE_APPEND_DATA != 0 && access & FILE_WRITE_DATA == 0,
+            truncate,
+            create,
+            directory: options & FILE_DIRECTORY_FILE != 0,
+            // A reparse point is the caller asking for the link itself.
+            follow: options & FILE_OPEN_REPARSE_POINT == 0,
+            // A handle is inheritable only when asked for, which is the
+            // opposite of the default a descriptor is installed with.
+            close_on_exec: attributes & OBJ_INHERIT == 0,
+            mode: 0o666,
+        },
+        information,
+    ))
 }
 
 /// The `PAGE_*` protections a caller may ask for.
@@ -396,10 +551,75 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             }
             Ntstatus::SUCCESS
         }
-        // Opening by name needs a path capability, and the remaining
-        // information classes describe things this package does not have; both
-        // stay with the caller rather than answering with something invented.
-        NtSyscall::CreateFile | NtSyscall::QueryInformationProcess => {
+        // NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+        // IoStatusBlock, AllocationSize, FileAttributes, ShareAccess,
+        // CreateDisposition, CreateOptions, EaBuffer, EaLength). The name is
+        // decoded here because its encoding and its namespace are this ABI's;
+        // resolving it is the host's.
+        NtSyscall::CreateFile => {
+            let Some(paths) = host.paths() else {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            };
+            let (handle_out, access, object_attributes, io_status) = (a(0), a(1), a(2), a(3));
+            if handle_out == 0 || object_attributes == 0 {
+                return finish(env, Ntstatus::INVALID_PARAMETER);
+            }
+
+            let mut oa = [0u8; OBJECT_ATTRIBUTES_LEN];
+            if let Err(errno) = host.platform().read_user(object_attributes, &mut oa) {
+                return finish(env, status_from_errno(errno));
+            }
+            let root = u64::from_le_bytes(
+                oa[OA_ROOT_DIRECTORY..OA_ROOT_DIRECTORY + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let name =
+                u64::from_le_bytes(oa[OA_OBJECT_NAME..OA_OBJECT_NAME + 8].try_into().unwrap())
+                    as usize;
+            let attributes = u32::from_le_bytes(oa[24..28].try_into().unwrap());
+            if name == 0 {
+                return finish(env, Ntstatus::OBJECT_NAME_INVALID);
+            }
+
+            let mut buf = [0u8; PATH_MAX];
+            let path = match read_nt_path(host, name, &mut buf) {
+                Ok(path) => path,
+                Err(status) => return finish(env, status),
+            };
+            let (how, information) = match open_request(access, a(7), a(8), attributes) {
+                Ok(request) => request,
+                Err(status) => return finish(env, status),
+            };
+            // A relative name is resolved against the directory the caller
+            // named, which is the one thing `RootDirectory` is for.
+            let at = match root {
+                0 => At::Cwd,
+                _ => match descriptor(root) {
+                    Ok(fd) => At::Dir(fd),
+                    Err(status) => return finish(env, status),
+                },
+            };
+
+            let fd = match paths.open(at, path, &how) {
+                Ok(fd) => fd,
+                Err(errno) => return finish(env, status_from_errno(errno)),
+            };
+            let Ok(slot) = usize::try_from(fd) else {
+                return finish(env, Ntstatus::UNSUCCESSFUL);
+            };
+            let handle = Handle::from_slot(slot);
+            if let Err(errno) = host
+                .platform()
+                .write_user(handle_out, &(handle.0 as u64).to_le_bytes())
+            {
+                return finish(env, status_from_errno(errno));
+            }
+            write_io_status(host, io_status, Ntstatus::SUCCESS, information)
+        }
+        // The remaining information classes describe things this package does
+        // not have, and stay with the caller rather than being invented.
+        NtSyscall::QueryInformationProcess => {
             return Dispatch::Passthrough;
         }
     };
@@ -414,7 +634,11 @@ fn finish(env: &mut dyn TrapEnv, status: Ntstatus) -> Dispatch {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::{
+        string::{String, ToString},
+        vec,
+        vec::Vec,
+    };
     use core::cell::RefCell;
 
     use super::*;
@@ -460,13 +684,31 @@ mod tests {
 
     // A host whose file port records what it was asked to move, and whose user
     // memory is one flat buffer at address zero.
-    #[derive(Default)]
     struct MockHost {
         mem: RefCell<Vec<u8>>,
         wrote: RefCell<Option<(i32, usize, usize)>>,
         closed: RefCell<Option<i32>>,
         mapped: RefCell<Option<MapRequest>>,
+        opened: RefCell<Option<(At, String, OpenHow)>>,
+        /// What the paths port answers with, or the error it reports.
+        opens_at: Result<i32, i32>,
+        /// Whether the host offers a paths port at all.
+        has_paths: bool,
     }
+    impl Default for MockHost {
+        fn default() -> Self {
+            Self {
+                mem: RefCell::default(),
+                wrote: RefCell::default(),
+                closed: RefCell::default(),
+                mapped: RefCell::default(),
+                opened: RefCell::default(),
+                opens_at: Ok(0),
+                has_paths: false,
+            }
+        }
+    }
+
     // The tests are single-threaded; the ports ask for Sync on a real host.
     unsafe impl Sync for MockHost {}
 
@@ -488,6 +730,19 @@ mod tests {
             }
             mem[uaddr..end].copy_from_slice(data);
             Ok(0)
+        }
+        fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> ax_abi_port::SysResult {
+            // Reads one byte at a time so it stops at the terminator, which
+            // is what a host with real mappings has to do anyway.
+            for (i, slot) in out.iter_mut().enumerate() {
+                let mut byte = [0u8; 1];
+                self.read_user(uaddr + i, &mut byte)?;
+                if byte[0] == 0 {
+                    return Ok(i as isize);
+                }
+                *slot = byte[0];
+            }
+            Ok(out.len() as isize)
         }
     }
 
@@ -587,9 +842,19 @@ mod tests {
         }
     }
 
+    impl ax_abi_port::Paths for MockHost {
+        fn open(&self, at: At, path: &str, how: &OpenHow) -> ax_abi_port::SysResult {
+            *self.opened.borrow_mut() = Some((at, path.to_string(), *how));
+            self.opens_at.map(|fd| fd as isize)
+        }
+    }
+
     impl Host for MockHost {
         fn platform(&self) -> &dyn ax_abi_port::Platform {
             self
+        }
+        fn paths(&self) -> Option<&dyn ax_abi_port::Paths> {
+            self.has_paths.then_some(self as &dyn ax_abi_port::Paths)
         }
         fn files(&self) -> Option<&dyn ax_abi_port::Files> {
             Some(self)
@@ -608,6 +873,19 @@ mod tests {
         }
         fn write_user(&self, _u: usize, _d: &[u8]) -> ax_abi_port::SysResult {
             Ok(0)
+        }
+        fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> ax_abi_port::SysResult {
+            // Reads one byte at a time so it stops at the terminator, which
+            // is what a host with real mappings has to do anyway.
+            for (i, slot) in out.iter_mut().enumerate() {
+                let mut byte = [0u8; 1];
+                self.read_user(uaddr + i, &mut byte)?;
+                if byte[0] == 0 {
+                    return Ok(i as isize);
+                }
+                *slot = byte[0];
+            }
+            Ok(out.len() as isize)
         }
     }
     impl Host for StaticHost {
@@ -724,11 +1002,164 @@ mod tests {
     }
 
     #[test]
-    fn a_call_without_a_port_stays_with_the_caller() {
+    fn a_request_this_package_does_not_answer_stays_with_the_caller() {
         let host = MockHost::default();
-        // Opening by name needs a capability this platform has no port for.
-        let mut env = trap(NtSyscall::CreateFile, [0; 4]);
+        // An information class this package has nothing to say about is the
+        // caller's to answer, not something to invent a reply for.
+        let mut env = trap(
+            NtSyscall::QueryInformationProcess,
+            [0, PROCESS_BASIC_INFORMATION + 1, 0, 0],
+        );
         assert_eq!(dispatch(&mut env, &host), Dispatch::Passthrough);
         assert_eq!(env.result, None);
+    }
+
+    /// Lay out the OBJECT_ATTRIBUTES and UNICODE_STRING a caller passes, with
+    /// `name` as the UTF-16 the object name points at.
+    fn object_attributes(host: &MockHost, name: &str, attributes: u32) -> usize {
+        const OA: usize = 0x100;
+        const US: usize = 0x200;
+        const BUF: usize = 0x300;
+        let utf16: Vec<u8> = name
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        let mut mem = host.mem.borrow_mut();
+        mem[OA + OA_ROOT_DIRECTORY..OA + OA_ROOT_DIRECTORY + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        mem[OA + OA_OBJECT_NAME..OA + OA_OBJECT_NAME + 8]
+            .copy_from_slice(&(US as u64).to_le_bytes());
+        mem[OA + 24..OA + 28].copy_from_slice(&attributes.to_le_bytes());
+        mem[US..US + 2].copy_from_slice(&(utf16.len() as u16).to_le_bytes());
+        mem[US + 8..US + 16].copy_from_slice(&(BUF as u64).to_le_bytes());
+        mem[BUF..BUF + utf16.len()].copy_from_slice(&utf16);
+        OA
+    }
+
+    fn create_file(host: &MockHost, name: &str, access: usize, disposition: usize) -> FakeTrap {
+        let oa = object_attributes(host, name, 0);
+        // NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+        // IoStatusBlock | AllocationSize, FileAttributes, ShareAccess,
+        // CreateDisposition, CreateOptions, ...): the rest arrive on the stack.
+        let mut env = trap_with_stack(
+            NtSyscall::CreateFile,
+            [0x400, access, oa, 0x410],
+            &[0, 0, 0, disposition, 0],
+            host,
+        );
+        dispatch(&mut env, host);
+        env
+    }
+
+    #[test]
+    fn opens_a_name_from_the_nt_namespace() {
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x500]),
+            has_paths: true,
+            opens_at: Ok(7),
+            ..MockHost::default()
+        };
+        let env = create_file(&host, r"\??\C:\lib\os.py", GENERIC_READ, FILE_OPEN);
+        assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
+
+        // The object-namespace prefix and the drive name the one root there is,
+        // and the separator becomes the one the host resolves with.
+        let opened = host.opened.borrow();
+        let (at, path, how) = opened.as_ref().unwrap();
+        assert_eq!(*at, At::Cwd);
+        assert_eq!(path, "/lib/os.py");
+        assert!(how.read && !how.write);
+        assert_eq!(how.create, Create::Never);
+        // OBJ_INHERIT was not asked for, so the handle does not survive a spawn.
+        assert!(how.close_on_exec);
+
+        // The handle is the descriptor in the caller's own numbering, and the
+        // status block says the file was opened rather than created.
+        let mem = host.mem.borrow();
+        assert_eq!(
+            u64::from_le_bytes(mem[0x400..0x408].try_into().unwrap()),
+            Handle::from_slot(7).0 as u64
+        );
+        assert_eq!(
+            u64::from_le_bytes(mem[0x418..0x420].try_into().unwrap()),
+            FILE_OPENED as u64
+        );
+    }
+
+    #[test]
+    fn each_disposition_asks_for_what_it_means() {
+        for (disposition, create, truncate, information) in [
+            (FILE_CREATE, Create::Exclusive, false, FILE_CREATED),
+            (FILE_OPEN_IF, Create::IfAbsent, false, FILE_OPENED),
+            (FILE_OVERWRITE, Create::Never, true, FILE_OVERWRITTEN),
+            (FILE_OVERWRITE_IF, Create::IfAbsent, true, FILE_OVERWRITTEN),
+            (FILE_SUPERSEDE, Create::IfAbsent, true, FILE_SUPERSEDED),
+        ] {
+            let host = MockHost {
+                mem: RefCell::new(vec![0u8; 0x500]),
+                has_paths: true,
+                opens_at: Ok(3),
+                ..MockHost::default()
+            };
+            let env = create_file(&host, r"\??\C:\f", GENERIC_WRITE, disposition);
+            assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
+            let opened = host.opened.borrow();
+            let how = &opened.as_ref().unwrap().2;
+            assert_eq!(how.create, create, "disposition {disposition}");
+            assert_eq!(how.truncate, truncate, "disposition {disposition}");
+            let mem = host.mem.borrow();
+            assert_eq!(
+                u64::from_le_bytes(mem[0x418..0x420].try_into().unwrap()),
+                information as u64,
+                "disposition {disposition}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_disposition_that_contradicts_the_access() {
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x500]),
+            has_paths: true,
+            opens_at: Ok(3),
+            ..MockHost::default()
+        };
+        // Creating a file without having asked to write it means nothing, and
+        // is refused rather than quietly opened read-only.
+        let env = create_file(&host, r"\??\C:\f", GENERIC_READ, FILE_CREATE);
+        assert_eq!(env.result, Some(Ntstatus::INVALID_PARAMETER.0 as usize));
+        assert!(host.opened.borrow().is_none());
+
+        // An unnamed disposition is not guessed at either.
+        let env = create_file(&host, r"\??\C:\f", GENERIC_WRITE, 99);
+        assert_eq!(env.result, Some(Ntstatus::INVALID_PARAMETER.0 as usize));
+    }
+
+    #[test]
+    fn reports_the_hosts_refusal_as_the_status_it_means() {
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x500]),
+            has_paths: true,
+            opens_at: Err(ax_abi_port::ENOENT),
+            ..MockHost::default()
+        };
+        let env = create_file(&host, r"\??\C:\missing", GENERIC_READ, FILE_OPEN);
+        assert_eq!(
+            env.result,
+            Some(status_from_errno(ax_abi_port::ENOENT).0 as usize)
+        );
+    }
+
+    #[test]
+    fn a_platform_without_the_capability_says_so() {
+        // The host has no paths port, which is a different answer from the ABI
+        // declining the request: the call is this package's, the platform
+        // cannot serve it.
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x500]),
+            ..MockHost::default()
+        };
+        let env = create_file(&host, r"\??\C:\f", GENERIC_READ, FILE_OPEN);
+        assert_eq!(env.result, Some(Ntstatus::NOT_IMPLEMENTED.0 as usize));
     }
 }

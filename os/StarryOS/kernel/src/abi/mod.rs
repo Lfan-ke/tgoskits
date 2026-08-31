@@ -17,7 +17,7 @@
 
 mod port;
 
-use ax_abi_port::{Clock, Creds, CurrentHost, Files, Host, Mem, Platform, Random, Signals, System, Tasks};
+use ax_abi_port::{Clock, Creds, CurrentHost, Files, Host, Mem, Paths, Platform, Random, Signals, System, Tasks};
 use ax_dispatch::TrapEnv;
 use ax_crate_interface::call_interface;
 use ax_runtime::hal::cpu::uspace::UserContext;
@@ -123,6 +123,9 @@ impl Host for KernelHost {
         Some(self)
     }
     fn creds(&self) -> Option<&dyn Creds> {
+        Some(self)
+    }
+    fn paths(&self) -> Option<&dyn Paths> {
         Some(self)
     }
 }
