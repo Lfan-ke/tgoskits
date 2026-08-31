@@ -88,7 +88,12 @@ pub fn dispatch(image: &[u8]) -> AbiResult<&'static dyn ImageFormat> {
 }
 
 #[cfg(test)]
+extern crate alloc;
+
+#[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use ax_abi_port::{Platform, SysResult};
 
     use super::*;
@@ -116,6 +121,39 @@ mod tests {
         fn current() -> &'static dyn Host {
             static HOST: BareHost = BareHost;
             &HOST
+        }
+    }
+
+    #[test]
+    fn a_package_registers_once_per_capability_it_provides() {
+        // Servicing traps and loading images are separate capabilities with
+        // separate registries, so a package appears in the one it provides -
+        // both, for a package that does both. Nothing here names a package.
+        let abis: Vec<Abi> = personalities().map(|p| p.abi()).collect();
+        let formats: Vec<Abi> = ax_binfmt::BINFMTS.iter().map(|get| get().abi()).collect();
+
+        #[cfg(feature = "linux")]
+        {
+            assert!(abis.contains(&Abi::Linux));
+            // The Linux package carries ELF only when asked for it, because a
+            // host may still load ELF itself.
+            assert_eq!(formats.contains(&Abi::Linux), cfg!(feature = "linux-elf"));
+        }
+        #[cfg(feature = "win")]
+        {
+            assert!(abis.contains(&Abi::Windows));
+            assert!(formats.contains(&Abi::Windows));
+        }
+        #[cfg(feature = "mac")]
+        {
+            assert!(abis.contains(&Abi::Darwin));
+            assert!(formats.contains(&Abi::Darwin));
+        }
+        // An ABI nothing linked in speaks is absent from both.
+        #[cfg(not(feature = "win"))]
+        {
+            assert!(!abis.contains(&Abi::Windows));
+            assert!(!formats.contains(&Abi::Windows));
         }
     }
 

@@ -137,7 +137,7 @@ mod tests {
     fn loads_segments_skipping_pagezero() {
         let img = synth();
         let mut env = RecordingEnv::default();
-        let loaded = DarwinAbi
+        let loaded = MachoFormat
             .load(
                 &LoadRequest {
                     image: &img,
@@ -200,7 +200,7 @@ mod tests {
         b[off + 8..off + 16].copy_from_slice(&0x100u64.to_le_bytes()); // entryoff in __TEXT
 
         let mut env = RecordingEnv::default();
-        let loaded = DarwinAbi
+        let loaded = MachoFormat
             .load(
                 &LoadRequest {
                     image: &b,
@@ -227,11 +227,11 @@ mod tests {
 
     #[test]
     fn recognizes_only_mach_o() {
-        assert!(DarwinAbi.recognizes(&[0xFE, 0xED, 0xFA, 0xCF]));
-        assert!(!DarwinAbi.recognizes(b"MZ"));
+        assert!(MachoFormat.recognizes(&[0xFE, 0xED, 0xFA, 0xCF]));
+        assert!(!MachoFormat.recognizes(b"MZ"));
         let mut env = RecordingEnv::default();
         assert_eq!(
-            DarwinAbi.load(
+            MachoFormat.load(
                 &LoadRequest {
                     image: b"\x7fELF",
                     load_base: 0,
@@ -245,7 +245,7 @@ mod tests {
     }
 }
 
-impl ImageFormat for DarwinAbi {
+impl ImageFormat for MachoFormat {
     fn abi(&self) -> Abi {
         Abi::Darwin
     }
@@ -292,10 +292,16 @@ fn darwin() -> &'static dyn SysAbi {
 
 ax_dispatch::register_sysabi!(darwin);
 
-/// The same package registers twice, once per capability: it knows how to
-/// map this format, and it knows how to service the traps that follow.
+/// The executable format this package loads. Kept apart from the type that
+/// services traps because they are separate capabilities: a package may
+/// provide either, and this one provides both.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MachoFormat;
+
+/// The same package registers twice, once per capability: it knows how to map
+/// this format, and it knows how to service the traps that follow.
 fn darwin_format() -> &'static dyn ImageFormat {
-    static IT: DarwinAbi = DarwinAbi;
+    static IT: MachoFormat = MachoFormat;
     &IT
 }
 

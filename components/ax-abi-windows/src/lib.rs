@@ -231,7 +231,7 @@ mod tests {
         );
 
         let mut env = RecordingEnv::default();
-        let loaded = WindowsAbi
+        let loaded = PeFormat
             .load(
                 &LoadRequest {
                     image: &img,
@@ -324,7 +324,7 @@ mod tests {
         );
 
         let mut env = RecordingEnv::default();
-        WindowsAbi
+        PeFormat
             .load(
                 &LoadRequest {
                     image: &img,
@@ -351,9 +351,9 @@ mod tests {
     #[test]
     fn rejects_non_pe_and_pe32() {
         let mut env = RecordingEnv::default();
-        assert!(!WindowsAbi.recognizes(b"\x7fELF"));
+        assert!(!PeFormat.recognizes(b"\x7fELF"));
         assert_eq!(
-            WindowsAbi.load(
+            PeFormat.load(
                 &LoadRequest {
                     image: b"not pe",
                     load_base: 0,
@@ -367,7 +367,7 @@ mod tests {
     }
 }
 
-impl ImageFormat for WindowsAbi {
+impl ImageFormat for PeFormat {
     fn abi(&self) -> Abi {
         Abi::Windows
     }
@@ -404,10 +404,16 @@ fn windows() -> &'static dyn SysAbi {
 
 ax_dispatch::register_sysabi!(windows);
 
-/// The same package registers twice, once per capability: it knows how to
-/// map this format, and it knows how to service the traps that follow.
+/// The executable format this package loads. Kept apart from the type that
+/// services traps because they are separate capabilities: a package may
+/// provide either, and this one provides both.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeFormat;
+
+/// The same package registers twice, once per capability: it knows how to map
+/// this format, and it knows how to service the traps that follow.
 fn windows_format() -> &'static dyn ImageFormat {
-    static IT: WindowsAbi = WindowsAbi;
+    static IT: PeFormat = PeFormat;
     &IT
 }
 
