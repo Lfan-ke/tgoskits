@@ -161,6 +161,47 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         Sysno::write => host.files()?.write(arg(0) as i32, arg(1), arg(2)),
         #[cfg(feature = "fs")]
         Sysno::close => host.files()?.close(arg(0) as i32),
+        // Name resolution - the domain owns the flag vocabulary and the
+        // architecture's stat layout; the host only resolves and describes.
+        #[cfg(feature = "paths")]
+        Sysno::newfstatat => sys_newfstatat(
+            host.platform(),
+            host.paths()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2),
+            arg(3) as i32,
+        ),
+        #[cfg(feature = "paths")]
+        Sysno::fstat => sys_fstat(host.platform(), host.paths()?, arg(0) as i32, arg(1)),
+        #[cfg(feature = "paths")]
+        Sysno::faccessat => sys_faccessat(
+            host.platform(),
+            host.paths()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2) as i32,
+            0,
+        ),
+        #[cfg(feature = "paths")]
+        Sysno::faccessat2 => sys_faccessat(
+            host.platform(),
+            host.paths()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2) as i32,
+            arg(3) as i32,
+        ),
+        // Only the x86_64 table carries the two-argument form.
+        #[cfg(all(feature = "paths", target_arch = "x86_64"))]
+        Sysno::access => sys_faccessat(
+            host.platform(),
+            host.paths()?,
+            AT_FDCWD,
+            arg(0),
+            arg(1) as i32,
+            0,
+        ),
         #[cfg(feature = "fs")]
         Sysno::dup => host.files()?.dup(arg(0) as i32),
         // Only the x86_64 table carries dup2; the generic ABI has dup3 alone.
@@ -573,6 +614,228 @@ fn sys_clock_nanosleep(
             }
         }
     })())
+}
+
+/// Longest name Linux resolves, terminator included.
+#[cfg(feature = "paths")]
+const PATH_MAX: usize = linux_raw_sys::general::PATH_MAX as usize;
+
+/// `AT_FDCWD` - resolve against the working directory.
+#[cfg(feature = "paths")]
+const AT_FDCWD: i32 = linux_raw_sys::general::AT_FDCWD;
+
+/// Where a relative name is resolved from.
+///
+/// Linux spells the working directory as a reserved descriptor rather than as
+/// a separate argument, so the translation belongs here and the port sees the
+/// distinction it actually cares about.
+#[cfg(feature = "paths")]
+fn resolve_from(dirfd: i32) -> ops::At {
+    if dirfd == AT_FDCWD {
+        ops::At::Cwd
+    } else {
+        ops::At::Dir(dirfd)
+    }
+}
+
+/// Read a path argument out of user memory.
+///
+/// Linux passes an opaque NUL-terminated byte string. A name whose bytes are
+/// not valid UTF-8 is one this host cannot resolve, which is `ENOENT` and not
+/// a fault: the pointer was readable, the name simply is not there.
+#[cfg(feature = "paths")]
+fn read_path(platform: &dyn ops::Platform, uaddr: usize) -> Result<alloc::string::String, i32> {
+    use alloc::{string::String, vec};
+
+    if uaddr == 0 {
+        return Err(ops::EFAULT);
+    }
+    let mut buf = vec![0u8; PATH_MAX];
+    let len = platform.read_user_cstr(uaddr, &mut buf)? as usize;
+    buf.truncate(len);
+    String::from_utf8(buf).map_err(|_| ENOENT)
+}
+
+/// `ENOENT` - the name is not there.
+#[cfg(feature = "paths")]
+const ENOENT: i32 = 2;
+
+/// The `st_mode` word: the format Linux encodes in the high bits, plus the
+/// permission bits the host reports.
+#[cfg(feature = "paths")]
+fn mode_word(kind: ops::NodeKind, mode: u32) -> u32 {
+    use linux_raw_sys::general::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
+
+    let format = match kind {
+        ops::NodeKind::File => S_IFREG,
+        ops::NodeKind::Directory => S_IFDIR,
+        ops::NodeKind::Symlink => S_IFLNK,
+        ops::NodeKind::CharDevice => S_IFCHR,
+        ops::NodeKind::BlockDevice => S_IFBLK,
+        ops::NodeKind::Fifo => S_IFIFO,
+        ops::NodeKind::Socket => S_IFSOCK,
+    };
+    format | (mode & 0o7777)
+}
+
+/// Lay attributes out as this architecture's `struct stat` and hand it over.
+///
+/// The layout is the ABI's, so it comes from the kernel headers rather than
+/// being spelled out here; the padding words differ between the x86-64 table
+/// and the generic one and are left zeroed either way.
+#[cfg(feature = "paths")]
+fn put_stat(
+    platform: &dyn ops::Platform,
+    uaddr: usize,
+    attrs: &ops::Attributes,
+) -> Result<(), i32> {
+    const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+    if uaddr == 0 {
+        return Err(ops::EFAULT);
+    }
+    // Every field is an integer, so an all-zero value is a valid starting point
+    // and leaves the architecture's padding words at zero.
+    let mut st: linux_raw_sys::general::stat = unsafe { core::mem::zeroed() };
+    st.st_dev = attrs.device as _;
+    st.st_ino = attrs.inode as _;
+    st.st_nlink = attrs.links as _;
+    st.st_mode = mode_word(attrs.kind, attrs.mode);
+    st.st_uid = attrs.uid;
+    st.st_gid = attrs.gid;
+    st.st_rdev = attrs.rdev as _;
+    st.st_size = attrs.size as _;
+    st.st_blksize = attrs.block_size as _;
+    st.st_blocks = attrs.blocks as _;
+    st.st_atime = (attrs.accessed_ns / NANOS_PER_SEC) as _;
+    st.st_atime_nsec = (attrs.accessed_ns % NANOS_PER_SEC) as _;
+    st.st_mtime = (attrs.modified_ns / NANOS_PER_SEC) as _;
+    st.st_mtime_nsec = (attrs.modified_ns % NANOS_PER_SEC) as _;
+    st.st_ctime = (attrs.changed_ns / NANOS_PER_SEC) as _;
+    st.st_ctime_nsec = (attrs.changed_ns % NANOS_PER_SEC) as _;
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&raw const st).cast::<u8>(),
+            core::mem::size_of::<linux_raw_sys::general::stat>(),
+        )
+    };
+    platform.write_user(uaddr, bytes).map(|_| ())
+}
+
+/// Decode Linux's access mode word.
+///
+/// `F_OK` is the empty request, so an all-clear word asks only whether the name
+/// is there. Anything outside the three permission bits is not a mode Linux
+/// accepts.
+#[cfg(feature = "paths")]
+fn access_wants(mode: i32) -> Option<ops::Access> {
+    use linux_raw_sys::general::{R_OK, S_IRWXO, W_OK, X_OK};
+
+    if mode & !(S_IRWXO as i32) != 0 {
+        return None;
+    }
+    Some(ops::Access {
+        read: mode & R_OK as i32 != 0,
+        write: mode & W_OK as i32 != 0,
+        execute: mode & X_OK as i32 != 0,
+    })
+}
+
+/// `faccessat2(dirfd, path, mode, flags)`, and `faccessat`/`access` through it.
+///
+/// Follows `do_faccessat`: the mode word is rejected before anything is
+/// resolved, `AT_EACCESS` asks for the effective identity rather than the real
+/// one, and an empty name with `AT_EMPTY_PATH` asks about the reference itself.
+#[cfg(feature = "paths")]
+fn sys_faccessat(
+    platform: &dyn ops::Platform,
+    paths: &dyn ops::Paths,
+    dirfd: i32,
+    path: usize,
+    mode: i32,
+    flags: i32,
+) -> SysResult {
+    use linux_raw_sys::general::{AT_EACCESS, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+
+    let Some(wants) = access_wants(mode) else {
+        return Err(ops::EINVAL);
+    };
+    let known = (AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) as i32;
+    if flags & !known != 0 {
+        return Err(ops::EINVAL);
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW as i32 == 0;
+    // Without AT_EACCESS the question is about the real identity, which is the
+    // point of the call for a set-user-ID program.
+    let real_ids = flags & AT_EACCESS as i32 == 0;
+    let name = read_path(platform, path)?;
+
+    if name.is_empty() {
+        if flags & AT_EMPTY_PATH as i32 == 0 {
+            return Err(ENOENT);
+        }
+        if dirfd >= 0 {
+            return paths.permitted_of(dirfd, wants, real_ids).map(|()| 0);
+        }
+        return paths
+            .permitted(ops::At::Cwd, ".", wants, follow, real_ids)
+            .map(|()| 0);
+    }
+    paths
+        .permitted(resolve_from(dirfd), &name, wants, follow, real_ids)
+        .map(|()| 0)
+}
+
+/// `newfstatat(dirfd, path, statbuf, flags)`.
+///
+/// Follows `vfs_fstatat`: an empty name with `AT_EMPTY_PATH` describes the
+/// descriptor itself when one was given, and otherwise resolves against the
+/// working directory. `AT_NO_AUTOMOUNT` is accepted and has nothing to do here.
+#[cfg(feature = "paths")]
+fn sys_newfstatat(
+    platform: &dyn ops::Platform,
+    paths: &dyn ops::Paths,
+    dirfd: i32,
+    path: usize,
+    statbuf: usize,
+    flags: i32,
+) -> SysResult {
+    use linux_raw_sys::general::{AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
+
+    let known = (AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW) as i32;
+    if flags & !known != 0 {
+        return Err(ops::EINVAL);
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW as i32 == 0;
+    let name = read_path(platform, path)?;
+
+    let attrs = if name.is_empty() && flags & AT_EMPTY_PATH as i32 != 0 {
+        if dirfd >= 0 {
+            paths.attributes_of(dirfd)?
+        } else {
+            paths.attributes(ops::At::Cwd, ".", follow)?
+        }
+    } else if name.is_empty() {
+        // Without AT_EMPTY_PATH an empty name is simply a name that is not there.
+        return Err(ENOENT);
+    } else {
+        paths.attributes(resolve_from(dirfd), &name, follow)?
+    };
+
+    put_stat(platform, statbuf, &attrs).map(|()| 0)
+}
+
+/// `fstat(fd, statbuf)`.
+#[cfg(feature = "paths")]
+fn sys_fstat(
+    platform: &dyn ops::Platform,
+    paths: &dyn ops::Paths,
+    fd: i32,
+    statbuf: usize,
+) -> SysResult {
+    let attrs = paths.attributes_of(fd)?;
+    put_stat(platform, statbuf, &attrs).map(|()| 0)
 }
 
 /// `readv(fd, iov, iovcnt)`: scatter one read across the runs the vector names.
@@ -1304,6 +1567,10 @@ mod tests {
         heap: RefCell<usize>,
         mapped: RefCell<Option<ops::MapRequest>>,
         blocking_source: RefCell<Option<bool>>,
+        described: RefCell<Option<(alloc::string::String, bool)>>,
+        described_fd: RefCell<Option<i32>>,
+        asked: RefCell<Option<(alloc::string::String, ops::Access, bool, bool)>>,
+        asked_fd: RefCell<Option<(i32, ops::Access, bool)>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Mock {}
@@ -1594,6 +1861,73 @@ mod tests {
             Ok(len as isize)
         }
     }
+    impl ops::Paths for Mock {
+        fn open(&self, _at: ops::At, _path: &str, _how: &ops::OpenHow) -> SysResult {
+            Err(super::ENOSYS)
+        }
+
+        fn attributes(
+            &self,
+            at: ops::At,
+            path: &str,
+            follow: bool,
+        ) -> Result<ops::Attributes, i32> {
+            let named = match at {
+                ops::At::Cwd => alloc::format!("cwd:{path}"),
+                ops::At::Dir(fd) => alloc::format!("{fd}:{path}"),
+            };
+            *self.described.borrow_mut() = Some((named, follow));
+            Ok(attrs(ops::NodeKind::File, 0o644))
+        }
+
+        fn attributes_of(&self, fd: i32) -> Result<ops::Attributes, i32> {
+            *self.described_fd.borrow_mut() = Some(fd);
+            Ok(attrs(ops::NodeKind::Directory, 0o755))
+        }
+
+        fn permitted(
+            &self,
+            at: ops::At,
+            path: &str,
+            wants: ops::Access,
+            follow: bool,
+            real_ids: bool,
+        ) -> Result<(), i32> {
+            let named = match at {
+                ops::At::Cwd => alloc::format!("cwd:{path}"),
+                ops::At::Dir(fd) => alloc::format!("{fd}:{path}"),
+            };
+            *self.asked.borrow_mut() = Some((named, wants, follow, real_ids));
+            Ok(())
+        }
+
+        fn permitted_of(&self, fd: i32, wants: ops::Access, real_ids: bool) -> Result<(), i32> {
+            *self.asked_fd.borrow_mut() = Some((fd, wants, real_ids));
+            Ok(())
+        }
+    }
+
+    /// A node the mock can describe, with every field distinct so a test can
+    /// tell one from another after it lands in user memory.
+    fn attrs(kind: ops::NodeKind, mode: u32) -> ops::Attributes {
+        ops::Attributes {
+            kind,
+            mode,
+            size: 1234,
+            block_size: 4096,
+            blocks: 8,
+            device: 5,
+            rdev: 0,
+            inode: 42,
+            links: 1,
+            uid: 7,
+            gid: 9,
+            accessed_ns: 3_000_000_001,
+            modified_ns: 4_000_000_002,
+            changed_ns: 5_000_000_003,
+        }
+    }
+
     impl Host for Mock {
         fn platform(&self) -> &dyn Platform {
             self
@@ -1620,6 +1954,9 @@ mod tests {
             Some(self)
         }
         fn random(&self) -> Option<&dyn Random> {
+            Some(self)
+        }
+        fn paths(&self) -> Option<&dyn ops::Paths> {
             Some(self)
         }
     }
@@ -2659,5 +2996,187 @@ mod tests {
     fn encode_follows_linux_convention() {
         assert_eq!(encode(Ok(16)), 16);
         assert_eq!(encode(Err(ENOSYS)), (-(ENOSYS as isize)) as usize);
+    }
+
+    // newfstatat: the flag vocabulary, the empty-name rules and the stat layout
+    // all belong to this domain, so each is asserted here rather than assumed of
+    // the host.
+
+    #[test]
+    fn newfstatat_rejects_a_flag_it_does_not_know() {
+        let host = Mock::default();
+        let err = super::sys_newfstatat(&host, &host, super::AT_FDCWD, 0x10, 0x100, 0x4000);
+        assert_eq!(err, Err(EINVAL));
+        assert!(host.described.borrow().is_none());
+    }
+
+    #[test]
+    fn newfstatat_describes_the_descriptor_for_an_empty_name_with_at_empty_path() {
+        let host = Mock::default();
+        *host.umem.borrow_mut() = alloc::vec![0u8; 512];
+        let flags = linux_raw_sys::general::AT_EMPTY_PATH as i32;
+
+        let out = super::sys_newfstatat(&host, &host, 3, 0x10, 0x100, flags);
+
+        assert_eq!(out, Ok(0));
+        assert_eq!(*host.described_fd.borrow(), Some(3));
+        assert!(host.described.borrow().is_none());
+    }
+
+    #[test]
+    fn newfstatat_without_at_empty_path_reports_an_empty_name_as_missing() {
+        let host = Mock::default();
+        *host.umem.borrow_mut() = alloc::vec![0u8; 512];
+
+        let out = super::sys_newfstatat(&host, &host, super::AT_FDCWD, 0x10, 0x100, 0);
+
+        assert_eq!(out, Err(super::ENOENT));
+    }
+
+    #[test]
+    fn newfstatat_resolves_relative_to_the_descriptor_and_lays_out_stat() {
+        let host = Mock::default();
+        let mut mem = alloc::vec![0u8; 1024];
+        mem[0x10..0x10 + 5].copy_from_slice(b"lib\0\0");
+        *host.umem.borrow_mut() = mem;
+
+        let out = super::sys_newfstatat(&host, &host, 5, 0x10, 0x100, 0);
+
+        assert_eq!(out, Ok(0));
+        assert_eq!(
+            *host.described.borrow(),
+            Some((alloc::string::String::from("5:lib"), true))
+        );
+
+        let mem = host.umem.borrow();
+        let size = core::mem::size_of::<linux_raw_sys::general::stat>();
+        let mut st: linux_raw_sys::general::stat = unsafe { core::mem::zeroed() };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                mem[0x100..0x100 + size].as_ptr(),
+                (&raw mut st).cast::<u8>(),
+                size,
+            );
+        }
+        assert_eq!(st.st_ino, 42);
+        assert_eq!(st.st_size, 1234);
+        assert_eq!(st.st_uid, 7);
+        assert_eq!(st.st_gid, 9);
+        assert_eq!(st.st_mode, linux_raw_sys::general::S_IFREG | 0o644);
+        assert_eq!(st.st_atime, 3);
+        assert_eq!(st.st_atime_nsec, 1);
+        assert_eq!(st.st_mtime, 4);
+        assert_eq!(st.st_mtime_nsec, 2);
+    }
+
+    #[test]
+    fn newfstatat_keeps_the_link_itself_when_told_not_to_follow() {
+        let host = Mock::default();
+        let mut mem = alloc::vec![0u8; 1024];
+        mem[0x10..0x10 + 5].copy_from_slice(b"lnk\0\0");
+        *host.umem.borrow_mut() = mem;
+        let flags = linux_raw_sys::general::AT_SYMLINK_NOFOLLOW as i32;
+
+        let out = super::sys_newfstatat(&host, &host, super::AT_FDCWD, 0x10, 0x100, flags);
+
+        assert_eq!(out, Ok(0));
+        assert_eq!(
+            *host.described.borrow(),
+            Some((alloc::string::String::from("cwd:lnk"), false))
+        );
+    }
+
+    #[test]
+    fn fstat_describes_the_descriptor() {
+        let host = Mock::default();
+        *host.umem.borrow_mut() = alloc::vec![0u8; 512];
+
+        let out = super::sys_fstat(&host, &host, 9, 0x100);
+
+        assert_eq!(out, Ok(0));
+        assert_eq!(*host.described_fd.borrow(), Some(9));
+    }
+
+    // faccessat: the mode word, the flag vocabulary and which identity the
+    // question is about are the ABI's; whether the caller may reach the name is
+    // the host's, so the domain is asserted on what it hands over.
+
+    #[test]
+    fn faccessat_rejects_a_mode_outside_the_permission_bits() {
+        let host = Mock::default();
+        let err = super::sys_faccessat(&host, &host, super::AT_FDCWD, 0x10, 0o10, 0);
+        assert_eq!(err, Err(EINVAL));
+        assert!(host.asked.borrow().is_none());
+    }
+
+    #[test]
+    fn faccessat_rejects_a_flag_it_does_not_know() {
+        let host = Mock::default();
+        let err = super::sys_faccessat(&host, &host, super::AT_FDCWD, 0x10, 0, 0x4000);
+        assert_eq!(err, Err(EINVAL));
+    }
+
+    #[test]
+    fn faccessat_decodes_the_mode_and_asks_about_the_real_identity() {
+        use linux_raw_sys::general::{R_OK, X_OK};
+
+        let host = Mock::default();
+        let mut mem = alloc::vec![0u8; 512];
+        mem[0x10..0x10 + 4].copy_from_slice(b"bin\0");
+        *host.umem.borrow_mut() = mem;
+
+        let out =
+            super::sys_faccessat(&host, &host, super::AT_FDCWD, 0x10, (R_OK | X_OK) as i32, 0);
+
+        assert_eq!(out, Ok(0));
+        let asked = host.asked.borrow().clone().expect("host was asked");
+        assert_eq!(asked.0, alloc::string::String::from("cwd:bin"));
+        assert_eq!(
+            asked.1,
+            ops::Access {
+                read: true,
+                write: false,
+                execute: true
+            }
+        );
+        assert!(asked.2, "resolves through symlinks by default");
+        assert!(
+            asked.3,
+            "without AT_EACCESS the question is about the real ids"
+        );
+    }
+
+    #[test]
+    fn faccessat_with_at_eaccess_asks_about_the_effective_identity() {
+        use linux_raw_sys::general::AT_EACCESS;
+
+        let host = Mock::default();
+        let mut mem = alloc::vec![0u8; 512];
+        mem[0x10..0x10 + 4].copy_from_slice(b"bin\0");
+        *host.umem.borrow_mut() = mem;
+
+        let out = super::sys_faccessat(&host, &host, 7, 0x10, 0, AT_EACCESS as i32);
+
+        assert_eq!(out, Ok(0));
+        let asked = host.asked.borrow().clone().expect("host was asked");
+        assert_eq!(asked.0, alloc::string::String::from("7:bin"));
+        assert_eq!(asked.1, ops::Access::default(), "an empty mode is F_OK");
+        assert!(!asked.3);
+    }
+
+    #[test]
+    fn faccessat_asks_about_the_descriptor_for_an_empty_name_with_at_empty_path() {
+        use linux_raw_sys::general::{AT_EMPTY_PATH, W_OK};
+
+        let host = Mock::default();
+        *host.umem.borrow_mut() = alloc::vec![0u8; 512];
+
+        let out = super::sys_faccessat(&host, &host, 4, 0x10, W_OK as i32, AT_EMPTY_PATH as i32);
+
+        assert_eq!(out, Ok(0));
+        let asked = (*host.asked_fd.borrow()).expect("host was asked");
+        assert_eq!(asked.0, 4);
+        assert!(asked.1.write);
+        assert!(host.asked.borrow().is_none());
     }
 }
