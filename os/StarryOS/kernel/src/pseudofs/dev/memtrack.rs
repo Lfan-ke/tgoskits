@@ -11,7 +11,6 @@ use axbacktrace::Backtrace;
 use axfs_ng_vfs::{NodeFlags, VfsResult};
 
 use crate::{
-    mm::clear_elf_cache,
     pseudofs::DeviceOps,
     sync::IrqMutex,
     task::{cleanup_task_tables, tasks},
@@ -39,7 +38,9 @@ fn run_memory_analysis() {
     // Wait for gc
     ax_task::yield_now();
     cleanup_task_tables();
-    clear_elf_cache();
+    // The loader no longer keeps its own map of parsed images; a loaded file
+    // lives in the filesystem's cache, whose index holds it weakly, so the last
+    // reference going away is what releases it and there is nothing to purge.
 
     ax_println!(
         "Alive tasks: {:?}",
