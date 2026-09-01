@@ -17,12 +17,13 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(used_with_arg)]
 
-#[cfg(any(feature = "fs", feature = "elf"))]
+#[cfg(any(feature = "fs", feature = "elf", feature = "paths"))]
 extern crate alloc;
 
 #[cfg(feature = "elf")]
 pub mod elf;
 
+// A build with no syscall family and no format has nothing to register.
 #[cfg(not(any(
     feature = "fs",
     feature = "mm",
@@ -31,34 +32,54 @@ pub mod elf;
     feature = "time",
     feature = "random",
     feature = "system",
-    feature = "creds"
+    feature = "creds",
+    feature = "paths",
+    feature = "elf"
 )))]
-compile_error!("ax-abi-linux needs at least one syscall family enabled");
+compile_error!("ax-abi-linux needs a syscall family or the elf format enabled");
 
 pub use ax_abi_port as ops;
 use ax_crate_interface::call_interface;
 use ax_dispatch::{Abi, Dispatch, SysAbi, TrapEnv, TrapOutcome};
 use ops::{ENOSYS, Host, SysResult};
+#[cfg(any(
+    feature = "fs",
+    feature = "mm",
+    feature = "task",
+    feature = "signal",
+    feature = "time",
+    feature = "random",
+    feature = "system",
+    feature = "creds",
+    feature = "paths"
+))]
 use syscalls::Sysno;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+#[cfg(all(
+    feature = "paths",
+    not(any(target_arch = "x86_64", target_arch = "riscv64"))
+))]
 use syscalls::Sysno::fstatat as SYS_FSTATAT;
 // One call under two names: the generic table spells it `fstatat`, while
 // x86_64 and riscv64 keep the historical `newfstatat`.
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(all(
+    feature = "paths",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 use syscalls::Sysno::newfstatat as SYS_FSTATAT;
 /// The page size every supported target agrees on, which the ABI's alignment
 /// rules are written against.
-#[cfg(feature = "mm")]
+#[cfg(any(feature = "mm", feature = "random"))]
 const PAGE_SIZE: usize = 4096;
-/// One `new_utsname` field width (arch-independent), and the packed struct length.
-#[cfg(feature = "system")]
 /// What Linux's `import_ubuf()` will pass to the random source at once.
 #[cfg(feature = "random")]
 const GETRANDOM_MAX: usize = (i32::MAX as usize) & !(PAGE_SIZE - 1);
 
 /// `UIO_MAXIOV`: the longest vector Linux accepts.
+#[cfg(feature = "fs")]
 const IOV_MAX: usize = 1024;
 
+/// One `new_utsname` field width (arch-independent), and the packed struct length.
+#[cfg(feature = "system")]
 const UTS_FIELD: usize = 65;
 #[cfg(feature = "system")]
 const UTS_LEN: usize = 6 * UTS_FIELD;
@@ -155,6 +176,34 @@ ax_dispatch::register_sysabi!(linux);
 /// Route one syscall to its handler, or `None` when the trapped number is not one
 /// this domain owns, so a hosting kernel can fall back to its own table during
 /// migration. Free of the trap-frame write, so it unit-tests with mock ports.
+#[cfg(not(any(
+    feature = "fs",
+    feature = "mm",
+    feature = "task",
+    feature = "signal",
+    feature = "time",
+    feature = "random",
+    feature = "system",
+    feature = "creds",
+    feature = "paths"
+)))]
+fn route(_host: &dyn Host, _uctx: &dyn TrapEnv) -> Option<SysResult> {
+    // With no family enabled this domain owns no syscall; the format alone
+    // is what it provides.
+    None
+}
+
+#[cfg(any(
+    feature = "fs",
+    feature = "mm",
+    feature = "task",
+    feature = "signal",
+    feature = "time",
+    feature = "random",
+    feature = "system",
+    feature = "creds",
+    feature = "paths"
+))]
 fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
     let sysno = Sysno::new(uctx.nr())?;
     let arg = |i| uctx.arg(i);
@@ -1384,6 +1433,7 @@ fn read_time_pair(platform: &dyn ops::Platform, at: usize) -> Result<(i64, i64),
     ))
 }
 
+#[cfg(feature = "time")]
 fn pack_time_pair(hi: i64, lo: i64) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&hi.to_le_bytes());
