@@ -733,6 +733,26 @@ mod tests {
         fn attributes_of(&self, _fd: i32) -> SysResultAttr {
             self.describes.clone().ok_or(ax_abi_port::EBADF)
         }
+
+        fn permitted(
+            &self,
+            _at: ax_abi_port::At,
+            _path: &str,
+            _wants: ax_abi_port::Access,
+            _follow: bool,
+            _real_ids: bool,
+        ) -> Result<(), i32> {
+            Ok(())
+        }
+
+        fn permitted_of(
+            &self,
+            _fd: i32,
+            _wants: ax_abi_port::Access,
+            _real_ids: bool,
+        ) -> Result<(), i32> {
+            Ok(())
+        }
     }
 
     impl Host for MockHost {

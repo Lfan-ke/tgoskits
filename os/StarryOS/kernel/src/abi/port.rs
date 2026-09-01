@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
-    At, Attributes, NodeKind, OpenHow, Paths,
+    Access, At, Attributes, NodeKind, OpenHow, Paths,
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
     Advice, Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
 };
@@ -20,13 +20,14 @@ use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
 use starry_signal::SignalSet;
 use starry_vm::{vm_load_until_nul, vm_read_slice, vm_write_slice};
 
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, R_OK, W_OK, X_OK};
 
 use super::{KernelHost, errno, port_result};
 use crate::{
     StarryError, StarryResult,
     file::{ResolveAtResult, add_file_like, close_file_like, get_file_like, resolve_at},
     mm::VmBytesMut,
+    syscall::access_permitted,
     syscall,
     syscall::{KillTarget, MmapFlags, MmapProt, open_path},
     task::{AsThread, PgidNumber, TgidNumber, current_pid_view, do_exit},
@@ -137,6 +138,48 @@ impl Paths for KernelHost {
     fn attributes_of(&self, fd: i32) -> Result<Attributes, i32> {
         describe(resolve_at(fd, None, AT_EMPTY_PATH))
     }
+
+    fn permitted(
+        &self,
+        at: At,
+        path: &str,
+        wants: Access,
+        follow: bool,
+        _real_ids: bool,
+    ) -> Result<(), i32> {
+        // The kernel decides from the filesystem credentials, which is the one
+        // identity it tracks; the real-versus-effective distinction an ABI can
+        // ask for is not one it can answer differently today, so the answer is
+        // the same one `faccessat2` has always given.
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let flags = if follow { 0 } else { AT_SYMLINK_NOFOLLOW };
+        let file = resolve_at(dirfd, Some(path), flags).map_err(errno)?;
+        access_permitted(&file, access_mode(wants)).map_err(errno)
+    }
+
+    fn permitted_of(&self, fd: i32, wants: Access, _real_ids: bool) -> Result<(), i32> {
+        let file = resolve_at(fd, None, AT_EMPTY_PATH).map_err(errno)?;
+        access_permitted(&file, access_mode(wants)).map_err(errno)
+    }
+}
+
+/// Restate the neutral request as the `R_OK`/`W_OK`/`X_OK` mask the kernel's
+/// own check reads.
+fn access_mode(wants: Access) -> u32 {
+    let mut mode = 0;
+    if wants.read {
+        mode |= R_OK;
+    }
+    if wants.write {
+        mode |= W_OK;
+    }
+    if wants.execute {
+        mode |= X_OK;
+    }
+    mode
 }
 
 /// Restate what the filesystem said in the neutral shape the port speaks.
