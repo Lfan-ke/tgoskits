@@ -2192,4 +2192,135 @@ mod tests {
         win32::dispatch(&mut missing, &host);
         assert_eq!(missing.result, Some(0));
     }
+
+    fn wide_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn utf8_and_utf16_convert_both_ways_with_the_windows_conventions() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[0x7000..0x7007].copy_from_slice("h\u{e9}llo\0".as_bytes()); // 6 bytes + NUL
+        }
+        // Asked how much: five units for five characters, terminator excluded
+        // because the length was given.
+        let mut need = call("MultiByteToWideChar", [65001, 0, 0x7000, 6, 0, 0], teb);
+        win32::dispatch(&mut need, &host);
+        assert_eq!(need.result, Some(5));
+        // With a buffer, the text arrives.
+        let mut conv = call(
+            "MultiByteToWideChar",
+            [65001, 0, 0x7000, 6, 0x7100, 16],
+            teb,
+        );
+        win32::dispatch(&mut conv, &host);
+        assert_eq!(conv.result, Some(5));
+        assert_eq!(wide_at(&host, 0x7100), "h\u{e9}llo");
+        // Too small a buffer is refused with ERROR_INSUFFICIENT_BUFFER.
+        let mut small = call("MultiByteToWideChar", [65001, 0, 0x7000, 6, 0x7100, 2], teb);
+        win32::dispatch(&mut small, &host);
+        assert_eq!(small.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(122));
+        // A -1 length takes the terminator along.
+        let mut whole = call(
+            "MultiByteToWideChar",
+            [65001, 0, 0x7000, usize::MAX, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut whole, &host);
+        assert_eq!(whole.result, Some(6));
+
+        // Back again, with a character outside the BMP: four UTF-8 bytes.
+        {
+            let mut mem = host.mem.borrow_mut();
+            let text = wide_bytes("a\u{1F600}");
+            mem[0x7200..0x7200 + text.len()].copy_from_slice(&text);
+        }
+        let mut back = call(
+            "WideCharToMultiByte",
+            [65001, 0, 0x7200, 3, 0x7300, 16],
+            teb,
+        );
+        win32::dispatch(&mut back, &host);
+        assert_eq!(back.result, Some(5));
+        assert_eq!(&host.mem.borrow()[0x7300..0x7305], "a\u{1F600}".as_bytes());
+
+        // Malformed input: replaced, unless the caller asked to be told.
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[0x7400..0x7402].copy_from_slice(&[0xFF, b'x']);
+        }
+        let mut lax = call("MultiByteToWideChar", [65001, 0, 0x7400, 2, 0x7500, 4], teb);
+        win32::dispatch(&mut lax, &host);
+        assert_eq!(lax.result, Some(2));
+        assert_eq!(wide_at(&host, 0x7500), "\u{FFFD}x");
+        let mut strict = call("MultiByteToWideChar", [65001, 8, 0x7400, 2, 0x7500, 4], teb);
+        win32::dispatch(&mut strict, &host);
+        assert_eq!(strict.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(1113), "ERROR_NO_UNICODE_TRANSLATION");
+    }
+
+    #[test]
+    fn the_locale_answers_case_class_and_order() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        {
+            let mut mem = host.mem.borrow_mut();
+            let text = wide_bytes("abC1 \0");
+            mem[0x7000..0x7000 + text.len()].copy_from_slice(&text);
+            let other = wide_bytes("ABC1 \0");
+            mem[0x7200..0x7200 + other.len()].copy_from_slice(&other);
+        }
+        let mut upper = call("LCMapStringW", [0x0400, 0x200, 0x7000, 5, 0x7100, 8], teb);
+        win32::dispatch(&mut upper, &host);
+        assert_eq!(upper.result, Some(5));
+        assert_eq!(wide_at(&host, 0x7100), "ABC1 ");
+
+        let mut classes = call("GetStringTypeW", [1, 0x7000, 5, 0x7300, 0, 0], teb);
+        win32::dispatch(&mut classes, &host);
+        assert_eq!(classes.result, Some(1));
+        let mem = host.mem.borrow();
+        let class = |i: usize| u16::from_le_bytes([mem[0x7300 + i * 2], mem[0x7301 + i * 2]]);
+        assert_eq!(class(0) & 0x0002, 0x0002, "a is lower");
+        assert_eq!(class(2) & 0x0001, 0x0001, "C is upper");
+        assert_eq!(class(3) & 0x0004, 0x0004, "1 is a digit");
+        assert_eq!(class(4) & 0x0008, 0x0008, "space is space");
+        drop(mem);
+
+        let mut cmp = call(
+            "CompareStringW",
+            [0x0400, 0, 0x7000, usize::MAX, 0x7200, usize::MAX],
+            teb,
+        );
+        win32::dispatch(&mut cmp, &host);
+        assert_eq!(
+            cmp.result,
+            Some(3),
+            "lower case sorts after upper, ordinally"
+        );
+        let mut fold = call(
+            "CompareStringW",
+            [0x0400, 1, 0x7000, usize::MAX, 0x7200, usize::MAX],
+            teb,
+        );
+        win32::dispatch(&mut fold, &host);
+        assert_eq!(fold.result, Some(2), "equal when case is ignored");
+
+        let mut acp = call("GetACP", [0; 6], teb);
+        win32::dispatch(&mut acp, &host);
+        assert_eq!(acp.result, Some(65001));
+        let mut info = call("GetCPInfo", [65001, 0x7400, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut info, &host);
+        assert_eq!(info.result, Some(1));
+        assert_eq!(host.mem.borrow()[0x7400], 4, "MaxCharSize");
+    }
 }
