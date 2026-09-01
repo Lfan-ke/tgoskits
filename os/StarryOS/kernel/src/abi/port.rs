@@ -25,7 +25,7 @@ use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, R_OK,
 use super::{KernelHost, errno, port_result};
 use crate::{
     StarryError, StarryResult,
-    file::{ResolveAtResult, add_file_like, close_file_like, get_file_like, resolve_at},
+    file::{Directory, FileLike, ResolveAtResult, add_file_like, close_file_like, get_file_like, resolve_at},
     mm::VmBytesMut,
     syscall::access_permitted,
     syscall,
@@ -146,6 +146,35 @@ impl Paths for KernelHost {
     fn path_of(&self, fd: i32, put: &mut dyn FnMut(&str)) -> Result<(), i32> {
         let file = get_file_like(fd).map_err(errno)?;
         put(&file.path());
+        Ok(())
+    }
+
+    fn read_dir(&self, fd: i32, sink: &mut dyn FnMut(&str, NodeKind) -> bool) -> Result<(), i32> {
+        use axfs_ng_vfs::NodeType;
+        let dir = Directory::from_fd(fd).map_err(errno)?;
+        let mut stop = false;
+        dir.inner()
+            .read_dir(0, &mut |name: &str, _ino, node_type, _offset| {
+                if name == "." || name == ".." {
+                    return true;
+                }
+                let kind = match node_type {
+                    NodeType::Directory => NodeKind::Directory,
+                    NodeType::Symlink => NodeKind::Symlink,
+                    NodeType::CharacterDevice => NodeKind::CharDevice,
+                    NodeType::BlockDevice => NodeKind::BlockDevice,
+                    NodeType::Fifo => NodeKind::Fifo,
+                    NodeType::Socket => NodeKind::Socket,
+                    _ => NodeKind::File,
+                };
+                if !sink(name, kind) {
+                    stop = true;
+                    return false;
+                }
+                true
+            })
+            .map_err(|e| errno(e.into()))?;
+        let _ = stop;
         Ok(())
     }
 

@@ -675,23 +675,158 @@ pub fn get_file_information_by_handle_ex(c: &mut Call<'_>) -> Dispatch {
     }
 }
 
-/// FindFirstFileW(lpFileName, lpFindFileData): directory enumeration. There is
-/// no readdir port yet, so a search finds nothing: the handle is invalid and
-/// the error is "file not found", which os.listdir turns into an empty list
-/// and the import machinery handles by stat'ing candidates directly. Modules
-/// in the zip on the path are found by the zip importer, which reads the
-/// archive rather than listing a directory.
+// A directory search's state lives in the process heap: FindFirstFileW takes a
+// snapshot of the matching entries there and returns its address as the find
+// handle, FindNextFileW advances a cursor in it, and FindClose frees it. The
+// block is a small header then one fixed-width record per entry.
+const FIND_MAGIC: u64 = 0x444E_4946_5241_5852; // "RXARFIND"
+const FIND_COUNT: usize = 8;
+const FIND_CURSOR: usize = 12;
+const FIND_HEADER: usize = 16;
+/// Per-entry: the attribute word, the name length in units, then the name.
+const FIND_NAME: usize = 260;
+const FIND_RECORD: usize = 8 + FIND_NAME * 2;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_NO_MORE_FILES: u32 = 18;
+
+/// Fill one WIN32_FIND_DATAW at `out` from a record at `rec` in the snapshot.
+fn write_find_data(c: &Call<'_>, out: usize, rec: usize) -> bool {
+    let Some(attr) = c.read_u32(rec) else {
+        return false;
+    };
+    let Some(len) = c.read::<2>(rec + 4).map(u16::from_le_bytes) else {
+        return false;
+    };
+    let mut data = [0u8; 592];
+    data[..4].copy_from_slice(&attr.to_le_bytes());
+    // cFileName is at offset 0x2C; copy the stored name and its terminator.
+    let name_bytes = (usize::from(len) + 1) * 2;
+    let mut name = alloc::vec![0u8; name_bytes.min(FIND_NAME * 2)];
+    if c.host.platform().read_user(rec + 8, &mut name).is_err() {
+        return false;
+    }
+    data[0x2C..0x2C + name.len()].copy_from_slice(&name);
+    c.write(out, &data)
+}
+
+/// FindFirstFileW(lpFileName, lpFindFileData): open the directory the pattern
+/// names, snapshot its entries into the process heap, and report the first.
+/// The only patterns a runtime uses are a whole-directory `*` and a specific
+/// name; both are served, and a directory with no match is reported as empty.
 pub fn find_first_file(c: &mut Call<'_>) -> Dispatch {
-    const ERROR_FILE_NOT_FOUND: u32 = 2;
-    c.fail(ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE)
+    let (pattern, out) = (c.arg(0), c.arg(1));
+    let Some(spec) = name_at(c, pattern) else {
+        return c.fail(ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
+    };
+    // Split the last component off as the match; the rest is the directory.
+    let (dir, want) = match spec.rsplit_once('\\') {
+        Some((dir, last)) => (dir, last),
+        None => (".", spec.as_str()),
+    };
+    let want = String::from(want);
+    let all = want == "*" || want == "*.*";
+    let Some(dir_host) = host_path(c, dir) else {
+        return c.fail(ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
+    };
+    let Some(paths) = c.host.paths() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, INVALID_HANDLE_VALUE);
+    };
+    // Open the directory to enumerate it; a plain open with the directory bit.
+    let how = ax_abi_port::OpenHow {
+        read: true,
+        write: false,
+        append: false,
+        truncate: false,
+        create: ax_abi_port::Create::Never,
+        directory: true,
+        follow: true,
+        close_on_exec: true,
+        mode: 0,
+    };
+    let dir_fd = match paths.open(At::Cwd, &dir_host, &how) {
+        Ok(fd) => fd as i32,
+        Err(errno) => return c.fail_status(nt::status_from_errno(errno), INVALID_HANDLE_VALUE),
+    };
+    // Collect the matching names and kinds.
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    let mut overflow = false;
+    let _ = paths.read_dir(dir_fd, &mut |name, kind| {
+        if entries.len() >= 4096 {
+            overflow = true;
+            return false;
+        }
+        if all || name == want {
+            entries.push((String::from(name), kind == NodeKind::Directory));
+        }
+        true
+    });
+    if let Some(files) = c.host.files() {
+        let _ = files.close(dir_fd);
+    }
+    let _ = overflow;
+    if entries.is_empty() {
+        return c.fail(ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
+    }
+    // Snapshot into the process heap.
+    let Some(peb) = c.peb() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, INVALID_HANDLE_VALUE);
+    };
+    let Some(heap) = c
+        .read_u64(peb + crate::teb_peb::PEB_PROCESS_HEAP)
+        .map(|h| h as usize)
+    else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, INVALID_HANDLE_VALUE);
+    };
+    let need = FIND_HEADER + entries.len() * FIND_RECORD;
+    let Some(block) = super::heap::alloc(c, heap, need) else {
+        return c.fail(super::ERROR_NOT_ENOUGH_MEMORY, INVALID_HANDLE_VALUE);
+    };
+    c.write(block, &FIND_MAGIC.to_le_bytes());
+    c.write_u32(block + FIND_COUNT, entries.len() as u32);
+    for (i, (name, is_dir)) in entries.iter().enumerate() {
+        let rec = block + FIND_HEADER + i * FIND_RECORD;
+        // FILE_ATTRIBUTE_DIRECTORY (0x10) or FILE_ATTRIBUTE_NORMAL (0x80).
+        c.write_u32(rec, if *is_dir { 0x10 } else { 0x80 });
+        let units: Vec<u16> = name.encode_utf16().take(FIND_NAME - 1).collect();
+        c.write(rec + 4, &(units.len() as u16).to_le_bytes());
+        let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        c.write(rec + 8, &bytes);
+    }
+    // The first entry, and the cursor left at the second.
+    if !write_find_data(c, out, block + FIND_HEADER) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, INVALID_HANDLE_VALUE);
+    }
+    c.write_u32(block + FIND_CURSOR, 1);
+    c.set_last_error(0);
+    c.finish(block)
 }
 
+/// FindNextFileW(hFindFile, lpFindFileData): the next entry from the snapshot,
+/// or ERROR_NO_MORE_FILES when it is exhausted.
 pub fn find_next_file(c: &mut Call<'_>) -> Dispatch {
-    const ERROR_NO_MORE_FILES: u32 = 18;
-    c.fail(ERROR_NO_MORE_FILES, FALSE)
+    let (block, out) = (c.arg(0), c.arg(1));
+    if c.read_u64(block) != Some(FIND_MAGIC) {
+        return c.fail(super::ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let count = c.read_u32(block + FIND_COUNT).unwrap_or(0);
+    let cursor = c.read_u32(block + FIND_CURSOR).unwrap_or(count);
+    if cursor >= count {
+        return c.fail(ERROR_NO_MORE_FILES, FALSE);
+    }
+    let rec = block + FIND_HEADER + cursor as usize * FIND_RECORD;
+    if !write_find_data(c, out, rec) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+    }
+    c.write_u32(block + FIND_CURSOR, cursor + 1);
+    c.finish(TRUE)
 }
 
+/// FindClose(hFindFile): free the snapshot.
 pub fn find_close(c: &mut Call<'_>) -> Dispatch {
+    let block = c.arg(0);
+    if c.read_u64(block) == Some(FIND_MAGIC) {
+        super::heap::mark_free(c, block);
+    }
     c.finish(TRUE)
 }
 

@@ -1042,6 +1042,8 @@ mod tests {
         opens_at: Result<i32, i32>,
         /// Whether the host offers a paths port at all.
         has_paths: bool,
+        /// Directory entries the paths port enumerates.
+        entries: Vec<(String, NodeKind)>,
     }
     impl Default for MockHost {
         fn default() -> Self {
@@ -1057,6 +1059,7 @@ mod tests {
                 describes: None,
                 opens_at: Ok(0),
                 has_paths: false,
+                entries: Vec::new(),
             }
         }
     }
@@ -1223,6 +1226,18 @@ mod tests {
                 }
                 None => Err(ax_abi_port::EBADF),
             }
+        }
+        fn read_dir(
+            &self,
+            _fd: i32,
+            sink: &mut dyn FnMut(&str, NodeKind) -> bool,
+        ) -> Result<(), i32> {
+            for (name, kind) in &self.entries {
+                if !sink(name, *kind) {
+                    break;
+                }
+            }
+            Ok(())
         }
 
         fn permitted(
@@ -2912,5 +2927,96 @@ mod tests {
             u64::from_le_bytes(host.mem.borrow()[0x7800..0x7808].try_into().unwrap()),
             0
         );
+    }
+
+    #[test]
+    fn a_directory_search_walks_its_entries_and_ends() {
+        use crate::win32;
+        let host = MockHost {
+            describes: Some(node(NodeKind::Directory, 0)),
+            has_paths: true,
+            opens_at: Ok(7),
+            entries: alloc::vec![
+                (String::from("__init__.py"), NodeKind::File),
+                (String::from("aliases.py"), NodeKind::File),
+                (String::from("cp437.py"), NodeKind::File),
+            ],
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        // FindFirstFileW("Z:\python\Lib\encodings\*", &data).
+        put_wide(&host, 0x7000, "Z:\\python\\Lib\\encodings\\*\0");
+        let mut first = call("FindFirstFileW", [0x7000, 0x7200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut first, &host);
+        let handle = first.result.unwrap();
+        assert_ne!(handle, usize::MAX, "a search that matches returns a handle");
+        // The directory it opened is the one the pattern named, host-spelled.
+        assert_eq!(
+            host.opened.borrow().as_ref().unwrap().1,
+            "/python/Lib/encodings"
+        );
+
+        // cFileName sits at offset 0x2C in WIN32_FIND_DATAW.
+        let name_of = |at: usize| wide_at(&host, at + 0x2C);
+        assert_eq!(name_of(0x7200), "__init__.py");
+        // FILE_ATTRIBUTE_NORMAL on a file.
+        assert_eq!(
+            u32::from_le_bytes(host.mem.borrow()[0x7200..0x7204].try_into().unwrap()),
+            0x80
+        );
+
+        let mut next = call("FindNextFileW", [handle, 0x7200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut next, &host);
+        assert_eq!(next.result, Some(1));
+        assert_eq!(name_of(0x7200), "aliases.py");
+        let mut next = call("FindNextFileW", [handle, 0x7200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut next, &host);
+        assert_eq!(name_of(0x7200), "cp437.py");
+        // The fourth advance is past the end.
+        let mut done = call("FindNextFileW", [handle, 0x7200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut done, &host);
+        assert_eq!(done.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(18), "ERROR_NO_MORE_FILES");
+
+        let mut close = call("FindClose", [handle, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut close, &host);
+        assert_eq!(close.result, Some(1));
+    }
+
+    #[test]
+    fn a_search_for_one_name_matches_only_it() {
+        use crate::win32;
+        let host = MockHost {
+            describes: Some(node(NodeKind::Directory, 0)),
+            has_paths: true,
+            opens_at: Ok(7),
+            entries: alloc::vec![
+                (String::from("python.exe"), NodeKind::File),
+                (String::from("python313.dll"), NodeKind::File),
+            ],
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "Z:\\python\\python.exe\0");
+        let mut first = call("FindFirstFileW", [0x7000, 0x7200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut first, &host);
+        assert_ne!(first.result, Some(usize::MAX));
+        assert_eq!(wide_at(&host, 0x7200 + 0x2C), "python.exe");
+        // Nothing after the single match.
+        let mut next = call(
+            "FindNextFileW",
+            [first.result.unwrap(), 0x7200, 0, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut next, &host);
+        assert_eq!(next.result, Some(0));
+
+        // A name nothing matches is "file not found".
+        put_wide(&host, 0x7000, "Z:\\python\\missing.txt\0");
+        let mut none = call("FindFirstFileW", [0x7000, 0x7200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut none, &host);
+        assert_eq!(none.result, Some(usize::MAX));
     }
 }

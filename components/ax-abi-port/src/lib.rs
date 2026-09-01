@@ -356,6 +356,14 @@ pub trait Paths: Sync {
     fn path_of(&self, _fd: i32, _put: &mut dyn FnMut(&str)) -> Result<(), i32> {
         Err(ENOSYS)
     }
+
+    /// Enumerate the entries of the directory `fd`, handing each name and its
+    /// kind to `sink`; a `sink` returning `false` stops the walk. `.` and `..`
+    /// are not reported, as a program listing a directory does not expect
+    /// them. A descriptor that is not a directory is an error.
+    fn read_dir(&self, _fd: i32, _sink: &mut dyn FnMut(&str, NodeKind) -> bool) -> Result<(), i32> {
+        Err(ENOSYS)
+    }
 }
 
 /// One run of user memory. An ABI decodes its own vector layout and names the
