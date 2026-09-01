@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod dll;
 pub mod handle;
 pub mod nt;
+pub mod start;
 pub mod teb_peb;
 pub mod thunk;
 pub mod win32;
@@ -67,6 +68,7 @@ fn map_image(
     image: &[u8],
     load_base: u64,
     binds: &[(u32, u64)],
+    words: &[(u32, u32)],
     from_file: bool,
     env: &mut dyn LoadEnv,
 ) -> AbiResult<()> {
@@ -81,7 +83,8 @@ fn map_image(
     for sec in pe.sections(image) {
         let va = load_base + sec.rva as u64;
         let range = sec.rva..sec.rva + sec.vsize;
-        let bound = binds.iter().any(|(rva, _)| range.contains(rva));
+        let bound = binds.iter().any(|(rva, _)| range.contains(rva))
+            || words.iter().any(|(rva, _)| range.contains(rva));
         if delta == 0 && !bound && from_file {
             // At its preferred base nothing is rewritten, so the section maps
             // from the file and its pages arrive as they are touched - the same
@@ -104,22 +107,101 @@ fn map_image(
             page[..n].copy_from_slice(&raw[..n]);
         }
         relocate_section(&mut page, &sec, &relocs, delta)?;
-        bind_section(&mut page, &sec, binds)?;
+        bind_section(&mut page, &sec, binds, words)?;
         env.map_region(va, sec.vsize as u64, section_prot(&sec), Some(&page))?;
     }
     Ok(())
 }
 
-/// Write the bound addresses that fall inside `sec` into its page buffer, before
-/// it is mapped. Each is an eight-byte address table entry in a PE32+ image.
-fn bind_section(page: &mut [u8], sec: &Section, binds: &[(u32, u64)]) -> AbiResult<()> {
+/// Write the bound addresses and words that fall inside `sec` into its page
+/// buffer, before it is mapped. An address is an eight-byte address table
+/// entry in a PE32+ image; a word is the `DWORD` a TLS index occupies.
+fn bind_section(
+    page: &mut [u8],
+    sec: &Section,
+    binds: &[(u32, u64)],
+    words: &[(u32, u32)],
+) -> AbiResult<()> {
     let range = sec.rva..sec.rva + sec.vsize;
     for (rva, value) in binds.iter().filter(|(rva, _)| range.contains(rva)) {
         let at = (rva - sec.rva) as usize;
         let slot = page.get_mut(at..at + 8).ok_or(AbiError::MalformedImage)?;
         slot.copy_from_slice(&value.to_le_bytes());
     }
+    for (rva, value) in words.iter().filter(|(rva, _)| range.contains(rva)) {
+        let at = (rva - sec.rva) as usize;
+        let slot = page.get_mut(at..at + 4).ok_or(AbiError::MalformedImage)?;
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
     Ok(())
+}
+
+/// The calls made before the program's entry: for each library in dependency
+/// order, its TLS callbacks and then its entry point; last, the program's own
+/// TLS callbacks. A library without an entry point - a pure forwarder - is
+/// only given its callbacks, which it has none of either.
+fn attach_steps(modules: &[dll::Module]) -> Vec<start::Step> {
+    let mut steps = Vec::new();
+    let callbacks = |module: &dll::Module, steps: &mut Vec<start::Step>| {
+        if let Some(dir) = module.pe.tls(&module.bytes) {
+            for at in module.pe.tls_callbacks(&module.bytes, &dir) {
+                steps.push(start::Step::Callback {
+                    base: module.base,
+                    at: module.base + u64::from(at),
+                });
+            }
+        }
+    };
+    for at in dll::init_order(modules) {
+        let module = &modules[at];
+        callbacks(module, &mut steps);
+        if module.pe.entry_rva != 0 {
+            steps.push(start::Step::Entry {
+                base: module.base,
+                at: module.base + u64::from(module.pe.entry_rva),
+            });
+        }
+    }
+    callbacks(&modules[0], &mut steps);
+    steps
+}
+
+/// The first thread's TLS area, to map at `tls_va`: an array with one entry per
+/// module that keeps thread locals, then each module's block - its template
+/// followed by its zero fill - which the entry points at. Each such module has
+/// its slot written where its `AddressOfIndex` says, before it is mapped. This
+/// is `alloc_tls_slot` done for a thread that does not exist yet.
+fn thread_locals(modules: &mut [dll::Module], tls_va: u64) -> Vec<u8> {
+    let dirs: Vec<(usize, pe::TlsDir)> = modules
+        .iter()
+        .enumerate()
+        .filter_map(|(at, module)| module.pe.tls(&module.bytes).map(|dir| (at, dir)))
+        .collect();
+    // An empty array still occupies a word, so the pointer in the TEB names
+    // something even for a process with no thread locals at all.
+    let mut area = vec![0u8; (dirs.len().max(1) * 8).next_multiple_of(16)];
+    for (slot, (at, dir)) in dirs.iter().enumerate() {
+        let module = &mut modules[*at];
+        let block_va = tls_va + area.len() as u64;
+        area[slot * 8..slot * 8 + 8].copy_from_slice(&block_va.to_le_bytes());
+        let template = module
+            .pe
+            .sections(&module.bytes)
+            .find(|sec| (sec.rva..sec.rva + sec.vsize).contains(&dir.raw_start))
+            .and_then(|sec| {
+                let raw = sec.raw_data(&module.bytes)?;
+                let from = (dir.raw_start - sec.rva) as usize;
+                let to = (dir.raw_end - sec.rva) as usize;
+                raw.get(from..to.min(raw.len()))
+            })
+            .unwrap_or(&[]);
+        area.extend_from_slice(template);
+        let len = (dir.raw_end - dir.raw_start) as usize + dir.zero_fill as usize;
+        area.resize(area.len() + len - template.len(), 0);
+        area.resize(area.len().next_multiple_of(16), 0);
+        module.words.push((dir.index, slot as u32));
+    }
+    area
 }
 
 /// Where the image ends, as an offset from its base: the first address free for
@@ -318,8 +400,12 @@ mod tests {
                 &mut env,
             )
             .expect("load");
-        assert_eq!(loaded.entry, 0x1_4000_1000);
-        assert_eq!(env.maps.len(), 2);
+        // The process starts in the startup sequence, which follows the one
+        // stub every process has (ExitProcess) on the page after the image.
+        let code_va = 0x1_4000_4000;
+        assert_eq!(loaded.entry, code_va + thunk::STUB_LEN as u64);
+        // Two sections, then the code page and the thread's blocks.
+        assert_eq!(env.maps.len(), 6);
 
         let (va, prot, _) = &env.maps[0];
         assert_eq!(*va, 0x1_4000_1000);
@@ -357,7 +443,7 @@ mod tests {
         let pe = pe::parse(&img).unwrap();
         let new_base = 0x1_8000_0000u64;
         let mut env = RecordingEnv::default();
-        map_image(&pe, &img, new_base, &[], true, &mut env).expect("relocated load");
+        map_image(&pe, &img, new_base, &[], &[], true, &mut env).expect("relocated load");
 
         // The pointer in .text now reads image_base_moved + 0x1000.
         let text_page = &env.maps[0].2;
@@ -373,7 +459,7 @@ mod tests {
         let mut env = RecordingEnv::default();
         // No reloc directory, but the base must move -> cannot relocate.
         assert_eq!(
-            map_image(&pe, &img, 0x1_8000_0000, &[], true, &mut env),
+            map_image(&pe, &img, 0x1_8000_0000, &[], &[], true, &mut env),
             Err(AbiError::Unsupported)
         );
     }
@@ -412,7 +498,8 @@ mod tests {
                 &mut env,
             )
             .expect("load");
-        assert_eq!(env.maps.len(), 4);
+        // Four sections, then the code page and the thread's three blocks.
+        assert_eq!(env.maps.len(), 8);
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
         assert_eq!(env.maps[1].1, Prot::READ);
         assert_eq!(env.maps[2].1, Prot::READ | Prot::WRITE);
@@ -492,29 +579,61 @@ mod tests {
     /// real library carries, since it is never placed where it asked to be.
     /// It spans 0x4000, so the next module lands 0x4000 past its base.
     fn dll_image(exports: &[u8]) -> Vec<u8> {
-        let ptr = (0x1_8000_0000u64 + 0x2000).to_le_bytes();
+        dll_image_ex(0x2000, exports, None)
+    }
+
+    /// The same, with its entry point at `entry_rva` (zero for none) and, when
+    /// `tls` is given, a `.tls` section at 0x4000 holding that template, an
+    /// index word at +0x40, and the directory at +0x80 asking for eight bytes
+    /// of zero fill - which makes the library span 0x5000.
+    fn dll_image_ex(entry_rva: u32, exports: &[u8], tls: Option<&[u8]>) -> Vec<u8> {
+        const BASE: u64 = 0x1_8000_0000;
+        let ptr = (BASE + 0x2000).to_le_bytes();
         let mut reloc = Vec::new();
         reloc.extend_from_slice(&0x2000u32.to_le_bytes());
         reloc.extend_from_slice(&(8u32 + 2).to_le_bytes());
         reloc.extend_from_slice(&(pe::REL_DIR64 << 12).to_le_bytes());
-        let mut img = synth(
-            0x1_8000_0000,
-            0x2000,
-            &[
-                (sect(0x1000, 0x100, 0x100, 0x400, RX), exports),
-                (sect(0x2000, 0x1000, 8, 0x600, RX), &ptr),
-                (
-                    sect(0x3000, 0x1000, reloc.len() as u32, 0x800, 0x4000_0000),
-                    &reloc,
-                ),
-            ],
-        );
+        let mut tls_data = vec![0u8; 0x100];
+        if let Some(template) = tls {
+            tls_data[..template.len()].copy_from_slice(template);
+            let dir = 0x80;
+            tls_data[dir..dir + 8].copy_from_slice(&(BASE + 0x4000).to_le_bytes());
+            tls_data[dir + 8..dir + 16]
+                .copy_from_slice(&(BASE + 0x4000 + template.len() as u64).to_le_bytes());
+            tls_data[dir + 16..dir + 24].copy_from_slice(&(BASE + 0x4040).to_le_bytes());
+            tls_data[dir + 32..dir + 36].copy_from_slice(&8u32.to_le_bytes());
+            // The three addresses move with the image, so they carry
+            // relocations too: one block for page 0x4000, padded to a word.
+            reloc.extend_from_slice(&0x4000u32.to_le_bytes());
+            reloc.extend_from_slice(&(8u32 + 8).to_le_bytes());
+            for off in [0x80u16, 0x88, 0x90] {
+                reloc.extend_from_slice(&((pe::REL_DIR64 << 12) as u16 | off).to_le_bytes());
+            }
+            reloc.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let mut sections = vec![
+            (sect(0x1000, 0x100, 0x100, 0x400, RX), &exports[..]),
+            (sect(0x2000, 0x1000, 8, 0x600, RX), &ptr[..]),
+            (
+                sect(0x3000, 0x1000, reloc.len() as u32, 0x800, 0x4000_0000),
+                &reloc[..],
+            ),
+        ];
+        if tls.is_some() {
+            sections.push((sect(0x4000, 0x100, 0x100, 0xA00, RW), &tls_data[..]));
+        }
+        let mut img = synth(BASE, entry_rva, &sections);
         let dd = OPT + 112 + pe::DIR_EXPORT * 8;
         img[dd..dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
         img[dd + 4..dd + 8].copy_from_slice(&0x100u32.to_le_bytes());
         let dd = OPT + 112 + pe::DIR_BASERELOC * 8;
         img[dd..dd + 4].copy_from_slice(&0x3000u32.to_le_bytes());
         img[dd + 4..dd + 8].copy_from_slice(&(reloc.len() as u32).to_le_bytes());
+        if tls.is_some() {
+            let dd = OPT + 112 + pe::DIR_TLS * 8;
+            img[dd..dd + 4].copy_from_slice(&0x4080u32.to_le_bytes());
+            img[dd + 4..dd + 8].copy_from_slice(&40u32.to_le_bytes());
+        }
         img
     }
 
@@ -580,7 +699,6 @@ mod tests {
         };
 
         let loaded = load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
-        assert_eq!(loaded.entry, 0x1_4000_1000, "the program's own entry");
 
         // The library lands on the page after the program, and the program's
         // address table now leads to the export inside it.
@@ -597,8 +715,148 @@ mod tests {
             u64::from_le_bytes(code[..8].try_into().unwrap()),
             dll_base + 0x2000
         );
-        // Nothing here imports from the system, so no stubs were made.
-        assert!(!env.maps.iter().any(|(va, ..)| *va == dll_base + 0x4000));
+        // Nothing here imports from the system, so the only stub is the one
+        // every process gets, and the startup sequence follows it.
+        let code_va = dll_base + 0x4000;
+        let (_, _, code) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == code_va)
+            .expect("the code page past the last module");
+        assert_eq!(
+            &code[..thunk::STUB_LEN],
+            &thunk::stub(crate::win32::Win32Call::ExitProcess)
+        );
+        assert_eq!(loaded.entry, code_va + thunk::STUB_LEN as u64);
+    }
+
+    #[test]
+    fn libraries_attach_before_the_program_and_the_thread_gets_its_blocks() {
+        let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
+        let dll = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/app/fake.dll".to_string(), dll)]),
+            ..RecordingEnv::default()
+        };
+
+        let loaded = load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+
+        let dll_base = 0x1_4000_2000u64;
+        let code_va = dll_base + 0x4000;
+        let (_, _, code) = env.maps.iter().find(|(va, ..)| *va == code_va).unwrap();
+        let startup = &code[thunk::STUB_LEN..];
+        // The library's entry point (its image's entry, 0x2000 past its base)
+        // is called with its base before the program's entry is reached.
+        let mut lib = vec![0x48, 0xB9];
+        lib.extend_from_slice(&dll_base.to_le_bytes());
+        let mut program = vec![0x48, 0xB8];
+        program.extend_from_slice(&0x1_4000_1000u64.to_le_bytes());
+        let at_lib = startup
+            .windows(lib.len())
+            .position(|w| w == lib)
+            .expect("library attached");
+        let at_program = startup
+            .windows(program.len())
+            .position(|w| w == program)
+            .expect("program");
+        assert!(at_lib < at_program);
+
+        // The thread's block sits after the code, points at itself, at the
+        // PEB, and at its TLS array; the process starts with `gs` on it.
+        let teb_va = code_va + 0x1000;
+        assert_eq!(loaded.thread_pointer, teb_va);
+        let (_, prot, teb) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == teb_va)
+            .expect("a TEB");
+        assert_eq!(*prot, Prot::READ | Prot::WRITE);
+        let word = |at: usize| u64::from_le_bytes(teb[at..at + 8].try_into().unwrap());
+        assert_eq!(word(teb_peb::TEB_SELF), teb_va);
+        let peb_va = teb_va + 0x2000;
+        assert_eq!(word(teb_peb::TEB_PEB), peb_va);
+        assert_eq!(word(teb_peb::TEB_TLS_POINTER), peb_va + 0x1000);
+        let (_, _, peb) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == peb_va)
+            .expect("a PEB");
+        assert_eq!(
+            u64::from_le_bytes(
+                peb[teb_peb::PEB_IMAGE_BASE..teb_peb::PEB_IMAGE_BASE + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x1_4000_0000
+        );
+    }
+
+    #[test]
+    fn a_library_with_thread_locals_gets_a_slot_and_a_block() {
+        let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
+        let template = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let dll = dll_image_ex(
+            0x2000,
+            &export_section(b"Hello\0", Ok(0x2000)),
+            Some(&template),
+        );
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/app/fake.dll".to_string(), dll)]),
+            ..RecordingEnv::default()
+        };
+
+        load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+
+        // This library spans 0x5000, so everything after it moves up.
+        let dll_base = 0x1_4000_2000u64;
+        let tls_va = dll_base + 0x5000 + 0x1000 + 0x2000 + 0x1000;
+        let (_, _, area) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == tls_va)
+            .expect("the TLS area");
+        // One slot, whose block follows the array: the template, then the
+        // zero fill the directory asked for.
+        let block_va = u64::from_le_bytes(area[..8].try_into().unwrap());
+        assert_eq!(block_va, tls_va + 16);
+        assert_eq!(&area[16..24], &template);
+        assert_eq!(&area[24..32], &[0u8; 8]);
+        // And the library was told its slot where its directory said to.
+        let (_, _, tls_section) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == dll_base + 0x4000)
+            .expect("the library's .tls section, rewritten");
+        assert_eq!(
+            u32::from_le_bytes(tls_section[0x40..0x44].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn a_library_without_an_entry_point_is_not_called() {
+        let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
+        // A forwarder-only library, as python3.dll is, has no entry point.
+        let dll = dll_image_ex(0, &export_section(b"Hello\0", Ok(0x2000)), None);
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/app/fake.dll".to_string(), dll)]),
+            ..RecordingEnv::default()
+        };
+
+        load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+
+        let dll_base = 0x1_4000_2000u64;
+        let (_, _, code) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == dll_base + 0x4000)
+            .unwrap();
+        let mut lib = vec![0x48, 0xB9];
+        lib.extend_from_slice(&dll_base.to_le_bytes());
+        assert!(
+            !code.windows(lib.len()).any(|w| w == lib),
+            "nothing to attach"
+        );
     }
 
     #[test]
@@ -703,7 +961,9 @@ mod tests {
                 &mut env,
             )
             .expect("an import this package serves is bound");
-        assert_eq!(loaded.entry, 0x1_4000_1000);
+        // The process starts in the startup sequence, after the two stubs
+        // this program needs: WriteFile, and the ExitProcess every one gets.
+        assert_eq!(loaded.entry, 0x1_4000_2000 + 2 * thunk::STUB_LEN as u64);
 
         // The image spans one page from RVA 0x1000, so the stubs land on the
         // page after it.
@@ -832,7 +1092,33 @@ impl ImageFormat for PeFormat {
         // is mapped, so a program that cannot be completed is refused while
         // the caller still has the space it came with. The program keeps its
         // preferred base; libraries follow it, each relocated to where it lands.
-        let linked = dll::link(pe, bytes, req.path, env)?;
+        let mut linked = dll::link(pe, bytes, req.path, env)?;
+
+        // What the thread starts with, laid out after the code: its control
+        // blocks, then the array and blocks its thread locals live in. The
+        // startup code's length does not depend on the addresses it carries,
+        // so it is measured first and emitted once the layout is known.
+        let steps = attach_steps(&linked.modules);
+        let program_entry = linked.modules[0].base + linked.modules[0].pe.entry_rva as u64;
+        let startup_va = linked.stubs_va + linked.stubs.len() as u64;
+        let startup_len = start::emit(&steps, program_entry, 0, linked.exit_stub).len() as u64;
+        let teb_va = page_up(startup_va + startup_len);
+        let peb_va = teb_va + page_up(teb_peb::TEB_SIZE as u64);
+        let tls_va = peb_va + page_up(teb_peb::PEB_SIZE as u64);
+        let tls = thread_locals(&mut linked.modules, tls_va);
+
+        let (mut teb, peb) = teb_peb::build(&teb_peb::BlockLayout {
+            teb_va,
+            peb_va,
+            image_base: linked.modules[0].base,
+            stack_base: env.stack_top(),
+            stack_limit: 0,
+        });
+        teb[teb_peb::TEB_TLS_POINTER..teb_peb::TEB_TLS_POINTER + 8]
+            .copy_from_slice(&tls_va.to_le_bytes());
+        let mut code = linked.stubs.clone();
+        code.extend(start::emit(&steps, program_entry, peb_va, linked.exit_stub));
+
         // The image is this package's from here, so the space it goes into is
         // torn down and prepared. Doing it after the checks is what lets a
         // malformed image be refused without destroying the caller's.
@@ -847,22 +1133,25 @@ impl ImageFormat for PeFormat {
                 &module.bytes,
                 module.base,
                 &module.binds,
+                &module.words,
                 alone && at == 0,
                 env,
             )?;
         }
-        if !linked.stubs.is_empty() {
-            env.map_region(
-                linked.stubs_va,
-                page_up(linked.stubs.len() as u64),
-                Prot::READ | Prot::EXEC,
-                Some(&linked.stubs),
-            )?;
-        }
-        let program = &linked.modules[0];
+        let rw = Prot::READ | Prot::WRITE;
+        env.map_region(
+            linked.stubs_va,
+            page_up(code.len() as u64),
+            Prot::READ | Prot::EXEC,
+            Some(&code),
+        )?;
+        env.map_region(teb_va, page_up(teb.len() as u64), rw, Some(&teb))?;
+        env.map_region(peb_va, page_up(peb.len() as u64), rw, Some(&peb))?;
+        env.map_region(tls_va, page_up(tls.len() as u64), rw, Some(&tls))?;
         Ok(Loaded {
-            entry: program.base + program.pe.entry_rva as u64,
+            entry: startup_va,
             stack: 0,
+            thread_pointer: teb_va,
         })
     }
 }

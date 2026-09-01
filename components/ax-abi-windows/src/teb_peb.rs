@@ -17,6 +17,10 @@ pub const TEB_STACK_BASE: usize = 0x08;
 pub const TEB_STACK_LIMIT: usize = 0x10;
 /// `NT_TIB.Self` - the TEB's own virtual address (ntdll reads `gs:[0x30]`).
 pub const TEB_SELF: usize = 0x30;
+/// `TEB.ThreadLocalStoragePointer` - the array of this thread's TLS blocks,
+/// one per module with a TLS directory, indexed by the slot the loader wrote
+/// into that module's `AddressOfIndex` (`gs:[0x58]`; Wine marks it `02c/0058`).
+pub const TEB_TLS_POINTER: usize = 0x58;
 /// `TEB.ProcessEnvironmentBlock` - pointer to the PEB (`gs:[0x60]`).
 pub const TEB_PEB: usize = 0x60;
 /// `TEB.LastErrorValue` - the `ULONG` `GetLastError` reports. Wine's

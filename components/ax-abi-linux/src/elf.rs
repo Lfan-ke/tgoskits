@@ -96,6 +96,7 @@ impl ImageFormat for ElfFormat {
         Ok(Loaded {
             entry: entry as u64,
             stack,
+            thread_pointer: 0,
         })
     }
 }

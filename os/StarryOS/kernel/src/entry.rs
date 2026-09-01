@@ -62,10 +62,22 @@ pub fn init(args: &[String], envs: &[String]) {
         })
         .expect("Failed to create user address space");
 
-    let (entry_vaddr, ustack_top, auxv) = load_user_app(&mut uspace, loc, &args[0], args, envs)
+    let (entry_vaddr, ustack_top, auxv, thread_pointer) = load_user_app(&mut uspace, loc, &args[0], args, envs)
         .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
 
-    let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
+    let mut uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
+
+    // A format that placed the thread's own block at load says where. On
+    // x86_64 that is Windows, which reaches the TEB through `gs`; Linux keeps
+    // its TLS in `fs` and sets it itself once running, so no ELF is affected.
+    if thread_pointer != 0 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            uctx.gs_base = thread_pointer;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        uctx.set_tls(thread_pointer as usize);
+    }
     let mut task = new_user_task(&name, uctx, 0);
     task.ctx_mut().set_page_table_root(uspace.page_table_root());
 
