@@ -31,8 +31,10 @@ use crate::{
     handle::Handle,
     nt::{self, Ntstatus},
     teb_peb::{
-        PEB_BEING_DEBUGGED, PEB_IMAGE_BASE, PEB_LDR, PEB_PROCESS_HEAP, PEB_TLS_BITMAP_BITS,
-        TEB_LAST_ERROR, TEB_PEB, TEB_TLS_SLOTS,
+        PARAMS_COMMAND_LINE, PARAMS_COMMAND_LINE_A, PARAMS_CURRENT_DIRECTORY, PARAMS_ENVIRONMENT,
+        PARAMS_ENVIRONMENT_SIZE, PARAMS_FLAGS, PARAMS_SHOW_WINDOW, PARAMS_STD_INPUT,
+        PEB_BEING_DEBUGGED, PEB_IMAGE_BASE, PEB_LDR, PEB_PROCESS_HEAP, PEB_PROCESS_PARAMS,
+        PEB_TLS_BITMAP_BITS, TEB_LAST_ERROR, TEB_PEB, TEB_TLS_SLOTS,
     },
 };
 
@@ -60,6 +62,10 @@ const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+/// `sizeof(STARTUPINFOW)` on x86-64.
+const STARTUPINFO_SIZE: u32 = 104;
 
 /// `TLS_MINIMUM_AVAILABLE`: slots in the TEB itself; more would live in the
 /// expansion array, which nothing here allocates yet.
@@ -323,6 +329,39 @@ impl Call<'_> {
         self.write(at, &value.to_le_bytes())
     }
 
+    /// The process parameters, through the PEB.
+    fn params(&self) -> Option<usize> {
+        let at = self.read_u64(self.peb()? + PEB_PROCESS_PARAMS)? as usize;
+        (at != 0).then_some(at)
+    }
+
+    /// A `UNICODE_STRING` at `at`: its length in bytes and its buffer.
+    fn unicode(&self, at: usize) -> Option<(usize, usize)> {
+        let len = u16::from_le_bytes(self.read::<2>(at)?) as usize;
+        let buf = self.read_u64(at + 8)? as usize;
+        Some((len, buf))
+    }
+
+    /// Copy `len` bytes from `from` to `to` through user memory.
+    fn copy(&self, from: usize, to: usize, len: usize) -> bool {
+        let mut chunk = [0u8; 256];
+        let mut moved = 0;
+        while moved < len {
+            let n = (len - moved).min(chunk.len());
+            if self
+                .host
+                .platform()
+                .read_user(from + moved, &mut chunk[..n])
+                .is_err()
+                || !self.write(to + moved, &chunk[..n])
+            {
+                return false;
+            }
+            moved += n;
+        }
+        true
+    }
+
     /// The PEB, through the TEB, as `NtCurrentTeb()->Peb`.
     fn peb(&self) -> Option<usize> {
         (self.teb != 0)
@@ -547,6 +586,57 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         }
         "GetModuleHandleW" => get_module_handle(&mut c),
         "GetProcAddress" => get_proc_address(&mut c),
+        "GetModuleFileNameW" => get_module_file_name(&mut c),
+        // Both hand out the block itself, as Windows does; a program must not
+        // free what it gets.
+        "GetCommandLineW" => {
+            let line = c
+                .params()
+                .and_then(|p| c.unicode(p + PARAMS_COMMAND_LINE))
+                .map_or(0, |(_, buf)| buf);
+            c.finish(line)
+        }
+        "GetCommandLineA" => {
+            let line = c
+                .params()
+                .and_then(|p| c.read_u64(p + PARAMS_COMMAND_LINE_A))
+                .unwrap_or(0) as usize;
+            c.finish(line)
+        }
+        // A copy of the environment block from the process heap, which the
+        // caller returns through FreeEnvironmentStringsW.
+        "GetEnvironmentStringsW" => {
+            let Some(params) = c.params() else {
+                return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+            };
+            let (Some(env), Some(size)) = (
+                c.read_u64(params + PARAMS_ENVIRONMENT),
+                c.read_u64(params + PARAMS_ENVIRONMENT_SIZE),
+            ) else {
+                return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+            };
+            let heap = c
+                .peb()
+                .and_then(|peb| c.read_u64(peb + PEB_PROCESS_HEAP))
+                .unwrap_or(0) as usize;
+            let Some(block) = heap::alloc(&c, heap, size as usize) else {
+                return c.fail(ERROR_NOT_ENOUGH_MEMORY, 0);
+            };
+            if !c.copy(env as usize, block, size as usize) {
+                return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+            }
+            c.finish(block)
+        }
+        "FreeEnvironmentStringsW" => {
+            let block = c.arg(0);
+            if heap::size_of(&c, block).is_none() {
+                return c.fail(ERROR_INVALID_PARAMETER, FALSE);
+            }
+            heap::mark_free(&c, block);
+            c.finish(TRUE)
+        }
+        "GetStartupInfoW" => get_startup_info(&mut c),
+        "GetCurrentDirectoryW" => get_current_directory(&mut c),
         "CloseHandle" => {
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
@@ -932,6 +1022,107 @@ fn get_proc_address(c: &mut Call<'_>) -> Dispatch {
         Some(at) => c.finish(at),
         None => c.fail(ERROR_PROC_NOT_FOUND, 0),
     }
+}
+
+/// GetModuleFileNameW(hModule, lpFilename, nSize): the module's full name out
+/// of the loader list, NULL meaning the program. A name that does not fit is
+/// cut to fit, terminated, and reported with ERROR_INSUFFICIENT_BUFFER.
+fn get_module_file_name(c: &mut Call<'_>) -> Dispatch {
+    use crate::teb_peb::{LDR_DLL_BASE, LDR_FULL_NAME, LDR_IN_LOAD_ORDER};
+    let (module, out, size) = (c.arg(0), c.arg(1), c.arg(2));
+    let Some(peb) = c.peb() else {
+        return c.fail(ERROR_MOD_NOT_FOUND, 0);
+    };
+    let module = if module == 0 {
+        c.read_u64(peb + PEB_IMAGE_BASE).unwrap_or(0) as usize
+    } else {
+        module
+    };
+    let Some(ldr) = c
+        .read_u64(peb + PEB_LDR)
+        .map(|v| v as usize)
+        .filter(|v| *v != 0)
+    else {
+        return c.fail(ERROR_MOD_NOT_FOUND, 0);
+    };
+    let head = ldr + LDR_IN_LOAD_ORDER;
+    let mut link = c.read_u64(head).unwrap_or(0) as usize;
+    let mut found = None;
+    for _ in 0..1024 {
+        if link == head || link == 0 {
+            break;
+        }
+        if c.read_u64(link + LDR_DLL_BASE) == Some(module as u64) {
+            found = c.unicode(link + LDR_FULL_NAME);
+            break;
+        }
+        link = c.read_u64(link).unwrap_or(0) as usize;
+    }
+    let Some((len, buf)) = found else {
+        return c.fail(ERROR_MOD_NOT_FOUND, 0);
+    };
+    let units = len / 2;
+    if size == 0 {
+        return c.fail(ERROR_INSUFFICIENT_BUFFER, 0);
+    }
+    let copied = units.min(size - 1);
+    if !c.copy(buf, out, copied * 2) || !c.write(out + copied * 2, &[0, 0]) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+    }
+    if units >= size {
+        return c.fail(ERROR_INSUFFICIENT_BUFFER, size);
+    }
+    c.set_last_error(0);
+    c.finish(copied)
+}
+
+/// GetStartupInfoW(lpStartupInfo): what the parameters block says, as Wine
+/// copies it field by field; the standard handles come along because the
+/// block marks them as meant.
+fn get_startup_info(c: &mut Call<'_>) -> Dispatch {
+    let info = c.arg(0);
+    let Some(params) = c.params() else {
+        return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+    };
+    let mut block = [0u8; STARTUPINFO_SIZE as usize];
+    block[..4].copy_from_slice(&STARTUPINFO_SIZE.to_le_bytes());
+    let flags = c.read_u32(params + PARAMS_FLAGS).unwrap_or(0);
+    block[0x3C..0x40].copy_from_slice(&flags.to_le_bytes());
+    let show = c.read_u32(params + PARAMS_SHOW_WINDOW).unwrap_or(0) as u16;
+    block[0x40..0x42].copy_from_slice(&show.to_le_bytes());
+    for (i, field) in [0x50usize, 0x58, 0x60].into_iter().enumerate() {
+        let handle = c.read_u64(params + PARAMS_STD_INPUT + i * 8).unwrap_or(0);
+        block[field..field + 8].copy_from_slice(&handle.to_le_bytes());
+    }
+    if !c.write(info, &block) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+    }
+    c.finish(0)
+}
+
+/// GetCurrentDirectoryW(nBufferLength, lpBuffer): the directory without its
+/// trailing separator unless it is a drive's root; too small a buffer is told
+/// how much it needs, terminator included.
+fn get_current_directory(c: &mut Call<'_>) -> Dispatch {
+    let (size, out) = (c.arg(0), c.arg(1));
+    let Some((len, buf)) = c
+        .params()
+        .and_then(|p| c.unicode(p + PARAMS_CURRENT_DIRECTORY))
+    else {
+        return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+    };
+    let mut units = len / 2;
+    // "Z:\" keeps its separator; "Z:\app\" does not.
+    if units > 3 && c.read::<2>(buf + (units - 1) * 2) == Some([b'\\', 0]) {
+        units -= 1;
+    }
+    if size <= units {
+        return c.finish(units + 1);
+    }
+    if !c.copy(buf, out, units * 2) || !c.write(out + units * 2, &[0, 0]) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+    }
+    c.finish(units)
 }
 
 /// VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect), as

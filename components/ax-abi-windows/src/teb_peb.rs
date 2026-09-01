@@ -57,6 +57,36 @@ pub const PEB_PRIVATE: usize = 0xF00;
 /// Bytes reserved for the PEB: the page it occupies.
 pub const PEB_SIZE: usize = 0x1000;
 
+// RTL_USER_PROCESS_PARAMETERS (x86-64): what `PEB.ProcessParameters` points at.
+/// `hStdInput`, `hStdOutput`, `hStdError`.
+pub const PARAMS_STD_INPUT: usize = 0x20;
+pub const PARAMS_STD_OUTPUT: usize = 0x28;
+pub const PARAMS_STD_ERROR: usize = 0x30;
+/// `CurrentDirectory.DosPath`, a `UNICODE_STRING`; its handle follows.
+pub const PARAMS_CURRENT_DIRECTORY: usize = 0x38;
+/// `DllPath`, `ImagePathName`, `CommandLine`: `UNICODE_STRING`s.
+pub const PARAMS_DLL_PATH: usize = 0x50;
+pub const PARAMS_IMAGE_PATH: usize = 0x60;
+pub const PARAMS_COMMAND_LINE: usize = 0x70;
+/// `Environment`: the block of `NAME=value` strings, and its size in bytes.
+pub const PARAMS_ENVIRONMENT: usize = 0x80;
+pub const PARAMS_ENVIRONMENT_SIZE: usize = 0x3F0;
+/// `dwFlags` and `wShowWindow`, what `GetStartupInfoW` reports.
+pub const PARAMS_FLAGS: usize = 0xA4;
+pub const PARAMS_SHOW_WINDOW: usize = 0xA8;
+/// Bytes the structure occupies.
+pub const PARAMS_SIZE: usize = 0x410;
+/// Past the structure: the ANSI copy of the command line that
+/// `GetCommandLineA` hands out, which Windows builds at startup as well.
+pub const PARAMS_COMMAND_LINE_A: usize = 0x410;
+const PARAMS_HEADER: usize = 0x420;
+
+/// `STARTF_USESTDHANDLES`: the standard handles in the parameters are meant.
+pub const STARTF_USESTDHANDLES: u32 = 0x100;
+/// `PROCESS_PARAMS_FLAG_NORMALIZED`: the pointers are absolute, as they are
+/// once the loader has fixed them up.
+const PARAMS_NORMALIZED: u32 = 0x1;
+
 /// `TEB.TlsSlots[64]` (`e10/1480`), what `TlsGetValue` reads for a small index.
 pub const TEB_TLS_SLOTS: usize = 0x1480;
 /// `TEB.TlsExpansionSlots` (`f94/1780`): the pointer to the next 1024 slots.
@@ -138,12 +168,13 @@ fn put_u16(block: &mut [u8], off: usize, value: u16) {
 }
 
 /// Fill in what the PEB says about the process once the loader knows it: the
-/// module list, the heap, the TLS bitmap, and the machine and OS a program
-/// asks about. The version is Windows 10 (10.0.19041), the oldest a current
-/// C runtime and CPython accept, and the machine has one processor, which is
-/// also what makes a critical section never spin.
-pub fn fill_peb(peb: &mut [u8], peb_va: u64, ldr_va: u64, heap_va: u64) {
+/// module list, the parameters, the heap, the TLS bitmap, and the machine and
+/// OS a program asks about. The version is Windows 10 (10.0.19041), the oldest
+/// a current C runtime and CPython accept, and the machine has one processor,
+/// which is also what makes a critical section never spin.
+pub fn fill_peb(peb: &mut [u8], peb_va: u64, ldr_va: u64, params_va: u64, heap_va: u64) {
     put_u64(peb, PEB_LDR, ldr_va);
+    put_u64(peb, PEB_PROCESS_PARAMS, params_va);
     put_u64(peb, PEB_PROCESS_HEAP, heap_va);
     // RTL_BITMAP { SizeOfBitMap, Buffer } in the private area, over the bits.
     put_u64(peb, PEB_TLS_BITMAP, peb_va + PEB_PRIVATE as u64);
@@ -154,6 +185,143 @@ pub fn fill_peb(peb: &mut [u8], peb_va: u64, ldr_va: u64, heap_va: u64) {
     put_u32(peb, PEB_OS_MAJOR + 4, 0);
     put_u32(peb, PEB_OS_MAJOR + 8, 19041);
     put_u32(peb, PEB_OS_MAJOR + 12, 2); // VER_PLATFORM_WIN32_NT
+}
+
+/// What a process is started with, as the parameters block records it.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessInfo<'a> {
+    /// The program's path as Windows spells it (`Z:\app\prog.exe`).
+    pub image: &'a str,
+    /// Its directory, the same way, without a trailing separator.
+    pub dir: &'a str,
+    /// `argv`, to be joined into one command line.
+    pub args: &'a [&'a str],
+    /// `NAME=value` strings.
+    pub envs: &'a [&'a str],
+    /// The standard input, output and error handles.
+    pub std: [u64; 3],
+}
+
+/// The `RTL_USER_PROCESS_PARAMETERS` for `info`, to map at `at`, with every
+/// string it names laid out after it. Pointers are absolute, as in a block the
+/// loader has normalized.
+pub fn build_params(info: &ProcessInfo<'_>, at: u64) -> Vec<u8> {
+    let mut out = vec![0u8; PARAMS_HEADER];
+    put_u32(&mut out, 8, PARAMS_NORMALIZED);
+    put_u64(&mut out, PARAMS_STD_INPUT, info.std[0]);
+    put_u64(&mut out, PARAMS_STD_OUTPUT, info.std[1]);
+    put_u64(&mut out, PARAMS_STD_ERROR, info.std[2]);
+    put_u32(&mut out, PARAMS_FLAGS, STARTF_USESTDHANDLES);
+    put_u32(&mut out, PARAMS_SHOW_WINDOW, 1); // SW_SHOWNORMAL
+
+    // A UNICODE_STRING over `text`, appended as UTF-16 with a terminator.
+    let unicode = |out: &mut Vec<u8>, field: usize, text: &str| {
+        let start = out.len();
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        let len = (out.len() - start) as u16;
+        out.extend_from_slice(&[0, 0]);
+        put_u16(out, field, len);
+        put_u16(out, field + 2, len + 2);
+        put_u64(out, field + 8, at + start as u64);
+    };
+    // The current directory carries its trailing separator, as CURDIR does.
+    let cwd = if info.dir.ends_with('\\') {
+        alloc::string::String::from(info.dir)
+    } else {
+        alloc::format!("{}\\", info.dir)
+    };
+    unicode(&mut out, PARAMS_CURRENT_DIRECTORY, &cwd);
+    unicode(&mut out, PARAMS_DLL_PATH, info.dir);
+    unicode(&mut out, PARAMS_IMAGE_PATH, info.image);
+    let line = command_line(info.args);
+    unicode(&mut out, PARAMS_COMMAND_LINE, &line);
+
+    // The environment: each string with its terminator, then one more.
+    let env_at = out.len();
+    for env in info.envs {
+        for unit in env.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
+    }
+    out.extend_from_slice(&[0, 0]);
+    let env_len = (out.len() - env_at) as u64;
+    put_u64(&mut out, PARAMS_ENVIRONMENT, at + env_at as u64);
+    put_u64(&mut out, PARAMS_ENVIRONMENT_SIZE, env_len);
+
+    // The ANSI command line: the same text, one byte per character where it
+    // fits and `?` where it does not, as the system code page would.
+    let ansi_at = out.len();
+    out.extend(
+        line.chars()
+            .map(|ch| if ch.is_ascii() { ch as u8 } else { b'?' }),
+    );
+    out.push(0);
+    put_u64(&mut out, PARAMS_COMMAND_LINE_A, at + ansi_at as u64);
+
+    let size = out.len() as u32;
+    put_u32(&mut out, 0, size);
+    put_u32(&mut out, 4, size);
+    out
+}
+
+/// One command line out of `argv`, as `build_command_line` in Wine's ntdll
+/// makes it: the first argument always quoted, any other quoted when it has a
+/// space or a tab or is empty, a quote inside escaped with backslashes doubled
+/// before it, and backslashes doubled before a closing quote so they are not
+/// taken as escaping it.
+pub fn command_line(args: &[&str]) -> alloc::string::String {
+    let mut line = alloc::string::String::new();
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            line.push(' ');
+        }
+        let has_space = i == 0 || arg.is_empty() || arg.contains([' ', '\t']);
+        let has_quote = arg.contains('"');
+        if has_space {
+            line.push('"');
+        }
+        if has_space || has_quote {
+            let mut backslashes = 0;
+            for ch in arg.chars() {
+                if ch == '\\' {
+                    backslashes += 1;
+                } else {
+                    if ch == '"' {
+                        for _ in 0..=backslashes {
+                            line.push('\\');
+                        }
+                    }
+                    backslashes = 0;
+                }
+                line.push(ch);
+            }
+            if has_space {
+                for _ in 0..backslashes {
+                    line.push('\\');
+                }
+            }
+        } else {
+            line.push_str(arg);
+        }
+        if has_space {
+            line.push('"');
+        }
+    }
+    line
+}
+
+/// A path as Windows spells it: the host's root is drive `Z:`, as Wine
+/// presents a Unix tree, and separators are backslashes.
+pub fn windows_path(unix: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::from("Z:");
+    if !unix.starts_with('/') {
+        out.push('\\');
+    }
+    out.extend(unix.chars().map(|ch| if ch == '/' { '\\' } else { ch }));
+    out
 }
 
 /// One module as the loader list describes it.
@@ -251,6 +419,57 @@ mod tests {
         assert_eq!(read_u64(&teb, TEB_STACK_BASE), layout.stack_base);
         assert_eq!(read_u64(&teb, TEB_STACK_LIMIT), layout.stack_limit);
         assert_eq!(read_u64(&peb, PEB_IMAGE_BASE), layout.image_base);
+    }
+
+    #[test]
+    fn the_command_line_is_quoted_as_windows_quotes_it() {
+        // The first argument is always quoted; a quote is escaped; a bare
+        // trailing backslash outside quotes is left alone.
+        assert_eq!(command_line(&["a b", "c\"d", "e\\"]), "\"a b\" c\\\"d e\\");
+        // Inside quotes, trailing backslashes are doubled so the closing quote
+        // survives.
+        assert_eq!(command_line(&["x\\"]), "\"x\\\\\"");
+        assert_eq!(
+            command_line(&["py", "-c", "print(1)"]),
+            "\"py\" -c print(1)"
+        );
+        assert_eq!(command_line(&["py", ""]), "\"py\" \"\"");
+    }
+
+    #[test]
+    fn a_host_path_becomes_a_drive_z_path() {
+        assert_eq!(windows_path("/app/python.exe"), "Z:\\app\\python.exe");
+        assert_eq!(windows_path("prog.exe"), "Z:\\prog.exe");
+    }
+
+    #[test]
+    fn the_parameters_name_every_string_they_carry() {
+        let info = ProcessInfo {
+            image: "Z:\\app\\prog.exe",
+            dir: "Z:\\app",
+            args: &["prog.exe", "-v"],
+            envs: &["A=1", "B=two"],
+            std: [4, 8, 12],
+        };
+        let at = 0x5000u64;
+        let block = build_params(&info, at);
+        let text = |field: usize| -> alloc::string::String {
+            let len = u16::from_le_bytes(block[field..field + 2].try_into().unwrap()) as usize;
+            let buf = (read_u64(&block, field + 8) - at) as usize;
+            let units: Vec<u16> = block[buf..buf + len]
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            alloc::string::String::from_utf16_lossy(&units)
+        };
+        assert_eq!(text(PARAMS_IMAGE_PATH), "Z:\\app\\prog.exe");
+        assert_eq!(text(PARAMS_CURRENT_DIRECTORY), "Z:\\app\\");
+        assert_eq!(text(PARAMS_COMMAND_LINE), "\"prog.exe\" -v");
+        assert_eq!(read_u64(&block, PARAMS_STD_OUTPUT), 8);
+        // A=1\0B=two\0\0 is eleven UTF-16 units.
+        assert_eq!(read_u64(&block, PARAMS_ENVIRONMENT_SIZE), 22);
+        let ansi = (read_u64(&block, PARAMS_COMMAND_LINE_A) - at) as usize;
+        assert_eq!(&block[ansi..ansi + 14], b"\"prog.exe\" -v\0");
     }
 
     #[test]

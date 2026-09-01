@@ -1878,17 +1878,45 @@ mod tests {
     /// them out: enough of the process for the Win32 layer to keep its state.
     fn process(host: &MockHost) -> (usize, usize) {
         use crate::{
-            teb_peb::{PEB_PROCESS_HEAP, TEB_PEB},
+            teb_peb::{self, PEB_PROCESS_HEAP, PEB_PROCESS_PARAMS, TEB_PEB},
             win32::heap,
         };
-        let (teb, peb, arena) = (0x100usize, 0x2000usize, 0x3000usize);
+        let (teb, peb, arena, params) = (0x100usize, 0x2000usize, 0x3000usize, 0x5000usize);
         let mut mem = host.mem.borrow_mut();
         mem.resize(0x8000, 0);
         mem[teb + TEB_PEB..teb + TEB_PEB + 8].copy_from_slice(&(peb as u64).to_le_bytes());
         mem[peb + PEB_PROCESS_HEAP..peb + PEB_PROCESS_HEAP + 8]
             .copy_from_slice(&(arena as u64).to_le_bytes());
         mem[arena..arena + heap::HEADER].copy_from_slice(&heap::arena(arena as u64, 0x1000));
+        let block = teb_peb::build_params(
+            &teb_peb::ProcessInfo {
+                image: "Z:\\app\\prog.exe",
+                dir: "Z:\\app",
+                args: &["prog.exe", "-v"],
+                envs: &["A=1", "B=two"],
+                std: [4, 8, 12],
+            },
+            params as u64,
+        );
+        mem[params..params + block.len()].copy_from_slice(&block);
+        mem[peb + PEB_PROCESS_PARAMS..peb + PEB_PROCESS_PARAMS + 8]
+            .copy_from_slice(&(params as u64).to_le_bytes());
         (teb, arena)
+    }
+
+    fn wide_at(host: &MockHost, at: usize) -> String {
+        let mem = host.mem.borrow();
+        let mut units = Vec::new();
+        let mut p = at;
+        loop {
+            let unit = u16::from_le_bytes([mem[p], mem[p + 1]]);
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+            p += 2;
+        }
+        String::from_utf16_lossy(&units)
     }
 
     fn call(name: &str, args: [usize; 6], teb: usize) -> Win32Trap {
@@ -2021,6 +2049,69 @@ mod tests {
         win32::dispatch(&mut err, &host);
         // ERROR_CALL_NOT_IMPLEMENTED, as a Wine stub reports itself.
         assert_eq!(err.result, Some(120));
+    }
+
+    #[test]
+    fn the_command_line_and_environment_come_out_of_the_parameters() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+
+        let mut line = call("GetCommandLineW", [0; 6], teb);
+        win32::dispatch(&mut line, &host);
+        assert_eq!(wide_at(&host, line.result.unwrap()), "\"prog.exe\" -v");
+
+        let mut ansi = call("GetCommandLineA", [0; 6], teb);
+        win32::dispatch(&mut ansi, &host);
+        let at = ansi.result.unwrap();
+        assert_eq!(&host.mem.borrow()[at..at + 13], b"\"prog.exe\" -v");
+
+        // The environment is a heap block holding the whole double-terminated
+        // list, which the caller gives back.
+        let mut env = call("GetEnvironmentStringsW", [0; 6], teb);
+        win32::dispatch(&mut env, &host);
+        let block = env.result.unwrap();
+        assert_eq!(wide_at(&host, block), "A=1");
+        assert_eq!(wide_at(&host, block + 8), "B=two");
+        let mut size = call("HeapSize", [0x3000, 0, block, 0, 0, 0], teb);
+        win32::dispatch(&mut size, &host);
+        assert_eq!(size.result, Some(22));
+        let mut free = call("FreeEnvironmentStringsW", [block, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut free, &host);
+        assert_eq!(free.result, Some(1));
+
+        let mut cwd = call("GetCurrentDirectoryW", [64, 0x7000, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut cwd, &host);
+        assert_eq!(cwd.result, Some(6), "Z:\\app is six characters");
+        assert_eq!(wide_at(&host, 0x7000), "Z:\\app");
+        let mut small = call("GetCurrentDirectoryW", [3, 0x7100, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut small, &host);
+        assert_eq!(small.result, Some(7), "what it needs, terminator included");
+    }
+
+    #[test]
+    fn startup_info_carries_the_standard_handles() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+
+        let mut info = call("GetStartupInfoW", [0x7000, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut info, &host);
+        let mem = host.mem.borrow();
+        let word = |off: usize| {
+            u64::from_le_bytes(mem[0x7000 + off..0x7000 + off + 8].try_into().unwrap())
+        };
+        assert_eq!(
+            u32::from_le_bytes(mem[0x7000..0x7004].try_into().unwrap()),
+            104,
+            "cb"
+        );
+        assert_eq!(
+            u32::from_le_bytes(mem[0x703C..0x7040].try_into().unwrap()),
+            0x100,
+            "USESTDHANDLES"
+        );
+        assert_eq!((word(0x50), word(0x58), word(0x60)), (4, 8, 12));
     }
 
     #[test]
