@@ -2131,4 +2131,65 @@ mod tests {
         win32::dispatch(&mut dec, &host);
         assert_eq!(dec.result, Some(0x1234_5678_9ABC));
     }
+
+    #[test]
+    fn a_program_can_find_kernel32_and_a_function_in_it() {
+        use crate::{teb_peb, thunk, win32};
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        // A module list with one entry, kernel32, whose image is the header
+        // the loader synthesizes with the stubs behind it.
+        let (ldr_va, k32_va) = (0x6000usize, 0x8000usize);
+        let image = thunk::kernel32_header(k32_va as u64, win32::table_len());
+        let ldr = teb_peb::build_ldr(
+            &[teb_peb::LdrModule {
+                base: k32_va as u64,
+                entry: 0,
+                size: 0x2000,
+                path: "Z:\\windows\\system32\\kernel32.dll",
+                name: "kernel32.dll",
+                tls_index: -1,
+            }],
+            &[],
+            ldr_va as u64,
+        );
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem.resize(0x12000, 0);
+            mem[ldr_va..ldr_va + ldr.len()].copy_from_slice(&ldr);
+            mem[k32_va..k32_va + image.len()].copy_from_slice(&image);
+            let peb = 0x2000;
+            mem[peb + teb_peb::PEB_LDR..peb + teb_peb::PEB_LDR + 8]
+                .copy_from_slice(&(ldr_va as u64).to_le_bytes());
+            // L"kernel32.dll" at 0x7000 for the lookup; the function names sit
+            // above 64 KiB, where a pointer is told from an ordinal.
+            let name: Vec<u8> = "kernel32.dll\0"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            mem[0x7000..0x7000 + name.len()].copy_from_slice(&name);
+            mem[0x10100..0x10100 + 10].copy_from_slice(b"WriteFile\0");
+        }
+
+        let mut module = call("GetModuleHandleW", [0x7000, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut module, &host);
+        assert_eq!(module.result, Some(k32_va));
+
+        let mut proc_ = call("GetProcAddress", [k32_va, 0x10100, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut proc_, &host);
+        // WriteFile is table entry 0: the first stub past the header.
+        assert_eq!(proc_.result, Some(k32_va + thunk::MODULE_HEADER));
+
+        // By ordinal, the same slot; an unknown name is refused.
+        let mut ord = call("GetProcAddress", [k32_va, 1, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut ord, &host);
+        assert_eq!(ord.result, Some(k32_va + thunk::MODULE_HEADER));
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[0x10200..0x10200 + 12].copy_from_slice(b"CreateMutexW");
+        }
+        let mut missing = call("GetProcAddress", [k32_va, 0x10200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut missing, &host);
+        assert_eq!(missing.result, Some(0));
+    }
 }

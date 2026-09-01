@@ -241,6 +241,11 @@ const TABLE: &[&str] = &[
     "WriteConsoleW",
 ];
 
+/// How many entry points the table binds - the number of stubs a process gets.
+pub fn table_len() -> usize {
+    TABLE.len()
+}
+
 /// A Win32 entry point this package binds: an index into [`TABLE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Win32Call(u32);

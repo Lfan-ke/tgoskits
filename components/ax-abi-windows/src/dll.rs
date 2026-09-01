@@ -57,9 +57,14 @@ pub struct Linked {
     /// The program first, then every library it reached in the order found,
     /// which is also the order they are placed in memory.
     pub modules: Vec<Module>,
-    /// Where the stubs go: the page after the last module.
+    /// Where the synthesized kernel32 image goes: the page after the last
+    /// module holds its header, and the stubs follow it. This is the module's
+    /// base, what `GetModuleHandleW(L"kernel32.dll")` answers.
     pub stubs_va: u64,
-    /// The stubs, one per distinct system function imported.
+    /// The kernel32 image: its header page, then every entry's stub in table
+    /// order, so an export's RVA is its index times the stub length past the
+    /// header. Every entry gets a stub whether or not anything imported it,
+    /// because `GetProcAddress` may ask for any of them.
     pub stubs: Vec<u8>,
     /// Where `ExitProcess`'s stub is. It is always among them, because the
     /// startup sequence ends the process through it whether or not the
@@ -116,7 +121,11 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
     }
     let stubs_va = next;
 
-    let mut calls: Vec<Win32Call> = Vec::new();
+    let stub_of = |call: Win32Call| {
+        stubs_va
+            + (thunk::MODULE_HEADER + (call.nr() - crate::win32::WIN32_BASE) as usize * STUB_LEN)
+                as u64
+    };
     for at in 0..modules.len() {
         let mut binds = Vec::new();
         let pe = modules[at].pe;
@@ -125,9 +134,7 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
                 let lib = canonical(import.library);
                 let value = match resolve(&modules, &lib, import.symbol, 0)? {
                     Resolved::At(va) => va,
-                    Resolved::Stub(call) => {
-                        stubs_va + (slot_of(&mut calls, call) * STUB_LEN) as u64
-                    }
+                    Resolved::Stub(call) => stub_of(call),
                 };
                 binds.push((import.thunk, value));
             }
@@ -135,16 +142,17 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         modules[at].binds = binds;
     }
 
-    let exit_stub = stubs_va + (slot_of(&mut calls, Win32Call::EXIT_PROCESS) * STUB_LEN) as u64;
-    let mut stubs = vec![0u8; calls.len() * STUB_LEN];
-    for (slot, call) in calls.iter().enumerate() {
-        stubs[slot * STUB_LEN..(slot + 1) * STUB_LEN].copy_from_slice(&thunk::stub(*call));
+    let count = crate::win32::table_len();
+    let mut stubs = thunk::kernel32_header(stubs_va, count);
+    for i in 0..count {
+        let call = Win32Call::from_nr(crate::win32::WIN32_BASE + i as u32).expect("in the table");
+        stubs.extend_from_slice(&thunk::stub(call));
     }
     Ok(Linked {
         modules,
         stubs_va,
         stubs,
-        exit_stub,
+        exit_stub: stub_of(Win32Call::EXIT_PROCESS),
     })
 }
 
@@ -313,16 +321,6 @@ fn resolve(
                 symbol,
                 depth + 1,
             )
-        }
-    }
-}
-
-fn slot_of(calls: &mut Vec<Win32Call>, call: Win32Call) -> usize {
-    match calls.iter().position(|it| *it == call) {
-        Some(at) => at,
-        None => {
-            calls.push(call);
-            calls.len() - 1
         }
     }
 }
