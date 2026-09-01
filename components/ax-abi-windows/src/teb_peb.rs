@@ -19,6 +19,9 @@ pub const TEB_STACK_LIMIT: usize = 0x10;
 pub const TEB_SELF: usize = 0x30;
 /// `TEB.ProcessEnvironmentBlock` - pointer to the PEB (`gs:[0x60]`).
 pub const TEB_PEB: usize = 0x60;
+/// `TEB.LastErrorValue` - the `ULONG` `GetLastError` reports. Wine's
+/// `include/winternl.h` marks the field `034/0068`, the 32- and 64-bit offsets.
+pub const TEB_LAST_ERROR: usize = 0x68;
 /// Bytes reserved for the TEB; larger than the fields used so later phases can
 /// populate more without moving the block.
 pub const TEB_SIZE: usize = 0x1800;

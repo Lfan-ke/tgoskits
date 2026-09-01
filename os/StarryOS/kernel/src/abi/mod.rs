@@ -78,6 +78,17 @@ impl TrapEnv for TrapCtx<'_> {
         self.slot
     }
 
+    // A 64-bit Windows thread reaches its TEB through `gs`, and a Linux one
+    // keeps its TLS in `fs` and leaves `gs` to the program, so reading `gs`
+    // serves the domain that asks without disturbing the one that does not.
+    // No other architecture runs a domain that keeps per-thread state where
+    // the thread itself reads it, so they say nothing rather than offer a
+    // register with a different meaning.
+    #[cfg(target_arch = "x86_64")]
+    fn thread_pointer(&self) -> usize {
+        self.uctx.gs_base as usize
+    }
+
     fn set_result(&mut self, value: usize) {
         // A syscall that got a signal delivered has already moved the frame on.
         // Where the return value shares a register with the first argument,
