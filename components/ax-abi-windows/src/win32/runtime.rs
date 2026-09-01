@@ -319,13 +319,9 @@ pub fn verify_version_info(c: &mut Call<'_>) -> Dispatch {
 /// system library answering for every name that folds into it.
 fn module_named(c: &Call<'_>, name: &str) -> Option<usize> {
     let peb = c.peb()?;
+    // A synthesized library is in the list under its own name, as is a file.
     let canonical = dll::canonical(name);
-    let wanted = if dll::is_system(&canonical) {
-        "kernel32.dll"
-    } else {
-        canonical.as_str()
-    };
-    super::find_module(c, peb, wanted.as_bytes())
+    super::find_module(c, peb, canonical.as_bytes())
 }
 
 /// LoadLibraryExW(lpLibFileName, hFile, dwFlags): a library already in the
