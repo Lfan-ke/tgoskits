@@ -112,6 +112,25 @@ fn bind_section(page: &mut [u8], sec: &Section, binds: &[(u32, u64)]) -> AbiResu
     Ok(())
 }
 
+/// The whole file, when the host has more of it than the request carries;
+/// `None` when the request already holds all there is, so nothing is copied.
+fn read_whole(head: &[u8], env: &mut dyn LoadEnv) -> AbiResult<Option<Vec<u8>>> {
+    let len = env.image_len() as usize;
+    if len <= head.len() {
+        return Ok(None);
+    }
+    let mut whole = vec![0u8; len];
+    let mut got = 0;
+    while got < len {
+        match env.read_image(got as u64, &mut whole[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    whole.truncate(got);
+    Ok(Some(whole))
+}
+
 /// Where the image ends, as an offset from its base: the first address free for
 /// anything the loader adds alongside it.
 fn image_extent(pe: &PeInfo, image: &[u8]) -> u64 {
@@ -167,6 +186,9 @@ mod tests {
         from_file: Vec<(u64, u64)>,
         reset: bool,
         sizes: Vec<u64>,
+        /// The whole file, for a loader that reads past the head the request
+        /// carries; empty means the request already has all there is.
+        file: Vec<u8>,
     }
 
     impl LoadEnv for RecordingEnv {
@@ -201,8 +223,14 @@ mod tests {
             Ok(())
         }
 
-        fn read_image(&mut self, _at: u64, _out: &mut [u8]) -> AbiResult<usize> {
-            Ok(0)
+        fn read_image(&mut self, at: u64, out: &mut [u8]) -> AbiResult<usize> {
+            let at = at as usize;
+            let n = self.file.len().saturating_sub(at).min(out.len());
+            out[..n].copy_from_slice(&self.file[at..at + n]);
+            Ok(n)
+        }
+        fn image_len(&self) -> u64 {
+            self.file.len() as u64
         }
         fn reset(&mut self) -> AbiResult<()> {
             self.reset = true;
@@ -426,11 +454,16 @@ mod tests {
     /// An image whose only section is `import_section(symbol)`, with the import
     /// directory pointed at it.
     fn image_importing(symbol: &[u8]) -> Vec<u8> {
+        image_importing_at(symbol, 0x400)
+    }
+
+    /// The same, with the section's bytes at file offset `raw`.
+    fn image_importing_at(symbol: &[u8], raw: u32) -> Vec<u8> {
         let data = import_section(symbol);
         let mut img = synth(
             0x1_4000_0000,
             0x1000,
-            &[(sect(0x1000, 0x200, 0x200, 0x400, RX), &data)],
+            &[(sect(0x1000, 0x200, 0x200, raw, RX), &data)],
         );
         let dir = OPT + 112 + pe::DIR_IMPORT * 8;
         img[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
@@ -486,6 +519,48 @@ mod tests {
     }
 
     #[test]
+    fn binds_imports_that_lie_past_the_head_the_request_carries() {
+        use crate::{thunk, win32::Win32Call};
+
+        // The kernel hands a loader the first page of the file and expects it
+        // to read the rest itself. A real image keeps its import directory in
+        // .rdata, well past that page.
+        let img = image_importing_at(b"WriteFile\0", 0x1400);
+        let mut env = RecordingEnv {
+            file: img.clone(),
+            ..RecordingEnv::default()
+        };
+        PeFormat
+            .load(
+                &LoadRequest {
+                    image: &img[..0x1000],
+                    load_base: 0,
+                    args: &[],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .expect("loads from the file, not just the head");
+
+        let stubs_va = 0x1_4000_2000;
+        let (_, _, code) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == stubs_va)
+            .expect("the import was seen and a stub was mapped");
+        assert_eq!(&code[..thunk::STUB_LEN], &thunk::stub(Win32Call::WriteFile));
+        let (_, _, page) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == 0x1_4000_1000)
+            .expect("the import section was rewritten");
+        assert_eq!(
+            u64::from_le_bytes(page[0x60..0x68].try_into().unwrap()),
+            stubs_va
+        );
+    }
+
+    #[test]
     fn refuses_an_image_that_needs_a_library_without_touching_the_space() {
         // A real kernel32 export, but not one the synthesized library serves.
         let img = image_importing(b"CreateMutexW\0");
@@ -526,20 +601,26 @@ impl ImageFormat for PeFormat {
             // Only PE32+ is in scope; a 32-bit image is a distinct ABI.
             return Err(AbiError::Unsupported);
         }
+        // The request carries the head of the file, which is enough for the
+        // headers and nothing else: a real image keeps its import directory
+        // and its relocations in sections well past the first page. The rest
+        // is read through the host, the way an ELF loader reads its segments.
+        let whole = read_whole(req.image, env)?;
+        let image: &[u8] = whole.as_deref().unwrap_or(req.image);
         // Honor the image's preferred base, so a well-formed image needs no
         // relocation; relocation is exercised only when the base must change.
         let base = pe.image_base;
         // The stubs go on the page after the image, where an import binds to
         // an address the image's own relocations never move.
-        let stubs_va = page_up(base + image_extent(&pe, req.image));
+        let stubs_va = page_up(base + image_extent(&pe, image));
         // Bound before anything is mapped, so an import this package cannot
         // serve is refused while the caller still has the space it came with.
-        let thunks = thunk::bind(&pe, req.image, stubs_va)?;
+        let thunks = thunk::bind(&pe, image, stubs_va)?;
         // The image is this package's from here, so the space it goes into is
         // torn down and prepared. Doing it after the checks is what lets a
         // malformed image be refused without destroying the caller's.
         env.reset()?;
-        map_image(&pe, req.image, base, &thunks.binds, env)?;
+        map_image(&pe, image, base, &thunks.binds, env)?;
         if !thunks.code.is_empty() {
             env.map_region(
                 stubs_va,
