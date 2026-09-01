@@ -2773,4 +2773,72 @@ mod tests {
         win32::dispatch(&mut null, &host);
         assert_eq!(null.result, Some(0));
     }
+
+    #[test]
+    fn an_srw_lock_is_taken_and_released_and_a_condvar_wait_returns() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (lock, cond) = (0x7000usize, 0x7100usize);
+
+        let mut init = call("InitializeSRWLock", [lock, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut init, &host);
+        let word =
+            |at: usize| u64::from_le_bytes(host.mem.borrow()[at..at + 8].try_into().unwrap());
+        let mut acq = call("AcquireSRWLockExclusive", [lock, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut acq, &host);
+        assert_eq!(word(lock), 1, "held exclusive");
+        let mut rel = call("ReleaseSRWLockExclusive", [lock, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut rel, &host);
+        assert_eq!(word(lock), 0, "free again");
+        // A try on a free lock takes it and reports success.
+        let mut tryacq = call("TryAcquireSRWLockExclusive", [lock, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut tryacq, &host);
+        assert_eq!(tryacq.result, Some(1));
+
+        // Sleeping on a condition variable releases the lock and returns woken,
+        // so a caller's recheck loop makes progress in this one thread.
+        let mut sleep = call("SleepConditionVariableSRW", [cond, lock, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut sleep, &host);
+        assert_eq!(sleep.result, Some(1));
+        assert_eq!(word(lock), 0, "the lock was released");
+    }
+
+    #[test]
+    fn an_ansi_environment_variable_comes_out_of_the_block() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        // The mock's environment is A=1, B=two.
+        put_wide(&host, 0x7000, "B\0");
+        let mut got = call(
+            "GetEnvironmentVariableA",
+            [0x7000, 0x7100, 64, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut got, &host);
+        assert_eq!(got.result, Some(3));
+        assert_eq!(&host.mem.borrow()[0x7100..0x7104], b"two\0");
+        // Names are matched without regard to case.
+        put_wide(&host, 0x7000, "a\0");
+        let mut lower = call(
+            "GetEnvironmentVariableA",
+            [0x7000, 0x7100, 64, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut lower, &host);
+        assert_eq!(lower.result, Some(1));
+        // A variable that is not set is reported as not found.
+        put_wide(&host, 0x7000, "NOPE\0");
+        let mut missing = call(
+            "GetEnvironmentVariableA",
+            [0x7000, 0x7100, 64, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut missing, &host);
+        assert_eq!(missing.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(203), "ERROR_ENVVAR_NOT_FOUND");
+    }
 }

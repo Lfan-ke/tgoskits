@@ -274,6 +274,7 @@ const KERNEL32: &[(&str, u16)] = &[
     ("WideCharToMultiByte", 0),
     ("WriteConsoleW", 0),
     ("AcquireSRWLockExclusive", 0),
+    ("TryAcquireSRWLockExclusive", 0),
     ("AddDllDirectory", 0),
     ("AddVectoredExceptionHandler", 0),
     ("CancelIoEx", 0),
@@ -952,6 +953,18 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "VerSetConditionMask" => runtime::ver_set_condition_mask(&mut c),
         "VerifyVersionInfoW" => runtime::verify_version_info(&mut c),
         "LoadLibraryExW" => runtime::load_library_ex(&mut c),
+        "InitializeSRWLock" | "InitializeConditionVariable" => runtime::init_sync_word(&mut c),
+        "AcquireSRWLockExclusive" => runtime::acquire_srw_lock_exclusive(&mut c),
+        "ReleaseSRWLockExclusive" => runtime::release_srw_lock_exclusive(&mut c),
+        "TryAcquireSRWLockExclusive" => runtime::try_acquire_srw_lock_exclusive(&mut c),
+        "AcquireSRWLockShared" => runtime::acquire_srw_lock_shared(&mut c),
+        "ReleaseSRWLockShared" => runtime::release_srw_lock_shared(&mut c),
+        "WakeConditionVariable" | "WakeAllConditionVariable" => {
+            runtime::wake_condition_variable(&mut c)
+        }
+        "SleepConditionVariableSRW" => runtime::sleep_condition_variable_srw(&mut c),
+        "OutputDebugStringW" | "OutputDebugStringA" => runtime::output_debug_string(&mut c),
+        "GetEnvironmentVariableA" => runtime::get_environment_variable_a(&mut c),
         "FreeLibrary" => runtime::free_library(&mut c),
         "GetModuleHandleExW" => runtime::get_module_handle_ex(&mut c),
         // No thread here was converted to a fiber.
