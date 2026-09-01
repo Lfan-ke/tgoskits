@@ -304,8 +304,18 @@ struct Call<'a> {
 }
 
 impl Call<'_> {
+    /// Argument `i`. The stub moved the first six into the trap frame; a
+    /// function with more leaves the rest where the caller put them, above
+    /// the return address and the spill space on its stack.
     fn arg(&self, i: usize) -> usize {
-        self.env.arg(i)
+        if i < 6 {
+            return self.env.arg(i);
+        }
+        let sp = self.env.stack_pointer();
+        if sp == 0 {
+            return 0;
+        }
+        self.read_u64(sp + 0x28 + (i - 4) * 8).unwrap_or(0) as usize
     }
 
     fn read<const N: usize>(&self, at: usize) -> Option<[u8; N]> {
@@ -345,6 +355,49 @@ impl Call<'_> {
         let len = u16::from_le_bytes(self.read::<2>(at)?) as usize;
         let buf = self.read_u64(at + 8)? as usize;
         Some((len, buf))
+    }
+
+    /// `len` bytes at `at`.
+    fn read_bytes(&self, at: usize, len: usize) -> Option<alloc::vec::Vec<u8>> {
+        let mut out = alloc::vec![0u8; len];
+        self.host.platform().read_user(at, &mut out).ok()?;
+        Some(out)
+    }
+
+    /// A NUL-terminated byte string at `at`, terminator included, as a C
+    /// runtime hands one to a conversion with a length of -1.
+    fn read_cstr(&self, at: usize) -> Option<alloc::vec::Vec<u8>> {
+        let mut out = alloc::vec::Vec::new();
+        loop {
+            let byte = self.read::<1>(at + out.len())?[0];
+            out.push(byte);
+            if byte == 0 || out.len() > 0x10000 {
+                return Some(out);
+            }
+        }
+    }
+
+    /// `units` UTF-16 code units at `at`.
+    fn read_wide_n(&self, at: usize, units: usize) -> Option<alloc::vec::Vec<u16>> {
+        let bytes = self.read_bytes(at, units * 2)?;
+        Some(
+            bytes
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        )
+    }
+
+    /// A NUL-terminated UTF-16 string at `at`, terminator excluded.
+    fn read_wstr(&self, at: usize) -> Option<alloc::vec::Vec<u16>> {
+        let mut out = alloc::vec::Vec::new();
+        loop {
+            let unit = u16::from_le_bytes(self.read::<2>(at + out.len() * 2)?);
+            if unit == 0 || out.len() > 0x8000 {
+                return Some(out);
+            }
+            out.push(unit);
+        }
     }
 
     /// Copy `len` bytes from `from` to `to` through user memory.
@@ -642,6 +695,18 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         }
         "GetStartupInfoW" => get_startup_info(&mut c),
         "GetCurrentDirectoryW" => get_current_directory(&mut c),
+        "GetACP" | "GetOEMCP" | "GetConsoleCP" | "GetConsoleOutputCP" => {
+            c.finish(locale::ACP as usize)
+        }
+        "IsValidCodePage" => locale::is_valid_code_page(&mut c),
+        "GetCPInfo" => locale::get_cp_info(&mut c),
+        "MultiByteToWideChar" => locale::multi_byte_to_wide_char(&mut c),
+        "WideCharToMultiByte" => locale::wide_char_to_multi_byte(&mut c),
+        "GetStringTypeW" => locale::get_string_type(&mut c),
+        "LCMapStringW" => locale::lc_map_string(&mut c),
+        "CompareStringW" => locale::compare_string(&mut c),
+        "GetUserDefaultLCID" => c.finish(locale::USER_LCID as usize),
+        "IsValidLocale" => locale::is_valid_locale(&mut c),
         "CloseHandle" => {
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
@@ -684,6 +749,8 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         _ => c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0),
     }
 }
+
+mod locale;
 
 /// Where the top-level exception filter is kept: a word of the PEB's reserved
 /// area that nothing else here uses.
