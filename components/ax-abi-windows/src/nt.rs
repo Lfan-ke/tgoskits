@@ -17,7 +17,9 @@
 //! Argument positions follow the NT syscall signatures (`ntdll` prototypes /
 //! ReactOS `ntoskrnl/io`,`mm`), read via the ABI-neutral [`TrapEnv`].
 
-use ax_abi_port::{At, Attributes, Create, Host, MapRequest, MapSource, NodeKind, OpenHow, Prot};
+use ax_abi_port::{
+    At, Attributes, Create, Host, MapRequest, MapSource, NodeKind, OpenHow, Prot, SeekFrom,
+};
 use ax_dispatch::{Dispatch, TrapEnv};
 
 use crate::handle::Handle;
@@ -85,6 +87,8 @@ pub enum NtSyscall {
     QueryAttributesFile,
     /// `NtQueryInformationFile(...)`.
     QueryInformationFile,
+    /// `NtSetInformationFile(...)`.
+    SetInformationFile,
 }
 
 impl NtSyscall {
@@ -103,6 +107,7 @@ impl NtSyscall {
             9 => NtSyscall::YieldExecution,
             10 => NtSyscall::QueryAttributesFile,
             11 => NtSyscall::QueryInformationFile,
+            12 => NtSyscall::SetInformationFile,
             _ => return None,
         })
     }
@@ -305,6 +310,12 @@ const FILE_STANDARD_INFORMATION_LEN: usize = 24;
 /// The information classes `NtQueryInformationFile` answers.
 const FILE_BASIC_INFORMATION_CLASS: usize = 4;
 const FILE_STANDARD_INFORMATION_CLASS: usize = 5;
+/// The classes `NtSetInformationFile` accepts: where the next transfer starts,
+/// and how long the file is. Both carry a single 64-bit value.
+const FILE_POSITION_INFORMATION_CLASS: usize = 14;
+const FILE_END_OF_FILE_INFORMATION_CLASS: usize = 20;
+/// `FILE_POSITION_INFORMATION` / `FILE_END_OF_FILE_INFORMATION`: one LARGE_INTEGER.
+const FILE_OFFSET_INFORMATION_LEN: usize = 8;
 
 /// `FILE_ATTRIBUTE_*`, the ones a node's kind and mode decide.
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
@@ -757,6 +768,47 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             }
         }
         // The remaining information classes describe things this package does
+        // NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+        // Length, FileInformationClass). Windows moves the file pointer and
+        // sets the length through the same call that Linux spells lseek and
+        // ftruncate, so both classes land on those primitives.
+        NtSyscall::SetInformationFile => {
+            let Some(files) = host.files() else {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            };
+            let (io_status, input, length, class) = (a(1), a(2), a(3), a(4));
+            let Ok(fd) = descriptor(a(0)) else {
+                return finish(env, Ntstatus::INVALID_HANDLE);
+            };
+            if !matches!(
+                class,
+                FILE_POSITION_INFORMATION_CLASS | FILE_END_OF_FILE_INFORMATION_CLASS
+            ) {
+                return finish(env, Ntstatus::NOT_IMPLEMENTED);
+            }
+            if length < FILE_OFFSET_INFORMATION_LEN {
+                return finish(env, Ntstatus::INFO_LENGTH_MISMATCH);
+            }
+            let mut raw = [0u8; FILE_OFFSET_INFORMATION_LEN];
+            if let Err(errno) = host.platform().read_user(input, &mut raw) {
+                return finish(env, status_from_errno(errno));
+            }
+            let value = i64::from_le_bytes(raw);
+            // Both classes are absolute, and neither has a meaning for a
+            // negative one.
+            if value < 0 {
+                return finish(env, Ntstatus::INVALID_PARAMETER);
+            }
+            let outcome = if class == FILE_POSITION_INFORMATION_CLASS {
+                files.seek(fd, SeekFrom::Start(value as u64))
+            } else {
+                files.ftruncate(fd, value as u64)
+            };
+            match outcome {
+                Ok(_) => write_io_status(host, io_status, Ntstatus::SUCCESS, 0),
+                Err(errno) => status_from_errno(errno),
+            }
+        }
         // not have, and stay with the caller rather than being invented.
         NtSyscall::QueryInformationProcess => {
             return Dispatch::Passthrough;
@@ -837,6 +889,8 @@ mod tests {
         mapped: RefCell<Option<MapRequest>>,
         opened: RefCell<Option<(At, String, OpenHow)>>,
         asked: RefCell<Option<String>>,
+        sought: RefCell<Option<(i32, u64)>>,
+        truncated: RefCell<Option<(i32, u64)>>,
         /// What the paths port describes a name as, or nothing for absent.
         describes: Option<Attributes>,
         /// What the paths port answers with, or the error it reports.
@@ -853,6 +907,8 @@ mod tests {
                 mapped: RefCell::default(),
                 opened: RefCell::default(),
                 asked: RefCell::default(),
+                sought: RefCell::default(),
+                truncated: RefCell::default(),
                 describes: None,
                 opens_at: Ok(0),
                 has_paths: false,
@@ -912,7 +968,10 @@ mod tests {
         fn dup(&self, _fd: i32) -> ax_abi_port::SysResult {
             Ok(0)
         }
-        fn seek(&self, _fd: i32, to: ax_abi_port::SeekFrom) -> ax_abi_port::SysResult {
+        fn seek(&self, fd: i32, to: ax_abi_port::SeekFrom) -> ax_abi_port::SysResult {
+            if let ax_abi_port::SeekFrom::Start(at) = to {
+                *self.sought.borrow_mut() = Some((fd, at));
+            }
             Ok(match to {
                 ax_abi_port::SeekFrom::Start(at) => at as isize,
                 ax_abi_port::SeekFrom::Current(by) | ax_abi_port::SeekFrom::End(by) => by as isize,
@@ -958,7 +1017,8 @@ mod tests {
         fn fsync(&self, _fd: i32, _datasync: bool) -> ax_abi_port::SysResult {
             Ok(0)
         }
-        fn ftruncate(&self, _fd: i32, _len: u64) -> ax_abi_port::SysResult {
+        fn ftruncate(&self, fd: i32, len: u64) -> ax_abi_port::SysResult {
+            *self.truncated.borrow_mut() = Some((fd, len));
             Ok(0)
         }
     }
@@ -1009,6 +1069,26 @@ mod tests {
         }
         fn attributes_of(&self, _fd: i32) -> Result<Attributes, i32> {
             self.describes.clone().ok_or(ax_abi_port::EBADF)
+        }
+
+        fn permitted(
+            &self,
+            _at: ax_abi_port::At,
+            _path: &str,
+            _wants: ax_abi_port::Access,
+            _follow: bool,
+            _real_ids: bool,
+        ) -> Result<(), i32> {
+            Ok(())
+        }
+
+        fn permitted_of(
+            &self,
+            _fd: i32,
+            _wants: ax_abi_port::Access,
+            _real_ids: bool,
+        ) -> Result<(), i32> {
+            Ok(())
         }
     }
 
@@ -1443,5 +1523,98 @@ mod tests {
             &host,
         );
         assert_eq!(dispatch(&mut other, &host), Dispatch::Passthrough);
+    }
+
+    /// Put a 64-bit value where `NtSetInformationFile` reads its argument from.
+    fn with_offset(value: i64) -> MockHost {
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x100]),
+            ..MockHost::default()
+        };
+        host.mem.borrow_mut()[0x40..0x48].copy_from_slice(&value.to_le_bytes());
+        host
+    }
+
+    #[test]
+    fn set_information_file_moves_the_file_pointer() {
+        let host = with_offset(1234);
+        // NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+        // Length, FileInformationClass). Handle 4 is descriptor 0.
+        let mut env = trap_with_stack(
+            NtSyscall::SetInformationFile,
+            [4, 0x80, 0x40, 8],
+            &[FILE_POSITION_INFORMATION_CLASS],
+            &host,
+        );
+
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
+        assert_eq!(*host.sought.borrow(), Some((0, 1234)));
+        assert!(host.truncated.borrow().is_none());
+        // The IO_STATUS_BLOCK carries the status; nothing was transferred.
+        let mem = host.mem.borrow();
+        assert_eq!(u64::from_le_bytes(mem[0x80..0x88].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn set_information_file_sets_the_length() {
+        let host = with_offset(4096);
+        let mut env = trap_with_stack(
+            NtSyscall::SetInformationFile,
+            [4, 0, 0x40, 8],
+            &[FILE_END_OF_FILE_INFORMATION_CLASS],
+            &host,
+        );
+
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(Ntstatus::SUCCESS.0 as usize));
+        assert_eq!(*host.truncated.borrow(), Some((0, 4096)));
+        assert!(host.sought.borrow().is_none());
+    }
+
+    #[test]
+    fn set_information_file_leaves_a_class_it_does_not_answer() {
+        let host = with_offset(0);
+        let mut env = trap_with_stack(
+            NtSyscall::SetInformationFile,
+            [4, 0, 0x40, 8],
+            &[FILE_BASIC_INFORMATION_CLASS],
+            &host,
+        );
+
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(Ntstatus::NOT_IMPLEMENTED.0 as usize));
+        assert!(host.sought.borrow().is_none());
+        assert!(host.truncated.borrow().is_none());
+    }
+
+    #[test]
+    fn set_information_file_refuses_a_buffer_too_small_for_the_class() {
+        let host = with_offset(8);
+        let mut env = trap_with_stack(
+            NtSyscall::SetInformationFile,
+            [4, 0, 0x40, 4],
+            &[FILE_POSITION_INFORMATION_CLASS],
+            &host,
+        );
+
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(Ntstatus::INFO_LENGTH_MISMATCH.0 as usize));
+        assert!(host.sought.borrow().is_none());
+    }
+
+    #[test]
+    fn set_information_file_refuses_a_negative_offset() {
+        let host = with_offset(-1);
+        let mut env = trap_with_stack(
+            NtSyscall::SetInformationFile,
+            [4, 0, 0x40, 8],
+            &[FILE_POSITION_INFORMATION_CLASS],
+            &host,
+        );
+
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(Ntstatus::INVALID_PARAMETER.0 as usize));
+        assert!(host.sought.borrow().is_none());
     }
 }

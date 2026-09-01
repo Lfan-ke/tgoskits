@@ -164,31 +164,16 @@ pub fn sys_access(path: *const c_char, mode: u32) -> StarryResult<isize> {
     sys_faccessat2(AT_FDCWD, path, mode, 0)
 }
 
-// Note: AT_EACCESS is not explicitly handled. This is functionally correct
-// because fsuid/fsgid track euid/egid by default in our credential model,
-// so the real-ID vs effective-ID distinction AT_EACCESS controls is a no-op.
-pub fn sys_faccessat2(
-    dirfd: c_int,
-    path: *const c_char,
-    mode: u32,
-    flags: u32,
-) -> StarryResult<isize> {
-    // man 2 access: mode is a mask of F_OK(0), R_OK, W_OK, and X_OK;
-    // faccessat2 flags are limited to AT_EACCESS, AT_EMPTY_PATH, and
-    // AT_SYMLINK_NOFOLLOW. Linux rejects invalid bits before path resolution.
-    const FACCESSAT2_VALID_FLAGS: u32 = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
-    const FACCESSAT2_VALID_MODE: u32 = R_OK | W_OK | X_OK;
-    if mode & !FACCESSAT2_VALID_MODE != 0 || flags & !FACCESSAT2_VALID_FLAGS != 0 {
-        return Err(StarryError::InvalidInput);
-    }
 
-    let path = path.nullable().map(vm_load_path_string).transpose()?;
-    debug!("sys_faccessat2 <= dirfd: {dirfd}, path: {path:?}, mode: {mode}, flags: {flags}");
-
-    let file = resolve_at(dirfd, path.as_deref(), flags)?;
-
+/// Whether the caller may reach a resolved name in the ways `mode` asks for.
+///
+/// Split out of [`sys_faccessat2`] so an ABI personality can ask the same
+/// question through the capability port: the rules turn on the caller's whole
+/// credential set including supplementary groups, which is the host's to know,
+/// and a second copy of them here would drift from this one.
+pub(crate) fn access_permitted(file: &ResolveAtResult, mode: u32) -> StarryResult {
     if mode == 0 {
-        return Ok(0);
+        return Ok(());
     }
 
     let cred = current().as_thread().cred();
@@ -205,7 +190,7 @@ pub fn sys_faccessat2(
                 return Err(StarryError::PermissionDenied);
             }
         }
-        return Ok(0);
+        return Ok(());
     }
 
     let kstat = file.stat()?;
@@ -232,7 +217,33 @@ pub fn sys_faccessat2(
         return Err(StarryError::PermissionDenied);
     }
 
-    Ok(0)
+    Ok(())
+}
+
+// Note: AT_EACCESS is not explicitly handled. This is functionally correct
+// because fsuid/fsgid track euid/egid by default in our credential model,
+// so the real-ID vs effective-ID distinction AT_EACCESS controls is a no-op.
+pub fn sys_faccessat2(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: u32,
+    flags: u32,
+) -> StarryResult<isize> {
+    // man 2 access: mode is a mask of F_OK(0), R_OK, W_OK, and X_OK;
+    // faccessat2 flags are limited to AT_EACCESS, AT_EMPTY_PATH, and
+    // AT_SYMLINK_NOFOLLOW. Linux rejects invalid bits before path resolution.
+    const FACCESSAT2_VALID_FLAGS: u32 = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
+    const FACCESSAT2_VALID_MODE: u32 = R_OK | W_OK | X_OK;
+    if mode & !FACCESSAT2_VALID_MODE != 0 || flags & !FACCESSAT2_VALID_FLAGS != 0 {
+        return Err(StarryError::InvalidInput);
+    }
+
+    let path = path.nullable().map(vm_load_path_string).transpose()?;
+    debug!("sys_faccessat2 <= dirfd: {dirfd}, path: {path:?}, mode: {mode}, flags: {flags}");
+
+    let file = resolve_at(dirfd, path.as_deref(), flags)?;
+
+    access_permitted(&file, mode).map(|()| 0)
 }
 
 fn statfs(loc: &Location) -> StarryResult<statfs> {
