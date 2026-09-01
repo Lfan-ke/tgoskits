@@ -43,6 +43,10 @@ impl Platform for KernelHost {
         Ok(0)
     }
 
+    fn trace(&self, message: &str) {
+        warn!("abi: {message}");
+    }
+
     fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
         let bytes = vm_load_until_nul(uaddr as *const u8)
             .map_err(|e| errno(StarryError::from(e)))?;

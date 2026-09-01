@@ -114,6 +114,13 @@ pub trait Platform: Sync {
     /// Reports the host's fault error for an unreadable address, and its
     /// name-too-long error for a string that does not end within `out`.
     fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult;
+
+    /// Record `message` wherever the host keeps its diagnostics. A domain
+    /// says here what it could not do for a program - an entry point it binds
+    /// but does not serve, a request it refused - so the reason a program
+    /// failed is on record and not only in its own error code. A host with
+    /// nowhere to put it drops it.
+    fn trace(&self, _message: &str) {}
 }
 
 #[cfg(feature = "task")]
