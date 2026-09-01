@@ -365,6 +365,53 @@ mod tests {
             Err(AbiError::MalformedImage)
         );
     }
+
+    /// A section whose bytes are an import directory naming one library.
+    fn import_section() -> Vec<u8> {
+        let mut data = vec![0u8; 0x200];
+        // IMAGE_IMPORT_DESCRIPTOR at the section's start (RVA 0x1000).
+        data[0x00..0x04].copy_from_slice(&0x1040u32.to_le_bytes()); // OriginalFirstThunk
+        data[0x0C..0x10].copy_from_slice(&0x1080u32.to_le_bytes()); // Name
+        data[0x10..0x14].copy_from_slice(&0x1060u32.to_le_bytes()); // FirstThunk
+        // The descriptor after it stays zeroed, which ends the table.
+        data[0x40..0x48].copy_from_slice(&0x1090u64.to_le_bytes()); // one by-name thunk
+        data[0x80..0x8D].copy_from_slice(b"KERNEL32.dll\0");
+        data[0x92..0x9C].copy_from_slice(b"WriteFile\0");
+        data
+    }
+
+    #[test]
+    fn refuses_an_image_that_needs_a_library_without_touching_the_space() {
+        let data = import_section();
+        let mut img = synth(
+            0x1_4000_0000,
+            0x1000,
+            &[(sect(0x1000, 0x200, 0x200, 0x400, RX), &data)],
+        );
+        // Point the import data directory at that section.
+        let dir = OPT + 112 + pe::DIR_IMPORT * 8;
+        img[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[dir + 4..dir + 8].copy_from_slice(&40u32.to_le_bytes());
+
+        let mut env = RecordingEnv::default();
+        let err = PeFormat
+            .load(
+                &LoadRequest {
+                    image: &img,
+                    load_base: 0,
+                    args: &[],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .expect_err("an image needing a library is refused");
+
+        assert_eq!(err, AbiError::MissingLibrary);
+        // Refused before the space was prepared: an image that cannot run must
+        // not cost the caller the one it already had.
+        assert!(!env.reset);
+        assert!(env.maps.is_empty());
+    }
 }
 
 impl ImageFormat for PeFormat {
@@ -381,6 +428,16 @@ impl ImageFormat for PeFormat {
         if !pe.pe64 {
             // Only PE32+ is in scope; a 32-bit image is a distinct ABI.
             return Err(AbiError::Unsupported);
+        }
+        // An image that calls into a library needs its imports bound before
+        // it runs; nothing here provides them yet. Refusing now says which
+        // layer is missing, where mapping it would leave the failure to the
+        // first call through an address table full of zeroes.
+        if pe
+            .imports(req.image)
+            .is_some_and(|mut names| names.next().is_some())
+        {
+            return Err(AbiError::MissingLibrary);
         }
         // The image is this package's from here, so the space it goes into is
         // torn down and prepared. Doing it after the header checks is what
