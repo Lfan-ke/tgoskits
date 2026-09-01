@@ -94,6 +94,9 @@ const PARAMS_NORMALIZED: u32 = 0x1;
 pub const TEB_TLS_SLOTS: usize = 0x1480;
 /// `TEB.TlsExpansionSlots` (`f94/1780`): the pointer to the next 1024 slots.
 pub const TEB_TLS_EXPANSION: usize = 0x1780;
+/// `TEB.FlsSlots` (`fb4/17c8`): this thread's fiber-local values, allocated
+/// the first time the thread touches one.
+pub const TEB_FLS_SLOTS: usize = 0x17C8;
 
 // PEB_LDR_DATA (x86-64): the three module lists the loader publishes.
 /// `PEB_LDR_DATA.InLoadOrderModuleList`.

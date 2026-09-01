@@ -2601,4 +2601,176 @@ mod tests {
         win32::dispatch(&mut open, &host);
         assert_eq!(host.opened.borrow().as_ref().unwrap().1, "/work/notes.txt");
     }
+
+    /// The kernel32 image and a loader list naming it and the program, laid
+    /// out in the mock's memory, as the loader would leave them.
+    fn with_modules(host: &MockHost) -> usize {
+        use crate::{teb_peb, thunk, win32};
+        let (ldr_va, k32_va, exe_va) = (0x6000usize, 0x8000usize, 0x40000usize);
+        let image = thunk::kernel32_header(k32_va as u64, win32::table_len());
+        let ldr = teb_peb::build_ldr(
+            &[
+                teb_peb::LdrModule {
+                    base: exe_va as u64,
+                    entry: exe_va as u64 + 0x1000,
+                    size: 0x3000,
+                    path: "Z:\\app\\prog.exe",
+                    name: "prog.exe",
+                    tls_index: -1,
+                },
+                teb_peb::LdrModule {
+                    base: k32_va as u64,
+                    entry: 0,
+                    size: 0x2000,
+                    path: "Z:\\windows\\system32\\kernel32.dll",
+                    name: "kernel32.dll",
+                    tls_index: -1,
+                },
+            ],
+            &[],
+            ldr_va as u64,
+        );
+        let mut mem = host.mem.borrow_mut();
+        mem.resize(0x50000, 0);
+        mem[ldr_va..ldr_va + ldr.len()].copy_from_slice(&ldr);
+        mem[k32_va..k32_va + image.len()].copy_from_slice(&image);
+        let peb = 0x2000;
+        mem[peb + teb_peb::PEB_LDR..peb + teb_peb::PEB_LDR + 8]
+            .copy_from_slice(&(ldr_va as u64).to_le_bytes());
+        mem[peb + teb_peb::PEB_IMAGE_BASE..peb + teb_peb::PEB_IMAGE_BASE + 8]
+            .copy_from_slice(&(exe_va as u64).to_le_bytes());
+        // The version the PEB reports, as the loader fills it.
+        let mut pebbuf = mem[peb..peb + teb_peb::PEB_SIZE].to_vec();
+        teb_peb::fill_peb(&mut pebbuf, peb as u64, ldr_va as u64, 0x5000, 0x3000);
+        mem[peb..peb + teb_peb::PEB_SIZE].copy_from_slice(&pebbuf);
+        k32_va
+    }
+
+    #[test]
+    fn fiber_local_storage_starts_at_one_and_keeps_values() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+
+        let mut a = call("FlsAlloc", [0; 6], teb);
+        win32::dispatch(&mut a, &host);
+        let mut b = call("FlsAlloc", [0x1234, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut b, &host);
+        let (a, b) = (a.result.unwrap(), b.result.unwrap());
+        assert!(a >= 1 && b >= 1 && a != b, "index zero is never handed out");
+
+        let mut set = call("FlsSetValue", [a, 0xABCD, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut set, &host);
+        assert_eq!(set.result, Some(1));
+        let mut get = call("FlsGetValue", [a, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut get, &host);
+        assert_eq!(get.result, Some(0xABCD));
+        let mut fresh = call("FlsGetValue", [b, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut fresh, &host);
+        assert_eq!(fresh.result, Some(0));
+
+        let mut free = call("FlsFree", [a, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut free, &host);
+        assert_eq!(free.result, Some(1));
+        let mut gone = call("FlsGetValue", [a, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut gone, &host);
+        assert_eq!(gone.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(87), "a freed index is not a valid one");
+        let mut again = call("FlsAlloc", [0; 6], teb);
+        win32::dispatch(&mut again, &host);
+        assert_eq!(again.result, Some(a), "and it is reused");
+    }
+
+    #[test]
+    fn the_version_check_compares_the_way_rtl_does() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        with_modules(&host);
+
+        // VerSetConditionMask(0, VER_MAJORVERSION, VER_GREATER_EQUAL) puts the
+        // condition three bits up.
+        let mut mask = call("VerSetConditionMask", [0, 0x2, 3, 0, 0, 0], teb);
+        win32::dispatch(&mut mask, &host);
+        assert_eq!(mask.result, Some(3 << 3));
+        let mut mask = call("VerSetConditionMask", [3 << 3, 0x1, 3, 0, 0, 0], teb);
+        win32::dispatch(&mut mask, &host);
+        let mask = mask.result.unwrap();
+        assert_eq!(mask, (3 << 3) | 3);
+
+        // RTL_OSVERSIONINFOEXW asking for at least 6.0: satisfied by 10.0.
+        let info = 0x7000usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[info..info + 4].copy_from_slice(&284u32.to_le_bytes());
+            mem[info + 4..info + 8].copy_from_slice(&6u32.to_le_bytes());
+            mem[info + 8..info + 12].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let mut ok = call("VerifyVersionInfoW", [info, 0x3, mask, 0, 0, 0], teb);
+        win32::dispatch(&mut ok, &host);
+        assert_eq!(ok.result, Some(1));
+        // At least 11.0 is not.
+        host.mem.borrow_mut()[info + 4..info + 8].copy_from_slice(&11u32.to_le_bytes());
+        let mut old = call("VerifyVersionInfoW", [info, 0x3, mask, 0, 0, 0], teb);
+        win32::dispatch(&mut old, &host);
+        assert_eq!(old.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(1150), "ERROR_OLD_WIN_VERSION");
+    }
+
+    #[test]
+    fn libraries_the_process_has_are_found_and_others_are_not_loaded() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let k32 = with_modules(&host);
+        put_wide(&host, 0x10000, "api-ms-win-core-file-l1-1-0.dll\0");
+        put_wide(&host, 0x10200, "nope.dll\0");
+        put_wide(&host, 0x10400, "KERNEL32.DLL\0");
+
+        // An api-set name folds into kernel32, which the process has.
+        let mut lib = call("LoadLibraryExW", [0x10000, 0, 0x800, 0, 0, 0], teb);
+        win32::dispatch(&mut lib, &host);
+        assert_eq!(lib.result, Some(k32));
+        let mut again = call("LoadLibraryExW", [0x10400, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut again, &host);
+        assert_eq!(again.result, Some(k32));
+        // A file the process does not have is not loaded from here.
+        let mut missing = call("LoadLibraryExW", [0x10200, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut missing, &host);
+        assert_eq!(missing.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(126), "ERROR_MOD_NOT_FOUND");
+
+        // GetModuleHandleExW: NULL is the program; an address inside a module
+        // names that module; a null out-pointer is refused.
+        let mut exe = call("GetModuleHandleExW", [0, 0, 0x10800, 0, 0, 0], teb);
+        win32::dispatch(&mut exe, &host);
+        assert_eq!(exe.result, Some(1));
+        let word =
+            |at: usize| u64::from_le_bytes(host.mem.borrow()[at..at + 8].try_into().unwrap());
+        assert_eq!(word(0x10800), 0x40000);
+        let mut by_addr = call(
+            "GetModuleHandleExW",
+            [0x4, k32 + 0x1234, 0x10800, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut by_addr, &host);
+        assert_eq!(by_addr.result, Some(1));
+        assert_eq!(word(0x10800), k32 as u64);
+        let mut bad = call("GetModuleHandleExW", [0, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut bad, &host);
+        assert_eq!(bad.result, Some(0));
+
+        let mut free = call("FreeLibrary", [k32, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut free, &host);
+        assert_eq!(free.result, Some(1));
+        let mut null = call("FreeLibrary", [0; 6], teb);
+        win32::dispatch(&mut null, &host);
+        assert_eq!(null.result, Some(0));
+    }
 }

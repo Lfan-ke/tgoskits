@@ -721,6 +721,15 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "GetFullPathNameW" => file::get_full_path_name(&mut c),
         "GetTempPathW" => file::get_temp_path(&mut c),
         "SetCurrentDirectoryW" => file::set_current_directory(&mut c),
+        "FlsAlloc" => runtime::fls_alloc(&mut c),
+        "FlsGetValue" => runtime::fls_get_value(&mut c),
+        "FlsSetValue" => runtime::fls_set_value(&mut c),
+        "FlsFree" => runtime::fls_free(&mut c),
+        "VerSetConditionMask" => runtime::ver_set_condition_mask(&mut c),
+        "VerifyVersionInfoW" => runtime::verify_version_info(&mut c),
+        "LoadLibraryExW" => runtime::load_library_ex(&mut c),
+        "FreeLibrary" => runtime::free_library(&mut c),
+        "GetModuleHandleExW" => runtime::get_module_handle_ex(&mut c),
         "CloseHandle" => {
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
@@ -772,6 +781,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
 
 mod file;
 mod locale;
+mod runtime;
 
 /// Where the top-level exception filter is kept: a word of the PEB's reserved
 /// area that nothing else here uses.
