@@ -24,7 +24,7 @@ pub mod teb_peb;
 pub mod thunk;
 pub mod win32;
 
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 
 use ax_binfmt::{
     AbiError, AbiResult, ImageFormat, LoadEnv, LoadRequest, Loaded, Prot,
@@ -229,7 +229,7 @@ fn process_params(req: &LoadRequest<'_>, path: &str, at: u64) -> Vec<u8> {
 
 /// The loader's view of the process, as `PEB.Ldr` publishes it: which modules
 /// are where, under what names, in what order they were loaded and started.
-fn module_list(modules: &[dll::Module], kernel32_va: u64, kernel32_len: u64, at: u64) -> Vec<u8> {
+fn module_list(modules: &[dll::Module], system: &[dll::SystemModule], at: u64) -> Vec<u8> {
     let mut tls_slot = 0i16;
     let described = modules
         .iter()
@@ -267,22 +267,28 @@ fn module_list(modules: &[dll::Module], kernel32_va: u64, kernel32_len: u64, at:
             },
         )
         .collect();
-    // kernel32 is a module like any other to a program that asks: it has a
-    // base, a name, and exports - the stubs - even though no file was read.
-    entries.push(teb_peb::LdrModule {
-        base: kernel32_va,
-        entry: 0,
-        size: page_up(kernel32_len),
-        path: KERNEL32_PATH,
-        name: "kernel32.dll",
-        tls_index: -1,
-    });
+    // A synthesized library is a module like any other to a program that
+    // asks: it has a base, a name, and exports - the stubs - though no file
+    // was read.
+    let paths: Vec<String> = system.iter().map(|lib| system_path(lib.name)).collect();
+    for (lib, path) in system.iter().zip(&paths) {
+        entries.push(teb_peb::LdrModule {
+            base: lib.base,
+            entry: 0,
+            size: lib.len,
+            path,
+            name: lib.name,
+            tls_index: -1,
+        });
+    }
     teb_peb::build_ldr(&entries, &dll::init_order(modules), at)
 }
 
-/// Where the synthesized kernel32 says it lives, as a program would see the
-/// real one's path.
-const KERNEL32_PATH: &str = "Z:\\windows\\system32\\kernel32.dll";
+/// Where a synthesized library says it lives, as a program would see the real
+/// one's path.
+fn system_path(name: &str) -> String {
+    alloc::format!("Z:\\windows\\system32\\{name}")
+}
 
 /// The first thread's TLS area, to map at `tls_va`: an array with one entry per
 /// module that keeps thread locals, then each module's block - its template
@@ -864,7 +870,7 @@ mod tests {
     /// Where the startup sequence begins inside the code region: after the
     /// kernel32 header page and one stub per table entry.
     fn startup_offset() -> u64 {
-        (thunk::MODULE_HEADER + crate::win32::table_len() * thunk::STUB_LEN) as u64
+        thunk::system_len() as u64
     }
 
     #[test]
@@ -880,24 +886,36 @@ mod tests {
         let peb = at(word(teb, teb_peb::TEB_PEB));
         let ldr_va = word(peb, teb_peb::PEB_LDR);
         let ldr = at(ldr_va);
-        // Walk the load-order list to its last entry: kernel32, at the code
-        // region, under its Windows path.
+        // Walk the load-order list to the entry at the code region: kernel32,
+        // the first synthesized library, under its Windows path; the others
+        // follow it.
         let head = teb_peb::LDR_IN_LOAD_ORDER;
         let mut link = word(ldr, head) - ldr_va;
-        let mut last = None;
+        let mut found = None;
+        let mut count = 0;
         while link as usize != head {
-            last = Some(link as usize);
+            if word(&ldr[link as usize..], teb_peb::LDR_DLL_BASE) == 0x1_4000_2000 {
+                found = Some(link as usize);
+            }
+            count += 1;
             link = word(ldr, link as usize) - ldr_va;
         }
-        let entry = &ldr[last.expect("a module")..];
-        assert_eq!(word(entry, teb_peb::LDR_DLL_BASE), 0x1_4000_2000);
+        assert_eq!(
+            count,
+            1 + crate::win32::LIBRARIES.len(),
+            "the program and every library"
+        );
+        let entry = &ldr[found.expect("kernel32 at the code region")..];
         let len = u16::from_le_bytes(entry[teb_peb::LDR_FULL_NAME..][..2].try_into().unwrap());
         let name_at = word(entry, teb_peb::LDR_FULL_NAME + 8) - ldr_va;
         let name: Vec<u16> = ldr[name_at as usize..][..len as usize]
             .chunks(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        assert_eq!(String::from_utf16_lossy(&name), KERNEL32_PATH);
+        assert_eq!(
+            String::from_utf16_lossy(&name),
+            "Z:\\windows\\system32\\kernel32.dll"
+        );
         // And the program's own entry names it the Windows way.
         let first = &ldr[(word(ldr, head) - ldr_va) as usize..];
         let len = u16::from_le_bytes(first[teb_peb::LDR_FULL_NAME..][..2].try_into().unwrap());
@@ -1109,6 +1127,37 @@ mod tests {
     }
 
     #[test]
+    fn an_import_from_another_system_library_binds_into_that_library() {
+        let exe = image_with_imports(
+            &[
+                (b"ADVAPI32.dll\0", b"RegOpenKeyExW\0"),
+                (b"KERNEL32.dll\0", b"WriteFile\0"),
+            ],
+            0x400,
+        );
+        let mut env = RecordingEnv::default();
+        load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+        // kernel32 is at the code region; advapi32 follows it, and the slot
+        // points at the first stub past advapi32's header.
+        let advapi32 = 0x1_4000_2000 + thunk::system_size(0) as u64;
+        assert_eq!(
+            slot_of(&env, 0),
+            advapi32
+                + thunk::MODULE_HEADER as u64
+                + crate::win32::LIBRARIES[1]
+                    .exports
+                    .iter()
+                    .position(|(n, _)| *n == "RegOpenKeyExW")
+                    .unwrap() as u64
+                    * thunk::STUB_LEN as u64
+        );
+        assert_eq!(
+            slot_of(&env, 1),
+            0x1_4000_2000 + thunk::MODULE_HEADER as u64
+        );
+    }
+
+    #[test]
     fn every_module_has_its_headers_readable_at_its_base() {
         let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
         let dll = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
@@ -1309,7 +1358,7 @@ mod tests {
     #[test]
     fn refuses_an_image_that_needs_a_library_without_touching_the_space() {
         // A real kernel32 export, but not one the synthesized library serves.
-        let img = image_importing(b"CreateMutexW\0");
+        let img = image_importing(b"NoSuchFunctionW\0");
 
         let mut env = RecordingEnv::default();
         let err = PeFormat
@@ -1378,12 +1427,7 @@ impl ImageFormat for PeFormat {
         let tls = thread_locals(&mut linked.modules, tls_va);
 
         let ldr_va = tls_va + page_up(tls.len() as u64);
-        let ldr = module_list(
-            &linked.modules,
-            linked.stubs_va,
-            linked.stubs.len() as u64,
-            ldr_va,
-        );
+        let ldr = module_list(&linked.modules, &linked.system, ldr_va);
         let params_va = ldr_va + page_up(ldr.len() as u64);
         let params = process_params(req, &linked.modules[0].path, params_va);
         let heap_va = params_va + page_up(params.len() as u64);

@@ -85,176 +85,349 @@ const TICKS_PER_SEC: u64 = 10_000_000;
 /// `FILETIME` and a Unix clock.
 const TICKS_1601_TO_1970: u64 = 116_444_736_000_000_000;
 
-/// The Win32 entry points this package binds, by name.
+/// The entry points this package binds, by library and by name.
 ///
-/// The position in this table is the call's number above [`WIN32_BASE`], so a
-/// stub can be told which entry it stands for and a trap can be routed back.
-/// Every name a C runtime and CPython's launcher import from kernel32 is here,
-/// so such an image links; [`dispatch`] says which of them do their work.
-const TABLE: &[&str] = &[
-    "WriteFile",
-    "GetStdHandle",
-    "GetLastError",
-    "SetLastError",
-    "ExitProcess",
-    "GetCurrentProcessId",
-    "GetCurrentThreadId",
-    "GetCurrentProcess",
-    "GetCurrentThread",
-    "GetSystemTimeAsFileTime",
-    "QueryPerformanceCounter",
-    "QueryPerformanceFrequency",
-    "IsProcessorFeaturePresent",
-    "IsDebuggerPresent",
-    "SetUnhandledExceptionFilter",
-    "UnhandledExceptionFilter",
-    "EncodePointer",
-    "DecodePointer",
-    "InitializeSListHead",
-    "TlsAlloc",
-    "TlsGetValue",
-    "TlsSetValue",
-    "TlsFree",
-    "GetProcessHeap",
-    "HeapAlloc",
-    "HeapFree",
-    "HeapReAlloc",
-    "HeapSize",
-    "InitializeCriticalSectionAndSpinCount",
-    "InitializeCriticalSectionEx",
-    "EnterCriticalSection",
-    "LeaveCriticalSection",
-    "DeleteCriticalSection",
-    "GetModuleHandleW",
-    "GetProcAddress",
-    "TerminateProcess",
-    "CloseHandle",
-    "Sleep",
-    "VirtualAlloc",
-    "VirtualProtect",
-    // Bound so the runtime links; each fails with ERROR_CALL_NOT_IMPLEMENTED
-    // when reached, until it is given its meaning.
-    "Beep",
-    "CompareStringW",
-    "CreateDirectoryW",
-    "CreateFileW",
-    "CreatePipe",
-    "CreateProcessW",
-    "CreateThread",
-    "DeleteFileW",
-    "DuplicateHandle",
-    "EnumSystemLocalesW",
-    "ExitThread",
-    "FileTimeToSystemTime",
-    "FindClose",
-    "FindFirstFileExW",
-    "FindNextFileW",
-    "FlsAlloc",
-    "FlsFree",
-    "FlsGetValue",
-    "FlsSetValue",
-    "FlushFileBuffers",
-    "FreeEnvironmentStringsW",
-    "FreeLibrary",
-    "FreeLibraryAndExitThread",
-    "GetACP",
-    "GetCPInfo",
-    "GetCommandLineA",
-    "GetCommandLineW",
-    "GetConsoleCP",
-    "GetConsoleMode",
-    "GetConsoleOutputCP",
-    "GetCurrentDirectoryW",
-    "GetDateFormatW",
-    "GetDiskFreeSpaceW",
-    "GetDriveTypeW",
-    "GetEnvironmentStringsW",
-    "GetExitCodeProcess",
-    "GetFileAttributesExW",
-    "GetFileInformationByHandle",
-    "GetFileSizeEx",
-    "GetFileType",
-    "GetFullPathNameW",
-    "GetLocalTime",
-    "GetLocaleInfoW",
-    "GetLogicalDrives",
-    "GetModuleFileNameW",
-    "GetModuleHandleExW",
-    "GetNumberOfConsoleInputEvents",
-    "GetOEMCP",
-    "GetStartupInfoW",
-    "GetStringTypeW",
-    "GetSystemInfo",
-    "GetTempPathW",
-    "GetTimeFormatW",
-    "GetTimeZoneInformation",
-    "GetUserDefaultLCID",
-    "HeapCompact",
-    "HeapQueryInformation",
-    "HeapValidate",
-    "HeapWalk",
-    "InterlockedFlushSList",
-    "InterlockedPushEntrySList",
-    "IsThreadAFiber",
-    "IsValidCodePage",
-    "IsValidLocale",
-    "LCMapStringW",
-    "LoadLibraryExW",
-    "LockFileEx",
-    "MoveFileExW",
-    "MultiByteToWideChar",
-    "OutputDebugStringW",
-    "PeekConsoleInputA",
-    "PeekNamedPipe",
-    "RaiseException",
-    "ReadConsoleInputW",
-    "ReadConsoleW",
-    "ReadFile",
-    "RemoveDirectoryW",
-    "ResumeThread",
-    "RtlCaptureContext",
-    "RtlLookupFunctionEntry",
-    "RtlPcToFileHeader",
-    "RtlUnwind",
-    "RtlUnwindEx",
-    "RtlVirtualUnwind",
-    "SetConsoleCtrlHandler",
-    "SetConsoleMode",
-    "SetCurrentDirectoryW",
-    "SetEndOfFile",
-    "SetEnvironmentVariableW",
-    "SetErrorMode",
-    "SetFileAttributesW",
-    "SetFilePointerEx",
-    "SetFileTime",
-    "SetLocalTime",
-    "SetStdHandle",
-    "SystemTimeToFileTime",
-    "SystemTimeToTzSpecificLocalTime",
-    "TzSpecificLocalTimeToSystemTime",
-    "UnlockFileEx",
-    "VerSetConditionMask",
-    "VerifyVersionInfoW",
-    "VirtualQuery",
-    "WaitForSingleObject",
-    "WideCharToMultiByte",
-    "WriteConsoleW",
-];
-
-/// How many entry points the table binds - the number of stubs a process gets.
-pub fn table_len() -> usize {
-    TABLE.len()
+/// Each library is synthesized as a module of its own - a header page with an
+/// export directory, then a stub per entry - so a program finds it in the
+/// module list and takes addresses out of it the way it would out of the real
+/// one. The position across all libraries is the call's number above
+/// [`WIN32_BASE`]; the position within a library is its stub's index. Every
+/// name a C runtime and CPython import from these libraries is here, so such
+/// an image links; [`dispatch`] says which of them do their work.
+pub struct Library {
+    /// The name imports spell, as the export directory will name it.
+    pub name: &'static str,
+    /// Exported names, and the ordinal each is exported under; zero means
+    /// "the position plus one", which is what an ordinary library has.
+    pub exports: &'static [(&'static str, u16)],
 }
 
-/// A Win32 entry point this package binds: an index into [`TABLE`].
+pub const LIBRARIES: &[Library] = &[
+    Library {
+        name: "KERNEL32.dll",
+        exports: KERNEL32,
+    },
+    Library {
+        name: "ADVAPI32.dll",
+        exports: ADVAPI32,
+    },
+    Library {
+        name: "VERSION.dll",
+        exports: VERSION,
+    },
+    Library {
+        name: "bcrypt.dll",
+        exports: BCRYPT,
+    },
+    // Imported by ordinal, so the ordinals are the real library's, read out
+    // of its export table.
+    Library {
+        name: "WS2_32.dll",
+        exports: WS2_32,
+    },
+];
+
+const KERNEL32: &[(&str, u16)] = &[
+    ("WriteFile", 0),
+    ("GetStdHandle", 0),
+    ("GetLastError", 0),
+    ("SetLastError", 0),
+    ("ExitProcess", 0),
+    ("GetCurrentProcessId", 0),
+    ("GetCurrentThreadId", 0),
+    ("GetCurrentProcess", 0),
+    ("GetCurrentThread", 0),
+    ("GetSystemTimeAsFileTime", 0),
+    ("QueryPerformanceCounter", 0),
+    ("QueryPerformanceFrequency", 0),
+    ("IsProcessorFeaturePresent", 0),
+    ("IsDebuggerPresent", 0),
+    ("SetUnhandledExceptionFilter", 0),
+    ("UnhandledExceptionFilter", 0),
+    ("EncodePointer", 0),
+    ("DecodePointer", 0),
+    ("InitializeSListHead", 0),
+    ("TlsAlloc", 0),
+    ("TlsGetValue", 0),
+    ("TlsSetValue", 0),
+    ("TlsFree", 0),
+    ("GetProcessHeap", 0),
+    ("HeapAlloc", 0),
+    ("HeapFree", 0),
+    ("HeapReAlloc", 0),
+    ("HeapSize", 0),
+    ("InitializeCriticalSectionAndSpinCount", 0),
+    ("InitializeCriticalSectionEx", 0),
+    ("EnterCriticalSection", 0),
+    ("LeaveCriticalSection", 0),
+    ("DeleteCriticalSection", 0),
+    ("GetModuleHandleW", 0),
+    ("GetProcAddress", 0),
+    ("TerminateProcess", 0),
+    ("CloseHandle", 0),
+    ("Sleep", 0),
+    ("VirtualAlloc", 0),
+    ("VirtualProtect", 0),
+    ("Beep", 0),
+    ("CompareStringW", 0),
+    ("CreateDirectoryW", 0),
+    ("CreateFileW", 0),
+    ("CreatePipe", 0),
+    ("CreateProcessW", 0),
+    ("CreateThread", 0),
+    ("DeleteFileW", 0),
+    ("DuplicateHandle", 0),
+    ("EnumSystemLocalesW", 0),
+    ("ExitThread", 0),
+    ("FileTimeToSystemTime", 0),
+    ("FindClose", 0),
+    ("FindFirstFileExW", 0),
+    ("FindNextFileW", 0),
+    ("FlsAlloc", 0),
+    ("FlsFree", 0),
+    ("FlsGetValue", 0),
+    ("FlsSetValue", 0),
+    ("FlushFileBuffers", 0),
+    ("FreeEnvironmentStringsW", 0),
+    ("FreeLibrary", 0),
+    ("FreeLibraryAndExitThread", 0),
+    ("GetACP", 0),
+    ("GetCPInfo", 0),
+    ("GetCommandLineA", 0),
+    ("GetCommandLineW", 0),
+    ("GetConsoleCP", 0),
+    ("GetConsoleMode", 0),
+    ("GetConsoleOutputCP", 0),
+    ("GetCurrentDirectoryW", 0),
+    ("GetDateFormatW", 0),
+    ("GetDiskFreeSpaceW", 0),
+    ("GetDriveTypeW", 0),
+    ("GetEnvironmentStringsW", 0),
+    ("GetExitCodeProcess", 0),
+    ("GetFileAttributesExW", 0),
+    ("GetFileInformationByHandle", 0),
+    ("GetFileSizeEx", 0),
+    ("GetFileType", 0),
+    ("GetFullPathNameW", 0),
+    ("GetLocalTime", 0),
+    ("GetLocaleInfoW", 0),
+    ("GetLogicalDrives", 0),
+    ("GetModuleFileNameW", 0),
+    ("GetModuleHandleExW", 0),
+    ("GetNumberOfConsoleInputEvents", 0),
+    ("GetOEMCP", 0),
+    ("GetStartupInfoW", 0),
+    ("GetStringTypeW", 0),
+    ("GetSystemInfo", 0),
+    ("GetTempPathW", 0),
+    ("GetTimeFormatW", 0),
+    ("GetTimeZoneInformation", 0),
+    ("GetUserDefaultLCID", 0),
+    ("HeapCompact", 0),
+    ("HeapQueryInformation", 0),
+    ("HeapValidate", 0),
+    ("HeapWalk", 0),
+    ("InterlockedFlushSList", 0),
+    ("InterlockedPushEntrySList", 0),
+    ("IsThreadAFiber", 0),
+    ("IsValidCodePage", 0),
+    ("IsValidLocale", 0),
+    ("LCMapStringW", 0),
+    ("LoadLibraryExW", 0),
+    ("LockFileEx", 0),
+    ("MoveFileExW", 0),
+    ("MultiByteToWideChar", 0),
+    ("OutputDebugStringW", 0),
+    ("PeekConsoleInputA", 0),
+    ("PeekNamedPipe", 0),
+    ("RaiseException", 0),
+    ("ReadConsoleInputW", 0),
+    ("ReadConsoleW", 0),
+    ("ReadFile", 0),
+    ("RemoveDirectoryW", 0),
+    ("ResumeThread", 0),
+    ("RtlCaptureContext", 0),
+    ("RtlLookupFunctionEntry", 0),
+    ("RtlPcToFileHeader", 0),
+    ("RtlUnwind", 0),
+    ("RtlUnwindEx", 0),
+    ("RtlVirtualUnwind", 0),
+    ("SetConsoleCtrlHandler", 0),
+    ("SetConsoleMode", 0),
+    ("SetCurrentDirectoryW", 0),
+    ("SetEndOfFile", 0),
+    ("SetEnvironmentVariableW", 0),
+    ("SetErrorMode", 0),
+    ("SetFileAttributesW", 0),
+    ("SetFilePointerEx", 0),
+    ("SetFileTime", 0),
+    ("SetLocalTime", 0),
+    ("SetStdHandle", 0),
+    ("SystemTimeToFileTime", 0),
+    ("SystemTimeToTzSpecificLocalTime", 0),
+    ("TzSpecificLocalTimeToSystemTime", 0),
+    ("UnlockFileEx", 0),
+    ("VerSetConditionMask", 0),
+    ("VerifyVersionInfoW", 0),
+    ("VirtualQuery", 0),
+    ("WaitForSingleObject", 0),
+    ("WideCharToMultiByte", 0),
+    ("WriteConsoleW", 0),
+    ("AcquireSRWLockExclusive", 0),
+    ("AddDllDirectory", 0),
+    ("AddVectoredExceptionHandler", 0),
+    ("CancelIoEx", 0),
+    ("CompareStringOrdinal", 0),
+    ("ConnectNamedPipe", 0),
+    ("CopyFile2", 0),
+    ("CreateEventA", 0),
+    ("CreateEventW", 0),
+    ("CreateFileMappingW", 0),
+    ("CreateHardLinkW", 0),
+    ("CreateMutexW", 0),
+    ("CreateNamedPipeW", 0),
+    ("CreateSemaphoreA", 0),
+    ("CreateSymbolicLinkW", 0),
+    ("CreateWaitableTimerExW", 0),
+    ("DeleteProcThreadAttributeList", 0),
+    ("DeviceIoControl", 0),
+    ("ExpandEnvironmentStringsW", 0),
+    ("FindFirstFileW", 0),
+    ("FindFirstVolumeW", 0),
+    ("FindNextVolumeW", 0),
+    ("FindVolumeClose", 0),
+    ("FlushViewOfFile", 0),
+    ("FormatMessageW", 0),
+    ("GenerateConsoleCtrlEvent", 0),
+    ("GetActiveProcessorCount", 0),
+    ("GetConsoleScreenBufferInfo", 0),
+    ("GetCurrentProcessorNumber", 0),
+    ("GetDiskFreeSpaceExW", 0),
+    ("GetEnvironmentVariableA", 0),
+    ("GetErrorMode", 0),
+    ("GetExitCodeThread", 0),
+    ("GetFileAttributesW", 0),
+    ("GetFileInformationByHandleEx", 0),
+    ("GetFileSize", 0),
+    ("GetFinalPathNameByHandleW", 0),
+    ("GetHandleInformation", 0),
+    ("GetLargePageMinimum", 0),
+    ("GetLocaleInfoA", 0),
+    ("GetLogicalDriveStringsW", 0),
+    ("GetLongPathNameW", 0),
+    ("GetNamedPipeHandleStateW", 0),
+    ("GetNumaHighestNodeNumber", 0),
+    ("GetNumaNodeProcessorMask", 0),
+    ("GetOverlappedResult", 0),
+    ("GetProcessTimes", 0),
+    ("GetShortPathNameW", 0),
+    ("GetSystemTimePreciseAsFileTime", 0),
+    ("GetThreadTimes", 0),
+    ("GetTickCount64", 0),
+    ("GetVersion", 0),
+    ("GetVersionExW", 0),
+    ("GetVolumePathNameW", 0),
+    ("GetVolumePathNamesForVolumeNameW", 0),
+    ("InitializeConditionVariable", 0),
+    ("InitializeProcThreadAttributeList", 0),
+    ("InitializeSRWLock", 0),
+    ("LCMapStringEx", 0),
+    ("LoadLibraryA", 0),
+    ("LoadLibraryW", 0),
+    ("LocalFree", 0),
+    ("MapViewOfFile", 0),
+    ("NeedCurrentDirectoryForExePathW", 0),
+    ("OpenEventW", 0),
+    ("OpenFileMappingW", 0),
+    ("OpenMutexW", 0),
+    ("OpenProcess", 0),
+    ("PathCchCombineEx", 0),
+    ("PathCchSkipRoot", 0),
+    ("PssCaptureSnapshot", 0),
+    ("PssFreeSnapshot", 0),
+    ("PssQuerySnapshot", 0),
+    ("ReleaseMutex", 0),
+    ("ReleaseSRWLockExclusive", 0),
+    ("ReleaseSemaphore", 0),
+    ("RemoveDllDirectory", 0),
+    ("RemoveVectoredExceptionHandler", 0),
+    ("ResetEvent", 0),
+    ("SetEvent", 0),
+    ("SetFileInformationByHandle", 0),
+    ("SetHandleInformation", 0),
+    ("SetNamedPipeHandleState", 0),
+    ("SetWaitableTimerEx", 0),
+    ("SleepConditionVariableSRW", 0),
+    ("SwitchToThread", 0),
+    ("TerminateThread", 0),
+    ("UnmapViewOfFile", 0),
+    ("UpdateProcThreadAttribute", 0),
+    ("VirtualFree", 0),
+    ("WaitForMultipleObjects", 0),
+    ("WaitForSingleObjectEx", 0),
+    ("WaitNamedPipeW", 0),
+    ("WakeConditionVariable", 0),
+    ("WriteConsoleA", 0),
+];
+
+const ADVAPI32: &[(&str, u16)] = &[
+    ("AdjustTokenPrivileges", 0),
+    ("ConvertStringSecurityDescriptorToSecurityDescriptorW", 0),
+    ("GetUserNameW", 0),
+    ("LookupPrivilegeValueA", 0),
+    ("LsaNtStatusToWinError", 0),
+    ("OpenProcessToken", 0),
+    ("RegCloseKey", 0),
+    ("RegConnectRegistryW", 0),
+    ("RegCreateKeyExW", 0),
+    ("RegCreateKeyW", 0),
+    ("RegDeleteKeyExW", 0),
+    ("RegDeleteKeyW", 0),
+    ("RegDeleteValueW", 0),
+    ("RegEnumKeyExW", 0),
+    ("RegEnumValueW", 0),
+    ("RegFlushKey", 0),
+    ("RegLoadKeyW", 0),
+    ("RegOpenKeyExW", 0),
+    ("RegQueryInfoKeyW", 0),
+    ("RegQueryValueExW", 0),
+    ("RegSaveKeyW", 0),
+    ("RegSetValueExW", 0),
+];
+
+const VERSION: &[(&str, u16)] = &[
+    ("GetFileVersionInfoSizeW", 0),
+    ("GetFileVersionInfoW", 0),
+    ("VerQueryValueW", 0),
+];
+
+const BCRYPT: &[(&str, u16)] = &[("BCryptGenRandom", 0)];
+
+const WS2_32: &[(&str, u16)] = &[
+    ("closesocket", 3),
+    ("getsockopt", 7),
+    ("send", 19),
+    ("socket", 23),
+    ("WSAGetLastError", 111),
+    ("WSAStartup", 115),
+    ("WSACleanup", 116),
+];
+
+/// A Win32 entry point this package binds: a position across [`LIBRARIES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Win32Call(u32);
+
+/// How many entry points the libraries bind in all - the number of stubs a
+/// process gets.
+pub fn table_len() -> usize {
+    LIBRARIES.iter().map(|lib| lib.exports.len()).sum()
+}
 
 impl Win32Call {
     /// The call a trap number names, or `None` for a number outside this layer.
     pub fn from_nr(nr: u32) -> Option<Win32Call> {
         let index = nr.checked_sub(WIN32_BASE)?;
-        (index < TABLE.len() as u32).then_some(Win32Call(index))
+        (index < table_len() as u32).then_some(Win32Call(index))
     }
 
     /// The trap number a stub for this call raises.
@@ -262,14 +435,49 @@ impl Win32Call {
         WIN32_BASE + self.0
     }
 
+    /// Which library this call belongs to, and its position in it.
+    pub fn place(self) -> (usize, usize) {
+        let mut index = self.0 as usize;
+        for (at, lib) in LIBRARIES.iter().enumerate() {
+            if index < lib.exports.len() {
+                return (at, index);
+            }
+            index -= lib.exports.len();
+        }
+        unreachable!("a call is always inside the table")
+    }
+
+    /// The first call of library `lib`.
+    pub fn first_of(lib: usize) -> Win32Call {
+        let before: usize = LIBRARIES[..lib].iter().map(|l| l.exports.len()).sum();
+        Win32Call(before as u32)
+    }
+
     /// The exported name an image imports this call by.
     pub fn symbol(self) -> &'static str {
-        TABLE[self.0 as usize]
+        let (lib, at) = self.place();
+        LIBRARIES[lib].exports[at].0
+    }
+
+    /// The ordinal this call is exported under.
+    pub fn ordinal(self) -> u16 {
+        let (lib, at) = self.place();
+        match LIBRARIES[lib].exports[at].1 {
+            0 => at as u16 + 1,
+            ordinal => ordinal,
+        }
     }
 
     /// The library an image expects to import this call from.
     pub fn library(self) -> &'static str {
-        "KERNEL32.dll"
+        LIBRARIES[self.place().0].name
+    }
+
+    /// The library `name` is, without regard to case, if it is one of these.
+    pub fn library_index(name: &str) -> Option<usize> {
+        LIBRARIES
+            .iter()
+            .position(|lib| lib.name.eq_ignore_ascii_case(name))
     }
 
     /// The call an import names, or `None` for one no stub is synthesized for.
@@ -277,18 +485,34 @@ impl Win32Call {
     /// A library name is matched without regard to case, as the loader matches
     /// it; an export name is matched exactly, as the linker wrote it.
     pub fn resolve(library: &str, symbol: &str) -> Option<Win32Call> {
-        if !library.eq_ignore_ascii_case("KERNEL32.dll") {
-            return None;
-        }
-        Self::named(symbol)
+        let lib = Self::library_index(library)?;
+        let at = LIBRARIES[lib]
+            .exports
+            .iter()
+            .position(|(name, _)| *name == symbol)?;
+        Some(Win32Call(Self::first_of(lib).0 + at as u32))
     }
 
-    /// The call with exactly this export name.
-    pub fn named(symbol: &str) -> Option<Win32Call> {
-        TABLE
+    /// The call `library` exports under `ordinal`.
+    pub fn by_ordinal(library: &str, ordinal: u16) -> Option<Win32Call> {
+        let lib = Self::library_index(library)?;
+        let first = Self::first_of(lib).0;
+        LIBRARIES[lib]
+            .exports
             .iter()
-            .position(|name| *name == symbol)
-            .map(|at| Win32Call(at as u32))
+            .enumerate()
+            .find(|(at, (_, fixed))| match *fixed {
+                0 => *at as u16 + 1 == ordinal,
+                fixed => fixed == ordinal,
+            })
+            .map(|(at, _)| Win32Call(first + at as u32))
+    }
+
+    /// The call with exactly this export name, in whichever library has it.
+    pub fn named(symbol: &str) -> Option<Win32Call> {
+        LIBRARIES
+            .iter()
+            .find_map(|lib| Self::resolve(lib.name, symbol))
     }
 
     /// Well-known calls, by name, for code that needs one in particular.
@@ -1397,7 +1621,7 @@ mod tests {
             assert_eq!(Win32Call::named(call.symbol()), Some(call));
             nr += 1;
         }
-        assert_eq!(nr - WIN32_BASE, TABLE.len() as u32);
+        assert_eq!(nr - WIN32_BASE, table_len() as u32);
     }
 
     #[test]
@@ -1421,18 +1645,22 @@ mod tests {
         );
         // An export name is case-sensitive, as the linker wrote it.
         assert_eq!(Win32Call::resolve("KERNEL32.dll", "writefile"), None);
-        assert_eq!(Win32Call::resolve("KERNEL32.dll", "CreateMutexW"), None);
+        // A real kernel32 export nothing here binds is not found either.
+        assert_eq!(Win32Call::resolve("KERNEL32.dll", "NoSuchFunctionW"), None);
         assert_eq!(Win32Call::resolve("USER32.dll", "WriteFile"), None);
     }
 
     #[test]
-    fn the_table_names_each_function_once() {
-        for (i, name) in TABLE.iter().enumerate() {
-            assert_eq!(
-                TABLE.iter().position(|n| n == name),
-                Some(i),
-                "{name} twice"
-            );
+    fn each_library_names_each_function_once() {
+        for lib in LIBRARIES {
+            for (i, (name, _)) in lib.exports.iter().enumerate() {
+                assert_eq!(
+                    lib.exports.iter().position(|(n, _)| n == name),
+                    Some(i),
+                    "{name} twice in {}",
+                    lib.name
+                );
+            }
         }
     }
 

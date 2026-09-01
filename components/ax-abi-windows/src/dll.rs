@@ -70,7 +70,27 @@ pub struct Linked {
     /// startup sequence ends the process through it whether or not the
     /// program imports it.
     pub exit_stub: u64,
+    /// The synthesized libraries, in the order they lie in `stubs`.
+    pub system: Vec<SystemModule>,
 }
+
+/// One synthesized library as the module list describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemModule {
+    /// The name imports spell, lowered as the module list keeps names.
+    pub name: &'static str,
+    pub base: u64,
+    pub len: u64,
+}
+
+/// The lowered name of synthesized library `lib`.
+const SYSTEM_NAMES: [&str; 5] = [
+    "kernel32.dll",
+    "advapi32.dll",
+    "version.dll",
+    "bcrypt.dll",
+    "ws2_32.dll",
+];
 
 /// Reach every library the program needs and resolve every import in the set.
 ///
@@ -130,10 +150,22 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
     }
     let stubs_va = next;
 
+    // Each synthesized library follows the last module, in table order, and
+    // a call's stub is in its own library past that library's header.
+    let mut system = Vec::new();
+    let mut next_lib = stubs_va;
+    for (lib, name) in SYSTEM_NAMES.iter().enumerate() {
+        let len = thunk::system_size(lib) as u64;
+        system.push(SystemModule {
+            name,
+            base: next_lib,
+            len,
+        });
+        next_lib += len;
+    }
     let stub_of = |call: Win32Call| {
-        stubs_va
-            + (thunk::MODULE_HEADER + (call.nr() - crate::win32::WIN32_BASE) as usize * STUB_LEN)
-                as u64
+        let (lib, at) = call.place();
+        system[lib].base + (thunk::MODULE_HEADER + at * STUB_LEN) as u64
     };
     for at in 0..modules.len() {
         let mut binds = Vec::new();
@@ -162,17 +194,23 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         modules[at].binds = binds;
     }
 
-    let count = crate::win32::table_len();
-    let mut stubs = thunk::kernel32_header(stubs_va, count);
-    for i in 0..count {
-        let call = Win32Call::from_nr(crate::win32::WIN32_BASE + i as u32).expect("in the table");
-        stubs.extend_from_slice(&thunk::stub(call));
+    let mut stubs = Vec::new();
+    for (lib, module) in system.iter().enumerate() {
+        let first = Win32Call::first_of(lib);
+        let mut image = thunk::system_header(module.base, lib);
+        for i in 0..crate::win32::LIBRARIES[lib].exports.len() {
+            let call = Win32Call::from_nr(first.nr() + i as u32).expect("in the table");
+            image.extend_from_slice(&thunk::stub(call));
+        }
+        image.resize(module.len as usize, 0xCC);
+        stubs.extend_from_slice(&image);
     }
     Ok(Linked {
         modules,
         stubs_va,
         stubs,
         exit_stub: stub_of(Win32Call::EXIT_PROCESS),
+        system,
     })
 }
 
@@ -219,7 +257,7 @@ pub fn canonical(library: &str) -> String {
 
 /// Whether a library is served by this package rather than loaded from a file.
 pub fn is_system(name: &str) -> bool {
-    name == "kernel32.dll"
+    SYSTEM_NAMES.contains(&name)
 }
 
 /// The whole of the file the host currently holds as the image.
@@ -299,13 +337,13 @@ fn resolve(
     depth: u8,
 ) -> AbiResult<Resolved> {
     if is_system(lib) {
-        // A synthesized library has names and nothing else.
-        let ImportedSymbol::Name(name) = symbol else {
-            return Err(AbiError::MissingLibrary);
+        // A synthesized library exports what its table says, by name or by
+        // the ordinal the real one uses.
+        let call = match symbol {
+            ImportedSymbol::Name(name) => Win32Call::resolve(lib, name),
+            ImportedSymbol::Ordinal(ordinal) => Win32Call::by_ordinal(lib, ordinal),
         };
-        return Win32Call::resolve("KERNEL32.dll", name)
-            .map(Resolved::Stub)
-            .ok_or(AbiError::MissingLibrary);
+        return call.map(Resolved::Stub).ok_or(AbiError::MissingLibrary);
     }
     let module = modules
         .iter()
@@ -365,6 +403,7 @@ mod tests {
         // Anything else is itself, lowered as the loader compares names.
         assert_eq!(canonical("PYTHON313.dll"), "python313.dll");
         assert!(is_system(&canonical("KERNEL32.dll")));
+        assert!(is_system(&canonical("WS2_32.dll")));
         assert!(!is_system(&canonical("ucrtbase.dll")));
     }
 

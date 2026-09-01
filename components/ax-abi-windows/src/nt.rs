@@ -2204,7 +2204,7 @@ mod tests {
         // A module list with one entry, kernel32, whose image is the header
         // the loader synthesizes with the stubs behind it.
         let (ldr_va, k32_va) = (0x6000usize, 0x8000usize);
-        let image = thunk::kernel32_header(k32_va as u64, win32::table_len());
+        let image = thunk::system_header(k32_va as u64, 0);
         let ldr = teb_peb::build_ldr(
             &[teb_peb::LdrModule {
                 base: k32_va as u64,
@@ -2250,7 +2250,7 @@ mod tests {
         assert_eq!(ord.result, Some(k32_va + thunk::MODULE_HEADER));
         {
             let mut mem = host.mem.borrow_mut();
-            mem[0x10200..0x10200 + 12].copy_from_slice(b"CreateMutexW");
+            mem[0x10200..0x10200 + 16].copy_from_slice(b"NoSuchFunctionW ");
         }
         let mut missing = call("GetProcAddress", [k32_va, 0x10200, 0, 0, 0, 0], teb);
         win32::dispatch(&mut missing, &host);
@@ -2605,9 +2605,9 @@ mod tests {
     /// The kernel32 image and a loader list naming it and the program, laid
     /// out in the mock's memory, as the loader would leave them.
     fn with_modules(host: &MockHost) -> usize {
-        use crate::{teb_peb, thunk, win32};
+        use crate::{teb_peb, thunk};
         let (ldr_va, k32_va, exe_va) = (0x6000usize, 0x8000usize, 0x40000usize);
-        let image = thunk::kernel32_header(k32_va as u64, win32::table_len());
+        let image = thunk::system_header(k32_va as u64, 0);
         let ldr = teb_peb::build_ldr(
             &[
                 teb_peb::LdrModule {
