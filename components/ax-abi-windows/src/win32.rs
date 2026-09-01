@@ -707,6 +707,19 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "CompareStringW" => locale::compare_string(&mut c),
         "GetUserDefaultLCID" => c.finish(locale::USER_LCID as usize),
         "IsValidLocale" => locale::is_valid_locale(&mut c),
+        "CreateFileW" => file::create_file(&mut c),
+        "ReadFile" => file::read_file(&mut c),
+        "GetFileType" => file::get_file_type(&mut c),
+        "SetFilePointerEx" => file::set_file_pointer_ex(&mut c),
+        "GetFileSizeEx" => file::get_file_size_ex(&mut c),
+        "FlushFileBuffers" => file::flush_file_buffers(&mut c),
+        "SetEndOfFile" => file::set_end_of_file(&mut c),
+        "GetFileAttributesExW" => file::get_file_attributes_ex(&mut c),
+        "GetFileInformationByHandle" => file::get_file_information_by_handle(&mut c),
+        "DuplicateHandle" => file::duplicate_handle(&mut c),
+        "GetFullPathNameW" => file::get_full_path_name(&mut c),
+        "GetTempPathW" => file::get_temp_path(&mut c),
+        "SetCurrentDirectoryW" => file::set_current_directory(&mut c),
         "CloseHandle" => {
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
@@ -750,6 +763,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     }
 }
 
+mod file;
 mod locale;
 
 /// Where the top-level exception filter is kept: a word of the PEB's reserved

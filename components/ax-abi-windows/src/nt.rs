@@ -52,6 +52,26 @@ impl Ntstatus {
             (Ntstatus::NAME_TOO_LONG, 206),
             (Ntstatus::NO_YIELD_PERFORMED, 721),
             (Ntstatus::ACCESS_VIOLATION, 998),
+            (Ntstatus::SHARING_VIOLATION, 32),
+            (Ntstatus::DEVICE_BUSY, 170),
+            (Ntstatus::DISK_FULL, 112),
+            (Ntstatus::ACCESS_DENIED, 5),
+            (Ntstatus::OBJECT_PATH_NOT_FOUND, 3),
+            (Ntstatus::OBJECT_NAME_NOT_FOUND, 2),
+            (Ntstatus::OBJECT_NAME_COLLISION, 183),
+            (Ntstatus::INVALID_DEVICE_REQUEST, 1),
+            (Ntstatus::TOO_MANY_OPENED_FILES, 4),
+            (Ntstatus::DIRECTORY_NOT_EMPTY, 145),
+            (Ntstatus::PIPE_DISCONNECTED, 233),
+            (Ntstatus::DEVICE_NOT_READY, 21),
+            (Ntstatus::NO_SUCH_DEVICE, 433),
+            (Ntstatus::NOT_SUPPORTED, 50),
+            (Ntstatus::ILLEGAL_FUNCTION, 1),
+            (Ntstatus::REPARSE_POINT_NOT_RESOLVED, 1921),
+            (Ntstatus::IO_TIMEOUT, 121),
+            (Ntstatus::NO_MEMORY, 8),
+            (Ntstatus::END_OF_FILE, 38),
+            (Ntstatus::BUFFER_TOO_SMALL, 122),
         ];
         MAP.iter()
             .find(|(status, _)| *status == self)
@@ -77,6 +97,28 @@ impl Ntstatus {
     pub const OBJECT_NAME_INVALID: Ntstatus = Ntstatus(0xC000_0033);
     /// `STATUS_NAME_TOO_LONG`: the name is longer than this package will resolve.
     pub const NAME_TOO_LONG: Ntstatus = Ntstatus(0xC000_0106);
+    // What a host's errno turns into, as `errno_to_status` in Wine's ntdll
+    // maps it; the values are those of `ntstatus.h`.
+    pub const SHARING_VIOLATION: Ntstatus = Ntstatus(0xC000_0043);
+    pub const DEVICE_BUSY: Ntstatus = Ntstatus(0x8000_0011);
+    pub const DISK_FULL: Ntstatus = Ntstatus(0xC000_007F);
+    pub const ACCESS_DENIED: Ntstatus = Ntstatus(0xC000_0022);
+    pub const OBJECT_PATH_NOT_FOUND: Ntstatus = Ntstatus(0xC000_003A);
+    pub const OBJECT_NAME_NOT_FOUND: Ntstatus = Ntstatus(0xC000_0034);
+    pub const OBJECT_NAME_COLLISION: Ntstatus = Ntstatus(0xC000_0035);
+    pub const INVALID_DEVICE_REQUEST: Ntstatus = Ntstatus(0xC000_0010);
+    pub const TOO_MANY_OPENED_FILES: Ntstatus = Ntstatus(0xC000_011F);
+    pub const DIRECTORY_NOT_EMPTY: Ntstatus = Ntstatus(0xC000_0101);
+    pub const PIPE_DISCONNECTED: Ntstatus = Ntstatus(0xC000_00B0);
+    pub const DEVICE_NOT_READY: Ntstatus = Ntstatus(0xC000_00A3);
+    pub const NO_SUCH_DEVICE: Ntstatus = Ntstatus(0xC000_000E);
+    pub const NOT_SUPPORTED: Ntstatus = Ntstatus(0xC000_00BB);
+    pub const ILLEGAL_FUNCTION: Ntstatus = Ntstatus(0xC000_00AF);
+    pub const REPARSE_POINT_NOT_RESOLVED: Ntstatus = Ntstatus(0xC000_0280);
+    pub const IO_TIMEOUT: Ntstatus = Ntstatus(0xC000_00B5);
+    pub const NO_MEMORY: Ntstatus = Ntstatus(0xC000_0017);
+    pub const END_OF_FILE: Ntstatus = Ntstatus(0xC000_0011);
+    pub const BUFFER_TOO_SMALL: Ntstatus = Ntstatus(0xC000_0023);
 
     /// Whether the status denotes success (top bit clear).
     pub const fn is_success(self) -> bool {
@@ -143,12 +185,34 @@ impl NtSyscall {
 }
 
 /// Translate a port error into the NTSTATUS a Windows program expects.
+/// The status a host's errno means, as Wine's `errno_to_status` maps it,
+/// with the two it leaves to the callers - a name that exists, and no memory -
+/// given their own statuses here since nothing else can tell them apart later.
 pub(crate) fn status_from_errno(errno: i32) -> Ntstatus {
+    use ax_abi_port::*;
     match errno {
-        ax_abi_port::EBADF => Ntstatus::INVALID_HANDLE,
-        ax_abi_port::EINVAL => Ntstatus::INVALID_PARAMETER,
-        ax_abi_port::EFAULT => Ntstatus::ACCESS_VIOLATION,
-        ax_abi_port::ENOSYS => Ntstatus::NOT_IMPLEMENTED,
+        EBADF => Ntstatus::INVALID_HANDLE,
+        EINVAL => Ntstatus::INVALID_PARAMETER,
+        EFAULT => Ntstatus::ACCESS_VIOLATION,
+        ENOSYS => Ntstatus::NOT_IMPLEMENTED,
+        EAGAIN => Ntstatus::SHARING_VIOLATION,
+        EBUSY => Ntstatus::DEVICE_BUSY,
+        ENOSPC => Ntstatus::DISK_FULL,
+        EPERM | EROFS | EACCES => Ntstatus::ACCESS_DENIED,
+        ENOTDIR => Ntstatus::OBJECT_PATH_NOT_FOUND,
+        ENOENT => Ntstatus::OBJECT_NAME_NOT_FOUND,
+        EEXIST => Ntstatus::OBJECT_NAME_COLLISION,
+        EISDIR => Ntstatus::INVALID_DEVICE_REQUEST,
+        EMFILE | ENFILE => Ntstatus::TOO_MANY_OPENED_FILES,
+        ENOTEMPTY => Ntstatus::DIRECTORY_NOT_EMPTY,
+        EPIPE | ECONNRESET => Ntstatus::PIPE_DISCONNECTED,
+        EIO => Ntstatus::DEVICE_NOT_READY,
+        ENXIO => Ntstatus::NO_SUCH_DEVICE,
+        ENOTTY | EOPNOTSUPP => Ntstatus::NOT_SUPPORTED,
+        ESPIPE => Ntstatus::ILLEGAL_FUNCTION,
+        ELOOP => Ntstatus::REPARSE_POINT_NOT_RESOLVED,
+        ETIME => Ntstatus::IO_TIMEOUT,
+        ENOMEM => Ntstatus::NO_MEMORY,
         _ => Ntstatus::UNSUCCESSFUL,
     }
 }
@@ -316,7 +380,7 @@ fn read_nt_path<'a>(
 
 /// Turn `DesiredAccess`, `CreateDisposition` and `CreateOptions` into the
 /// neutral request the host resolves, or say why the combination means nothing.
-fn open_request(
+pub(crate) fn open_request(
     access: usize,
     disposition: usize,
     options: usize,
@@ -379,13 +443,13 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Convert an epoch time to NT's, which counts 100-nanosecond intervals from
 /// 1601 rather than seconds from 1970.
-fn nt_time(ns: u64) -> u64 {
+pub(crate) fn nt_time(ns: u64) -> u64 {
     const EPOCH_DIFFERENCE_100NS: u64 = 116_444_736_000_000_000;
     EPOCH_DIFFERENCE_100NS + ns / 100
 }
 
 /// The attribute word a node's kind and mode amount to.
-fn file_attributes(attr: &Attributes) -> u32 {
+pub(crate) fn file_attributes(attr: &Attributes) -> u32 {
     let mut flags = match attr.kind {
         NodeKind::Directory => FILE_ATTRIBUTE_DIRECTORY,
         NodeKind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
@@ -2322,5 +2386,219 @@ mod tests {
         win32::dispatch(&mut info, &host);
         assert_eq!(info.result, Some(1));
         assert_eq!(host.mem.borrow()[0x7400], 4, "MaxCharSize");
+    }
+
+    fn node(kind: NodeKind, size: u64) -> Attributes {
+        Attributes {
+            kind,
+            mode: 0o644,
+            size,
+            block_size: 4096,
+            blocks: 0,
+            device: 7,
+            rdev: 0,
+            inode: 42,
+            links: 1,
+            uid: 0,
+            gid: 0,
+            accessed_ns: 1_000_000_000,
+            modified_ns: 2_000_000_000,
+            changed_ns: 3_000_000_000,
+        }
+    }
+
+    fn put_wide(host: &MockHost, at: usize, text: &str) {
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        host.mem.borrow_mut()[at..at + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    #[test]
+    fn create_file_opens_the_host_path_a_windows_name_means() {
+        use crate::win32;
+        let host = MockHost {
+            opens_at: Ok(5),
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "Z:\\app\\data.txt\0");
+
+        // GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL.
+        let mut open = call("CreateFileW", [0x7000, 0x8000_0000, 1, 0, 3, 0x80], teb);
+        win32::dispatch(&mut open, &host);
+        assert_eq!(open.result, Some(Handle::from_slot(5).0 as usize));
+        let (at, path, how) = host.opened.borrow().clone().expect("opened");
+        assert_eq!(at, At::Cwd);
+        assert_eq!(path, "/app/data.txt");
+        assert!(how.read && !how.write && !how.truncate);
+        assert_eq!(how.create, Create::Never);
+
+        // A relative name goes against the current directory, Z:\app.
+        put_wide(&host, 0x7100, "sub\\x.txt\0");
+        let mut rel = call("CreateFileW", [0x7100, 0x8000_0000, 1, 0, 3, 0x80], teb);
+        win32::dispatch(&mut rel, &host);
+        assert_eq!(host.opened.borrow().as_ref().unwrap().1, "/app/sub/x.txt");
+        put_wide(&host, 0x7200, "..\\etc\\hosts\0");
+        let mut up = call("CreateFileW", [0x7200, 0x8000_0000, 1, 0, 3, 0x80], teb);
+        win32::dispatch(&mut up, &host);
+        assert_eq!(host.opened.borrow().as_ref().unwrap().1, "/etc/hosts");
+
+        // CREATE_ALWAYS with GENERIC_WRITE creates if absent and truncates.
+        let mut make = call("CreateFileW", [0x7000, 0x4000_0000, 0, 0, 2, 0x80], teb);
+        win32::dispatch(&mut make, &host);
+        let how = host.opened.borrow().as_ref().unwrap().2;
+        assert!(how.write && how.truncate);
+        assert_eq!(how.create, Create::IfAbsent);
+    }
+
+    #[test]
+    fn create_file_reports_a_missing_file_the_windows_way() {
+        use crate::win32;
+        let host = MockHost {
+            opens_at: Err(ax_abi_port::ENOENT),
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "Z:\\app\\missing.txt\0");
+        let mut open = call("CreateFileW", [0x7000, 0x8000_0000, 1, 0, 3, 0x80], teb);
+        win32::dispatch(&mut open, &host);
+        assert_eq!(open.result, Some(usize::MAX), "INVALID_HANDLE_VALUE");
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(2), "ERROR_FILE_NOT_FOUND");
+        // A disposition Windows does not have is refused before anything opens.
+        let mut bad = call("CreateFileW", [0x7000, 0x8000_0000, 1, 0, 9, 0x80], teb);
+        win32::dispatch(&mut bad, &host);
+        assert_eq!(bad.result, Some(usize::MAX));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(87));
+    }
+
+    #[test]
+    fn a_file_is_described_by_kind_size_and_position() {
+        use crate::win32;
+        let host = MockHost {
+            describes: Some(node(NodeKind::CharDevice, 0)),
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        let mut kind = call("GetFileType", [8, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut kind, &host);
+        assert_eq!(kind.result, Some(2), "FILE_TYPE_CHAR for a terminal");
+        let mut std = call("GetFileType", [-11i32 as u32 as usize, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut std, &host);
+        assert_eq!(
+            std.result,
+            Some(2),
+            "the pseudo-handle names the same stream"
+        );
+
+        let host = MockHost {
+            describes: Some(node(NodeKind::File, 1234)),
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        let mut kind = call("GetFileType", [24, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut kind, &host);
+        assert_eq!(kind.result, Some(1), "FILE_TYPE_DISK");
+        let mut size = call("GetFileSizeEx", [24, 0x7000, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut size, &host);
+        assert_eq!(size.result, Some(1));
+        let mem = host.mem.borrow();
+        assert_eq!(
+            u64::from_le_bytes(mem[0x7000..0x7008].try_into().unwrap()),
+            1234
+        );
+        drop(mem);
+
+        // FILE_BEGIN by 100 lands at 100 and says so; backwards past the
+        // start is ERROR_NEGATIVE_SEEK.
+        let mut seek = call("SetFilePointerEx", [24, 100, 0x7100, 0, 0, 0], teb);
+        win32::dispatch(&mut seek, &host);
+        assert_eq!(seek.result, Some(1));
+        assert_eq!(*host.sought.borrow(), Some((5, 100)));
+        let mem = host.mem.borrow();
+        assert_eq!(
+            u64::from_le_bytes(mem[0x7100..0x7108].try_into().unwrap()),
+            100
+        );
+        drop(mem);
+        let mut back = call("SetFilePointerEx", [24, (-5i64) as usize, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut back, &host);
+        assert_eq!(back.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        assert_eq!(err.result, Some(131));
+
+        // Attributes by name: normal file, its size low word, its times as
+        // FILETIMEs.
+        put_wide(&host, 0x7400, "Z:\\app\\data.txt\0");
+        let mut attrs = call("GetFileAttributesExW", [0x7400, 0, 0x7500, 0, 0, 0], teb);
+        win32::dispatch(&mut attrs, &host);
+        assert_eq!(attrs.result, Some(1));
+        let mem = host.mem.borrow();
+        assert_eq!(
+            u32::from_le_bytes(mem[0x7500..0x7504].try_into().unwrap()),
+            0x80
+        );
+        assert_eq!(
+            u32::from_le_bytes(mem[0x7520..0x7524].try_into().unwrap()),
+            1234
+        );
+        assert_eq!(
+            u64::from_le_bytes(mem[0x7514..0x751C].try_into().unwrap()),
+            crate::nt::nt_time(2_000_000_000),
+            "last write time"
+        );
+    }
+
+    #[test]
+    fn full_path_names_are_normalized_against_the_current_directory() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "..\\lib\\..\\x.py\0");
+        let mut full = call("GetFullPathNameW", [0x7000, 64, 0x7100, 0x7300, 0, 0], teb);
+        win32::dispatch(&mut full, &host);
+        assert_eq!(full.result, Some(7), "Z:\\x.py");
+        assert_eq!(wide_at(&host, 0x7100), "Z:\\x.py");
+        let part = u64::from_le_bytes(host.mem.borrow()[0x7300..0x7308].try_into().unwrap());
+        assert_eq!(part, 0x7100 + 3 * 2, "the file part starts after Z:\\");
+        // Too small a buffer is told what it needs, terminator included.
+        let mut small = call("GetFullPathNameW", [0x7000, 3, 0x7100, 0, 0, 0], teb);
+        win32::dispatch(&mut small, &host);
+        assert_eq!(small.result, Some(8));
+
+        let mut tmp = call("GetTempPathW", [64, 0x7400, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut tmp, &host);
+        assert_eq!(tmp.result, Some(7));
+        assert_eq!(wide_at(&host, 0x7400), "Z:\\tmp\\");
+    }
+
+    #[test]
+    fn changing_directory_moves_where_relative_names_go() {
+        use crate::win32;
+        let host = MockHost {
+            describes: Some(node(NodeKind::Directory, 0)),
+            opens_at: Ok(5),
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "Z:\\work\0");
+        let mut cd = call("SetCurrentDirectoryW", [0x7000, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut cd, &host);
+        assert_eq!(cd.result, Some(1));
+        let mut cwd = call("GetCurrentDirectoryW", [64, 0x7100, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut cwd, &host);
+        assert_eq!(wide_at(&host, 0x7100), "Z:\\work");
+        put_wide(&host, 0x7200, "notes.txt\0");
+        let mut open = call("CreateFileW", [0x7200, 0x8000_0000, 1, 0, 3, 0x80], teb);
+        win32::dispatch(&mut open, &host);
+        assert_eq!(host.opened.borrow().as_ref().unwrap().1, "/work/notes.txt");
     }
 }
