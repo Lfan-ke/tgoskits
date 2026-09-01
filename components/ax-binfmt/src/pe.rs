@@ -276,6 +276,14 @@ impl Iterator for TlsCallbacks<'_> {
 }
 
 impl PeInfo {
+    /// `OptionalHeader.SizeOfHeaders`: how much of the file, from its start,
+    /// the headers occupy. Windows maps that much at the image base, and a
+    /// program reads its own headers there - the DOS header first - whenever
+    /// it walks to its NT headers, as a C runtime does on the way out.
+    pub fn size_of_headers(&self, image: &[u8]) -> Option<u32> {
+        read_u32(image, self.opt_off + 60)
+    }
+
     /// The image's TLS directory, or `None` when it keeps no thread locals.
     pub fn tls(&self, image: &[u8]) -> Option<TlsDir> {
         let dir = self.data_dir(image, DIR_TLS)?;
