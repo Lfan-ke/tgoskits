@@ -617,6 +617,7 @@ pub fn get_file_information_by_handle_ex(c: &mut Call<'_>) -> Dispatch {
     const FILE_BASIC_INFO: usize = 0;
     const FILE_STANDARD_INFO: usize = 1;
     const FILE_ATTRIBUTE_TAG_INFO: usize = 9;
+    const FILE_ID_INFO: usize = 18;
     let (handle, class, info) = (c.arg(0), c.arg(1), c.arg(2));
     let (Ok(fd), Some(paths)) = (descriptor(handle), c.host.paths()) else {
         return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
@@ -651,6 +652,15 @@ pub fn get_file_information_by_handle_ex(c: &mut Call<'_>) -> Dispatch {
             buf[..4].copy_from_slice(&attributes.to_le_bytes());
             c.write(info, &buf)
         }
+        // FILE_ID_INFO: the volume serial and a 128-bit file id, which os.stat
+        // uses to tell files apart. The device and inode the host reports fill
+        // both; the id's high half is zero, as a 64-bit inode leaves it.
+        FILE_ID_INFO => {
+            let mut buf = [0u8; 24];
+            buf[..8].copy_from_slice(&attr.device.to_le_bytes());
+            buf[8..16].copy_from_slice(&attr.inode.to_le_bytes());
+            c.write(info, &buf)
+        }
         _ => {
             c.host.platform().trace(&alloc::format!(
                 "GetFileInformationByHandleEx class {class} is not implemented"
@@ -663,4 +673,68 @@ pub fn get_file_information_by_handle_ex(c: &mut Call<'_>) -> Dispatch {
     } else {
         c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE)
     }
+}
+
+/// FindFirstFileW(lpFileName, lpFindFileData): directory enumeration. There is
+/// no readdir port yet, so a search finds nothing: the handle is invalid and
+/// the error is "file not found", which os.listdir turns into an empty list
+/// and the import machinery handles by stat'ing candidates directly. Modules
+/// in the zip on the path are found by the zip importer, which reads the
+/// archive rather than listing a directory.
+pub fn find_first_file(c: &mut Call<'_>) -> Dispatch {
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    c.fail(ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE)
+}
+
+pub fn find_next_file(c: &mut Call<'_>) -> Dispatch {
+    const ERROR_NO_MORE_FILES: u32 = 18;
+    c.fail(ERROR_NO_MORE_FILES, FALSE)
+}
+
+pub fn find_close(c: &mut Call<'_>) -> Dispatch {
+    c.finish(TRUE)
+}
+
+/// SetHandleInformation(hObject, dwMask, dwFlags): inheritance and protection
+/// flags on a handle. Nothing here inherits handles across a spawn, so the
+/// request is accepted and has no further effect.
+pub fn set_handle_information(c: &mut Call<'_>) -> Dispatch {
+    c.finish(TRUE)
+}
+
+/// GetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags): the
+/// full path the handle refers to. The default flags want a DOS volume name
+/// with the `\\?\` prefix, which is what CPython strips to locate itself; the
+/// host names the descriptor and the drive is put back on. The return is the
+/// length written, not counting the terminator, or the length needed when the
+/// buffer is too small - as the function reports.
+pub fn get_final_path_name_by_handle(c: &mut Call<'_>) -> Dispatch {
+    let (handle, buf, size) = (c.arg(0), c.arg(1), c.arg(2));
+    let Ok(fd) = descriptor(handle) else {
+        return c.fail_status(Ntstatus::INVALID_HANDLE, 0);
+    };
+    let Some(paths) = c.host.paths() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, 0);
+    };
+    let mut host = String::new();
+    if paths.path_of(fd, &mut |p| host.push_str(p)).is_err() {
+        return c.fail_status(Ntstatus::INVALID_HANDLE, 0);
+    }
+    // The host path is single-rooted; Windows sees it under drive Z, spelled
+    // with backslashes and prefixed as the object-namespace form the default
+    // flags return.
+    let win: String = host
+        .chars()
+        .map(|ch| if ch == '/' { '\\' } else { ch })
+        .collect();
+    let full = alloc::format!("\\\\?\\Z:{win}");
+    let units: Vec<u16> = full.encode_utf16().collect();
+    if size <= units.len() {
+        return c.finish(units.len() + 1);
+    }
+    if !write_wide(c, buf, &full) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+    }
+    c.set_last_error(0);
+    c.finish(units.len())
 }

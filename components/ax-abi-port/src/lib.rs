@@ -348,6 +348,14 @@ pub trait Paths: Sync {
 
     /// The same question about an open descriptor.
     fn permitted_of(&self, fd: i32, wants: Access, real_ids: bool) -> Result<(), i32>;
+
+    /// The path the descriptor `fd` was opened by, handed to `put`. A program
+    /// that canonicalizes a handle back to a name - Windows does this to locate
+    /// itself - needs the host to say what a descriptor refers to. A host that
+    /// cannot name it reports the error rather than a guess.
+    fn path_of(&self, _fd: i32, _put: &mut dyn FnMut(&str)) -> Result<(), i32> {
+        Err(ENOSYS)
+    }
 }
 
 /// One run of user memory. An ABI decodes its own vector layout and names the
