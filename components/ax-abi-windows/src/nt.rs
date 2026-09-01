@@ -930,12 +930,14 @@ mod tests {
     // where the Win32 layer keeps the last error.
     struct Win32Trap {
         nr: usize,
-        args: [usize; 4],
+        /// Six, as the stub leaves them: four from the Windows registers and
+        /// two lifted off the caller's stack.
+        args: [usize; 6],
         teb: usize,
         result: Option<usize>,
     }
     impl Win32Trap {
-        fn new(call: crate::win32::Win32Call, args: [usize; 4], teb: usize) -> Self {
+        fn new(call: crate::win32::Win32Call, args: [usize; 6], teb: usize) -> Self {
             Self {
                 nr: call.nr() as usize,
                 args,
@@ -1707,12 +1709,7 @@ mod tests {
         };
         // WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite,
         // lpNumberOfBytesWritten, lpOverlapped). Handle 4 is descriptor 0.
-        let mut env = FakeTrap {
-            nr: Win32Call::WriteFile.nr() as usize,
-            args: [4, 0x40, 8, 0x80],
-            sp: 0,
-            result: None,
-        };
+        let mut env = Win32Trap::new(Win32Call::WriteFile, [4, 0x40, 8, 0x80, 0, 0], 0);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         // A Windows API function reports success as a nonzero return, where an
@@ -1731,12 +1728,7 @@ mod tests {
             mem: RefCell::new(vec![0u8; 0x100]),
             ..MockHost::default()
         };
-        let mut env = FakeTrap {
-            nr: Win32Call::WriteFile.nr() as usize,
-            args: [4, 0x40, 4, 0],
-            sp: 0,
-            result: None,
-        };
+        let mut env = Win32Trap::new(Win32Call::WriteFile, [4, 0x40, 4, 0, 0, 0], 0);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(1));
@@ -1754,7 +1746,7 @@ mod tests {
         // A handle that is not a multiple of four names no slot, so the write
         // is refused before any bytes move.
         let teb = 0xC0;
-        let mut env = Win32Trap::new(Win32Call::WriteFile, [3, 0x40, 8, 0x80], teb);
+        let mut env = Win32Trap::new(Win32Call::WriteFile, [3, 0x40, 8, 0x80, 0, 0], teb);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(0), "a Win32 failure is a zero BOOL");
@@ -1780,10 +1772,10 @@ mod tests {
         };
         let teb = 0xC0;
 
-        let mut set = Win32Trap::new(Win32Call::SetLastError, [87, 0, 0, 0], teb);
+        let mut set = Win32Trap::new(Win32Call::SetLastError, [87, 0, 0, 0, 0, 0], teb);
         assert_eq!(win32::dispatch(&mut set, &host), Dispatch::Handled);
 
-        let mut get = Win32Trap::new(Win32Call::GetLastError, [0; 4], teb);
+        let mut get = Win32Trap::new(Win32Call::GetLastError, [0; 6], teb);
         assert_eq!(win32::dispatch(&mut get, &host), Dispatch::Handled);
         assert_eq!(get.result, Some(87));
     }
@@ -1795,7 +1787,7 @@ mod tests {
         // A host that cannot say where the block is must still answer, with a
         // clean error rather than a reading of unrelated memory.
         let host = MockHost::default();
-        let mut env = Win32Trap::new(Win32Call::GetLastError, [0; 4], 0);
+        let mut env = Win32Trap::new(Win32Call::GetLastError, [0; 6], 0);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(0));
@@ -1814,7 +1806,7 @@ mod tests {
         for (selector, descriptor) in [(-10i32, 0usize), (-11, 1), (-12, 2)] {
             let mut env = Win32Trap::new(
                 Win32Call::GetStdHandle,
-                [selector as u32 as usize, 0, 0, 0],
+                [selector as u32 as usize, 0, 0, 0, 0, 0],
                 0xC0,
             );
             assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
@@ -1825,7 +1817,7 @@ mod tests {
         }
 
         let teb = 0xC0;
-        let mut env = Win32Trap::new(Win32Call::GetStdHandle, [0, 0, 0, 0], teb);
+        let mut env = Win32Trap::new(Win32Call::GetStdHandle, [0; 6], teb);
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(usize::MAX), "INVALID_HANDLE_VALUE");
         let mem = host.mem.borrow();
@@ -1851,5 +1843,30 @@ mod tests {
         ] {
             assert_eq!(status.dos_error(), error, "{status:?}");
         }
+    }
+
+    #[test]
+    fn a_win32_write_asking_for_overlapped_delivery_is_refused() {
+        use crate::win32::{self, Win32Call};
+
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x200]),
+            ..MockHost::default()
+        };
+        let teb = 0xC0;
+        // The fifth argument is the OVERLAPPED; the stub lifted it off the
+        // caller's stack into the fifth trap register.
+        let mut env = Win32Trap::new(Win32Call::WriteFile, [4, 0x40, 8, 0x80, 0x100, 0], teb);
+
+        assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(0));
+        assert!(
+            host.wrote.borrow().is_none(),
+            "not served synchronously behind its back"
+        );
+        let mem = host.mem.borrow();
+        // ERROR_INVALID_FUNCTION, the mapping of STATUS_NOT_IMPLEMENTED.
+        let at = teb + crate::teb_peb::TEB_LAST_ERROR;
+        assert_eq!(u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()), 1);
     }
 }

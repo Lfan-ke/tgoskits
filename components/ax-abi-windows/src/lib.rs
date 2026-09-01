@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod handle;
 pub mod nt;
 pub mod teb_peb;
+pub mod thunk;
 pub mod win32;
 
 use alloc::{vec, vec::Vec};
@@ -53,7 +54,13 @@ impl SysAbi for WindowsAbi {
 /// Map a parsed PE image into `env` at `load_base`, applying base relocations
 /// when that differs from the image's preferred base. Mirrors the map + fix-up
 /// sequence ntdll's loader performs (`LdrpMapDll` + `LdrRelocateImage`).
-fn map_image(pe: &PeInfo, image: &[u8], load_base: u64, env: &mut dyn LoadEnv) -> AbiResult<()> {
+fn map_image(
+    pe: &PeInfo,
+    image: &[u8],
+    load_base: u64,
+    binds: &[(u32, u64)],
+    env: &mut dyn LoadEnv,
+) -> AbiResult<()> {
     let delta = load_base.wrapping_sub(pe.image_base);
     // A non-zero delta needs a relocation directory; a stripped image cannot move.
     let relocs: Vec<Reloc> = match pe.relocations(image) {
@@ -64,7 +71,9 @@ fn map_image(pe: &PeInfo, image: &[u8], load_base: u64, env: &mut dyn LoadEnv) -
 
     for sec in pe.sections(image) {
         let va = load_base + sec.rva as u64;
-        if delta == 0 {
+        let range = sec.rva..sec.rva + sec.vsize;
+        let bound = binds.iter().any(|(rva, _)| range.contains(rva));
+        if delta == 0 && !bound {
             // At its preferred base nothing is rewritten, so the section maps
             // from the file and its pages arrive as they are touched - the same
             // reason `binfmt_elf` uses `vm_mmap` for a `PT_LOAD`.
@@ -77,17 +86,45 @@ fn map_image(pe: &PeInfo, image: &[u8], load_base: u64, env: &mut dyn LoadEnv) -
             )?;
             continue;
         }
-        // A relocated section is rewritten before it is mapped, so it cannot
-        // come straight from the page cache.
+        // A section that is rewritten - relocated, or holding an address
+        // table that was bound - cannot come straight from the page cache.
         let mut page = vec![0u8; sec.vsize as usize];
         if let Some(raw) = sec.raw_data(image) {
             let n = raw.len().min(page.len());
             page[..n].copy_from_slice(&raw[..n]);
         }
         relocate_section(&mut page, &sec, &relocs, delta)?;
+        bind_section(&mut page, &sec, binds)?;
         env.map_region(va, sec.vsize as u64, section_prot(&sec), Some(&page))?;
     }
     Ok(())
+}
+
+/// Write the bound addresses that fall inside `sec` into its page buffer, before
+/// it is mapped. Each is an eight-byte address table entry in a PE32+ image.
+fn bind_section(page: &mut [u8], sec: &Section, binds: &[(u32, u64)]) -> AbiResult<()> {
+    let range = sec.rva..sec.rva + sec.vsize;
+    for (rva, value) in binds.iter().filter(|(rva, _)| range.contains(rva)) {
+        let at = (rva - sec.rva) as usize;
+        let slot = page.get_mut(at..at + 8).ok_or(AbiError::MalformedImage)?;
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Where the image ends, as an offset from its base: the first address free for
+/// anything the loader adds alongside it.
+fn image_extent(pe: &PeInfo, image: &[u8]) -> u64 {
+    pe.sections(image)
+        .map(|sec| sec.rva as u64 + sec.vsize as u64)
+        .max()
+        .unwrap_or(0)
+}
+
+const PAGE: u64 = 0x1000;
+
+fn page_up(at: u64) -> u64 {
+    at.div_ceil(PAGE) * PAGE
 }
 
 /// Apply the relocations that fall inside `sec` to its freshly-built page buffer,
@@ -286,7 +323,7 @@ mod tests {
         let pe = pe::parse(&img).unwrap();
         let new_base = 0x1_8000_0000u64;
         let mut env = RecordingEnv::default();
-        map_image(&pe, &img, new_base, &mut env).expect("relocated load");
+        map_image(&pe, &img, new_base, &[], &mut env).expect("relocated load");
 
         // The pointer in .text now reads image_base_moved + 0x1000.
         let text_page = &env.maps[0].2;
@@ -302,7 +339,7 @@ mod tests {
         let mut env = RecordingEnv::default();
         // No reloc directory, but the base must move -> cannot relocate.
         assert_eq!(
-            map_image(&pe, &img, 0x1_8000_0000, &mut env),
+            map_image(&pe, &img, 0x1_8000_0000, &[], &mut env),
             Err(AbiError::Unsupported)
         );
     }
@@ -371,8 +408,9 @@ mod tests {
         );
     }
 
-    /// A section whose bytes are an import directory naming one library.
-    fn import_section() -> Vec<u8> {
+    /// A section whose bytes are an import directory taking one `symbol` from
+    /// kernel32; the address table entry for it is at RVA 0x1060.
+    fn import_section(symbol: &[u8]) -> Vec<u8> {
         let mut data = vec![0u8; 0x200];
         // IMAGE_IMPORT_DESCRIPTOR at the section's start (RVA 0x1000).
         data[0x00..0x04].copy_from_slice(&0x1040u32.to_le_bytes()); // OriginalFirstThunk
@@ -381,22 +419,76 @@ mod tests {
         // The descriptor after it stays zeroed, which ends the table.
         data[0x40..0x48].copy_from_slice(&0x1090u64.to_le_bytes()); // one by-name thunk
         data[0x80..0x8D].copy_from_slice(b"KERNEL32.dll\0");
-        data[0x92..0x9C].copy_from_slice(b"WriteFile\0");
+        data[0x92..0x92 + symbol.len()].copy_from_slice(symbol);
         data
     }
 
-    #[test]
-    fn refuses_an_image_that_needs_a_library_without_touching_the_space() {
-        let data = import_section();
+    /// An image whose only section is `import_section(symbol)`, with the import
+    /// directory pointed at it.
+    fn image_importing(symbol: &[u8]) -> Vec<u8> {
+        let data = import_section(symbol);
         let mut img = synth(
             0x1_4000_0000,
             0x1000,
             &[(sect(0x1000, 0x200, 0x200, 0x400, RX), &data)],
         );
-        // Point the import data directory at that section.
         let dir = OPT + 112 + pe::DIR_IMPORT * 8;
         img[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
         img[dir + 4..dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        img
+    }
+
+    #[test]
+    fn binds_an_import_to_a_stub_mapped_past_the_image() {
+        use crate::{thunk, win32::Win32Call};
+
+        let img = image_importing(b"WriteFile\0");
+        let mut env = RecordingEnv::default();
+        let loaded = PeFormat
+            .load(
+                &LoadRequest {
+                    image: &img,
+                    load_base: 0,
+                    args: &[],
+                    envs: &[],
+                },
+                &mut env,
+            )
+            .expect("an import this package serves is bound");
+        assert_eq!(loaded.entry, 0x1_4000_1000);
+
+        // The image spans one page from RVA 0x1000, so the stubs land on the
+        // page after it.
+        let stubs_va = 0x1_4000_2000;
+        let (_, prot, code) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == stubs_va)
+            .expect("a stub region past the image");
+        assert_eq!(*prot, Prot::READ | Prot::EXEC);
+        assert_eq!(&code[..thunk::STUB_LEN], &thunk::stub(Win32Call::WriteFile));
+
+        // The section holding the address table was rewritten rather than
+        // mapped from the file, and its one entry now points at the stub.
+        let (_, _, page) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == 0x1_4000_1000)
+            .expect("the import section is mapped from a rewritten buffer");
+        assert_eq!(
+            u64::from_le_bytes(page[0x60..0x68].try_into().unwrap()),
+            stubs_va
+        );
+        assert!(
+            env.from_file.is_empty(),
+            "nothing came straight from the file"
+        );
+    }
+
+    #[test]
+    fn refuses_an_image_that_needs_a_library_without_touching_the_space() {
+        // A real kernel32 export, but not one the synthesized library serves.
+        let img = image_importing(b"CreateMutexW\0");
 
         let mut env = RecordingEnv::default();
         let err = PeFormat
@@ -434,24 +526,28 @@ impl ImageFormat for PeFormat {
             // Only PE32+ is in scope; a 32-bit image is a distinct ABI.
             return Err(AbiError::Unsupported);
         }
-        // An image that calls into a library needs its imports bound before
-        // it runs; nothing here provides them yet. Refusing now says which
-        // layer is missing, where mapping it would leave the failure to the
-        // first call through an address table full of zeroes.
-        if pe
-            .imports(req.image)
-            .is_some_and(|mut names| names.next().is_some())
-        {
-            return Err(AbiError::MissingLibrary);
-        }
-        // The image is this package's from here, so the space it goes into is
-        // torn down and prepared. Doing it after the header checks is what
-        // lets a malformed image be refused without destroying the caller's.
-        env.reset()?;
         // Honor the image's preferred base, so a well-formed image needs no
         // relocation; relocation is exercised only when the base must change.
         let base = pe.image_base;
-        map_image(&pe, req.image, base, env)?;
+        // The stubs go on the page after the image, where an import binds to
+        // an address the image's own relocations never move.
+        let stubs_va = page_up(base + image_extent(&pe, req.image));
+        // Bound before anything is mapped, so an import this package cannot
+        // serve is refused while the caller still has the space it came with.
+        let thunks = thunk::bind(&pe, req.image, stubs_va)?;
+        // The image is this package's from here, so the space it goes into is
+        // torn down and prepared. Doing it after the checks is what lets a
+        // malformed image be refused without destroying the caller's.
+        env.reset()?;
+        map_image(&pe, req.image, base, &thunks.binds, env)?;
+        if !thunks.code.is_empty() {
+            env.map_region(
+                stubs_va,
+                page_up(thunks.code.len() as u64),
+                Prot::READ | Prot::EXEC,
+                Some(&thunks.code),
+            )?;
+        }
         Ok(Loaded {
             entry: base + pe.entry_rva as u64,
             stack: 0,

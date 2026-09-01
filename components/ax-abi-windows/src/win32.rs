@@ -10,8 +10,9 @@
 //! the same: the work stays in [`crate::nt`], and this module only applies the
 //! conventions.
 //!
-//! Arguments arrive as `nt` reads them - the first four from the trap frame,
-//! the rest from the caller's stack - because the same stubs raise both.
+//! Every argument is read from the trap frame, none from the stack: the stub
+//! an import binds to ([`crate::thunk`]) has already moved the Windows
+//! registers and the two stack arguments into the registers a trap carries.
 
 use ax_abi_port::Host;
 use ax_dispatch::{Dispatch, TrapEnv};
@@ -117,23 +118,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         return Dispatch::Passthrough;
     };
     let teb = env.thread_pointer();
-    let sp = env.stack_pointer();
-    let a = |i: usize| -> usize {
-        if i < 4 {
-            env.arg(i)
-        } else if sp == 0 {
-            0
-        } else {
-            let mut word = [0u8; size_of::<usize>()];
-            match host
-                .platform()
-                .read_user(sp + (i - 4) * size_of::<usize>(), &mut word)
-            {
-                Ok(_) => usize::from_ne_bytes(word),
-                Err(_) => 0,
-            }
-        }
-    };
+    let a = |i: usize| env.arg(i);
     let result = match call {
         // WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite,
         // lpNumberOfBytesWritten, lpOverlapped).
