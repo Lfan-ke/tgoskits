@@ -153,6 +153,32 @@ ax_dispatch::register_sysabi!(linux);
 fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
     let sysno = Sysno::new(uctx.nr())?;
     let arg = |i| uctx.arg(i);
+
+    // Flags this domain cannot carry out faithfully stay with the hosting
+    // kernel's table during the migration rather than being dropped, so the
+    // answer is an Option and not a claim.
+    #[cfg(feature = "paths")]
+    if sysno == Sysno::openat {
+        return sys_openat(
+            host.platform(),
+            host.paths()?,
+            arg(0) as i32,
+            arg(1),
+            arg(2) as i32,
+            arg(3) as u32,
+        );
+    }
+    #[cfg(all(feature = "paths", target_arch = "x86_64"))]
+    if sysno == Sysno::open {
+        return sys_openat(
+            host.platform(),
+            host.paths()?,
+            AT_FDCWD,
+            arg(0),
+            arg(1) as i32,
+            arg(2) as u32,
+        );
+    }
     Some(match sysno {
         // fd I/O - the domain copies user memory itself, then drives Files.
         #[cfg(feature = "fs")]
@@ -721,6 +747,83 @@ fn put_stat(
         )
     };
     platform.write_user(uaddr, bytes).map(|_| ())
+}
+
+/// Translate Linux's open flags into what the port can express.
+///
+/// Returns `None` for a request this domain cannot carry out faithfully, so the
+/// call goes back to the hosting kernel's own table instead of being answered
+/// with a descriptor that quietly differs. `O_PATH` and `O_TMPFILE` decide what
+/// kind of descriptor gets installed, which the port does not describe yet; the
+/// synchronous-write and no-controlling-terminal flags change how the file
+/// behaves afterwards, which it does not describe either.
+#[cfg(feature = "paths")]
+fn open_how(flags: i32, mode: u32) -> Option<ops::OpenHow> {
+    use linux_raw_sys::general::{
+        __O_TMPFILE, O_ACCMODE, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL,
+        O_NOCTTY, O_NOFOLLOW, O_PATH, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY,
+    };
+
+    let unsupported = (O_PATH | __O_TMPFILE | O_SYNC | O_DSYNC | O_NOCTTY) as i32;
+    if flags & unsupported != 0 {
+        return None;
+    }
+    // Linux refuses this pair outright: it would have created a regular file
+    // for a request that says it wants a directory.
+    if flags & (O_DIRECTORY | O_CREAT) as i32 == (O_DIRECTORY | O_CREAT) as i32 {
+        return None;
+    }
+
+    let access = flags & O_ACCMODE as i32;
+    let (read, write) = match access as u32 {
+        0 => (true, false),
+        x if x == O_WRONLY => (false, true),
+        x if x == O_RDWR => (true, true),
+        _ => return None,
+    };
+
+    let creates = flags & O_CREAT as i32 != 0;
+    let create = if !creates {
+        ops::Create::Never
+    } else if flags & O_EXCL as i32 != 0 {
+        ops::Create::Exclusive
+    } else {
+        ops::Create::IfAbsent
+    };
+
+    Some(ops::OpenHow {
+        read,
+        write,
+        append: flags & O_APPEND as i32 != 0,
+        truncate: flags & O_TRUNC as i32 != 0,
+        create,
+        directory: flags & O_DIRECTORY as i32 != 0,
+        follow: flags & O_NOFOLLOW as i32 == 0,
+        close_on_exec: flags & O_CLOEXEC as i32 != 0,
+        // A mode is only meaningful for a call that may create, and Linux keeps
+        // just the permission bits.
+        mode: if creates { mode & 0o7777 } else { 0 },
+    })
+}
+
+/// `openat(dirfd, path, flags, mode)`, and x86_64 `open` through it.
+#[cfg(feature = "paths")]
+fn sys_openat(
+    platform: &dyn ops::Platform,
+    paths: &dyn ops::Paths,
+    dirfd: i32,
+    path: usize,
+    flags: i32,
+    mode: u32,
+) -> Option<SysResult> {
+    let how = open_how(flags, mode)?;
+    Some((|| {
+        let name = read_path(platform, path)?;
+        if name.is_empty() {
+            return Err(ENOENT);
+        }
+        paths.open(resolve_from(dirfd), &name, &how)
+    })())
 }
 
 /// Decode Linux's access mode word.
@@ -1571,6 +1674,7 @@ mod tests {
         described_fd: RefCell<Option<i32>>,
         asked: RefCell<Option<(alloc::string::String, ops::Access, bool, bool)>>,
         asked_fd: RefCell<Option<(i32, ops::Access, bool)>>,
+        opened: RefCell<Option<(alloc::string::String, ops::OpenHow)>>,
     }
     // Single-threaded test only; the ports need Sync for the real 'static host.
     unsafe impl Sync for Mock {}
@@ -1862,8 +1966,13 @@ mod tests {
         }
     }
     impl ops::Paths for Mock {
-        fn open(&self, _at: ops::At, _path: &str, _how: &ops::OpenHow) -> SysResult {
-            Err(super::ENOSYS)
+        fn open(&self, at: ops::At, path: &str, how: &ops::OpenHow) -> SysResult {
+            let named = match at {
+                ops::At::Cwd => alloc::format!("cwd:{path}"),
+                ops::At::Dir(fd) => alloc::format!("{fd}:{path}"),
+            };
+            *self.opened.borrow_mut() = Some((named, *how));
+            Ok(11)
         }
 
         fn attributes(
@@ -3178,5 +3287,93 @@ mod tests {
         assert_eq!(asked.0, 4);
         assert!(asked.1.write);
         assert!(host.asked.borrow().is_none());
+    }
+
+    // openat: the flag word is Linux's, so the domain translates it and declines
+    // anything the port cannot carry out faithfully rather than opening
+    // something subtly different.
+
+    #[test]
+    fn openat_declines_flags_the_port_cannot_express() {
+        use linux_raw_sys::general::{O_PATH, O_TMPFILE};
+
+        let host = Mock::default();
+        for flags in [O_PATH as i32, O_TMPFILE as i32] {
+            let out = super::sys_openat(&host, &host, super::AT_FDCWD, 0x10, flags, 0);
+            assert!(out.is_none(), "{flags:#x} should fall back to the kernel");
+        }
+        assert!(host.opened.borrow().is_none());
+    }
+
+    #[test]
+    fn openat_declines_a_directory_that_may_be_created() {
+        use linux_raw_sys::general::{O_CREAT, O_DIRECTORY};
+
+        let host = Mock::default();
+        let out = super::sys_openat(
+            &host,
+            &host,
+            super::AT_FDCWD,
+            0x10,
+            (O_DIRECTORY | O_CREAT) as i32,
+            0o644,
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn openat_translates_a_read_only_request_relative_to_the_descriptor() {
+        let host = Mock::default();
+        let mut mem = alloc::vec![0u8; 512];
+        mem[0x10..0x10 + 4].copy_from_slice(b"etc\0");
+        *host.umem.borrow_mut() = mem;
+
+        let out = super::sys_openat(&host, &host, 6, 0x10, 0, 0o777);
+
+        assert_eq!(out, Some(Ok(11)));
+        let (named, how) = host.opened.borrow().clone().expect("host opened it");
+        assert_eq!(named, alloc::string::String::from("6:etc"));
+        assert!(how.read && !how.write);
+        assert_eq!(how.create, ops::Create::Never);
+        assert!(how.follow);
+        assert_eq!(
+            how.mode, 0,
+            "a mode means nothing unless the call may create"
+        );
+    }
+
+    #[test]
+    fn openat_keeps_the_mode_only_for_an_exclusive_create() {
+        use linux_raw_sys::general::{O_CLOEXEC, O_CREAT, O_EXCL, O_WRONLY};
+
+        let host = Mock::default();
+        let mut mem = alloc::vec![0u8; 512];
+        mem[0x10..0x10 + 4].copy_from_slice(b"new\0");
+        *host.umem.borrow_mut() = mem;
+
+        let out = super::sys_openat(
+            &host,
+            &host,
+            super::AT_FDCWD,
+            0x10,
+            (O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC) as i32,
+            0o1644,
+        );
+
+        assert_eq!(out, Some(Ok(11)));
+        let (named, how) = host.opened.borrow().clone().expect("host opened it");
+        assert_eq!(named, alloc::string::String::from("cwd:new"));
+        assert!(how.write && !how.read);
+        assert_eq!(how.create, ops::Create::Exclusive);
+        assert!(how.close_on_exec);
+        assert_eq!(how.mode, 0o1644 & 0o7777);
+    }
+
+    #[test]
+    fn openat_reports_an_empty_name_as_missing() {
+        let host = Mock::default();
+        *host.umem.borrow_mut() = alloc::vec![0u8; 512];
+        let out = super::sys_openat(&host, &host, super::AT_FDCWD, 0x10, 0, 0);
+        assert_eq!(out, Some(Err(super::ENOENT)));
     }
 }
