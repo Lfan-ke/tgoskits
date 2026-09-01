@@ -527,6 +527,59 @@ pub fn output_debug_string(c: &mut Call<'_>) -> Dispatch {
 /// the environment block, as bytes. The block is UTF-16; an ASCII name and an
 /// ASCII value pass through unchanged, which is all a C runtime reads at
 /// startup, and anything wider is left to the wide form the runtime prefers.
+/// The value of `name` from the environment, as UTF-16 units, or None with the
+/// last error set for a name that is not present. Shared by the narrow and
+/// wide forms; names are compared without regard to case, as Windows does.
+fn env_value(c: &mut Call<'_>, name: &[u16]) -> Option<alloc::vec::Vec<u16>> {
+    use crate::teb_peb::PARAMS_ENVIRONMENT;
+    let env = c
+        .params()
+        .and_then(|p| c.read_u64(p + PARAMS_ENVIRONMENT))? as usize;
+    let mut at = env;
+    loop {
+        let units = c.read_wstr(at)?;
+        if units.is_empty() {
+            return None;
+        }
+        at += (units.len() + 1) * 2;
+        if let Some(eq) = units.iter().position(|u| *u == u16::from(b'=')) {
+            let lower = |u: &u16| {
+                if (0x41..=0x5A).contains(u) {
+                    u + 0x20
+                } else {
+                    *u
+                }
+            };
+            if name.len() == eq && name.iter().map(lower).eq(units[..eq].iter().map(lower)) {
+                return Some(units[eq + 1..].to_vec());
+            }
+        }
+    }
+}
+
+/// GetEnvironmentVariableW(lpName, lpBuffer, nSize): the value in UTF-16, or
+/// zero with ERROR_ENVVAR_NOT_FOUND. `nSize` and the return are in units.
+pub fn get_environment_variable_w(c: &mut Call<'_>) -> Dispatch {
+    const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+    let (name_ptr, buf, size) = (c.arg(0), c.arg(1), c.arg(2));
+    let Some(name) = c.read_wstr(name_ptr) else {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    };
+    let Some(value) = env_value(c, &name) else {
+        return c.fail(ERROR_ENVVAR_NOT_FOUND, 0);
+    };
+    if size <= value.len() {
+        return c.finish(value.len() + 1);
+    }
+    let mut out: alloc::vec::Vec<u8> = value.iter().flat_map(|u| u.to_le_bytes()).collect();
+    out.extend_from_slice(&[0, 0]);
+    if !c.write(buf, &out) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+    }
+    c.set_last_error(0);
+    c.finish(value.len())
+}
+
 pub fn get_environment_variable_a(c: &mut Call<'_>) -> Dispatch {
     use crate::teb_peb::PARAMS_ENVIRONMENT;
     const ERROR_ENVVAR_NOT_FOUND: u32 = 203;

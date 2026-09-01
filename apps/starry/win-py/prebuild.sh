@@ -37,12 +37,3 @@ done
 # the host is expanded into Lib.
 install -d "$overlay_dir/python/Lib"
 unzip -qo "$dll_dir/python313.zip" -d "$overlay_dir/python/Lib"
-
-# An absolute isolated path file next to the executable and beside the DLL:
-# the standard library directory and the program directory, no site.
-for pth in "$overlay_dir/python/python._pth" "$overlay_dir/python/python313._pth"; do
-    cat > "$pth" <<'PTH'
-Z:\python\Lib
-Z:\python
-PTH
-done
