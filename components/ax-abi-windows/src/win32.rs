@@ -965,6 +965,23 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "SleepConditionVariableSRW" => runtime::sleep_condition_variable_srw(&mut c),
         "OutputDebugStringW" | "OutputDebugStringA" => runtime::output_debug_string(&mut c),
         "GetEnvironmentVariableA" => runtime::get_environment_variable_a(&mut c),
+        "PathCchSkipRoot" => file::path_cch_skip_root(&mut c),
+        "PathCchCombineEx" => file::path_cch_combine_ex(&mut c),
+        "GetFileAttributesW" => file::get_file_attributes_w(&mut c),
+        "LCMapStringEx" => locale::lc_map_string_ex(&mut c),
+        "GetLocaleInfoW" => locale::get_locale_info_w(&mut c),
+        "GetSystemInfo" | "GetNativeSystemInfo" => runtime::get_system_info(&mut c),
+        "LocalFree" => runtime::local_free(&mut c),
+        "LoadLibraryA" => runtime::load_library_a(&mut c),
+        "BCryptGenRandom" => runtime::bcrypt_gen_random(&mut c),
+        "FormatMessageW" => runtime::format_message_w(&mut c),
+        "RegOpenKeyExW" | "RegOpenKeyExA" | "RegCreateKeyExW" | "RegCreateKeyW" => {
+            runtime::reg_open_key(&mut c)
+        }
+        "RegCloseKey" => runtime::reg_close_key(&mut c),
+        "RegQueryValueExW" | "RegQueryInfoKeyW" | "RegEnumKeyExW" | "RegEnumValueW" => {
+            runtime::reg_not_found(&mut c)
+        }
         "FreeLibrary" => runtime::free_library(&mut c),
         "GetModuleHandleExW" => runtime::get_module_handle_ex(&mut c),
         // No thread here was converted to a fiber.
