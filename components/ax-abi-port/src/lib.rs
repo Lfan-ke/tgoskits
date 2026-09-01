@@ -181,21 +181,6 @@ pub struct OpenHow {
 ///
 /// Neutral because the three lay the same facts out differently - a Linux
 /// `struct stat`, an NT `FILE_BASIC_INFORMATION`, a Darwin `struct stat` whose
-/// The ways a caller may want to reach a name.
-///
-/// All false asks only whether the name is there, which is what Linux spells
-/// `F_OK`. Each ABI decodes its own bits into this; the host never sees them.
-#[cfg(feature = "paths")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Access {
-    /// May read its contents.
-    pub read: bool,
-    /// May change its contents.
-    pub write: bool,
-    /// May execute it, or search it when it is a directory.
-    pub execute: bool,
-}
-
 /// fields are in another order - while agreeing on what the facts are. The
 /// times are since the epoch, which is the one origin all three count from.
 #[cfg(feature = "paths")]
@@ -229,6 +214,21 @@ pub struct Attributes {
     pub modified_ns: u64,
     /// Last status change, since the epoch.
     pub changed_ns: u64,
+}
+
+/// The ways a caller may want to reach a name.
+///
+/// All false asks only whether the name is there, which is what Linux spells
+/// `F_OK`. Each ABI decodes its own bits into this; the host never sees them.
+#[cfg(feature = "paths")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Access {
+    /// May read its contents.
+    pub read: bool,
+    /// May change its contents.
+    pub write: bool,
+    /// May execute it, or search it when it is a directory.
+    pub execute: bool,
 }
 
 /// What kind of thing a name refers to.
