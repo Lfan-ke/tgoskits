@@ -135,7 +135,7 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         modules[at].binds = binds;
     }
 
-    let exit_stub = stubs_va + (slot_of(&mut calls, Win32Call::ExitProcess) * STUB_LEN) as u64;
+    let exit_stub = stubs_va + (slot_of(&mut calls, Win32Call::EXIT_PROCESS) * STUB_LEN) as u64;
     let mut stubs = vec![0u8; calls.len() * STUB_LEN];
     for (slot, call) in calls.iter().enumerate() {
         stubs[slot * STUB_LEN..(slot + 1) * STUB_LEN].copy_from_slice(&thunk::stub(*call));

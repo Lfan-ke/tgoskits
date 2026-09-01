@@ -166,6 +166,42 @@ fn attach_steps(modules: &[dll::Module]) -> Vec<start::Step> {
     steps
 }
 
+/// How much the process heap starts with. Windows grows a heap by reserving
+/// more address space; growing this one is a limit to lift once a program
+/// reaches it, and it fails honestly there rather than hand out memory it
+/// does not have.
+const HEAP_LEN: u64 = 8 << 20;
+
+/// The loader's view of the process, as `PEB.Ldr` publishes it: which modules
+/// are where, under what names, in what order they were loaded and started.
+fn module_list(modules: &[dll::Module], at: u64) -> Vec<u8> {
+    let mut tls_slot = 0i16;
+    let described: Vec<teb_peb::LdrModule<'_>> = modules
+        .iter()
+        .map(|module| {
+            let tls_index = if module.pe.tls(&module.bytes).is_some() {
+                tls_slot += 1;
+                tls_slot - 1
+            } else {
+                -1
+            };
+            teb_peb::LdrModule {
+                base: module.base,
+                entry: if module.pe.entry_rva == 0 {
+                    0
+                } else {
+                    module.base + u64::from(module.pe.entry_rva)
+                },
+                size: page_up(image_extent(&module.pe, &module.bytes)),
+                path: &module.path,
+                name: &module.name,
+                tls_index,
+            }
+        })
+        .collect();
+    teb_peb::build_ldr(&described, &dll::init_order(modules), at)
+}
+
 /// The first thread's TLS area, to map at `tls_va`: an array with one entry per
 /// module that keeps thread locals, then each module's block - its template
 /// followed by its zero fill - which the entry points at. Each such module has
@@ -249,7 +285,10 @@ fn section_prot(sec: &Section) -> Prot {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{collections::BTreeMap, string::ToString};
+    use alloc::{
+        collections::BTreeMap,
+        string::{String, ToString},
+    };
 
     use super::*;
 
@@ -404,8 +443,9 @@ mod tests {
         // stub every process has (ExitProcess) on the page after the image.
         let code_va = 0x1_4000_4000;
         assert_eq!(loaded.entry, code_va + thunk::STUB_LEN as u64);
-        // Two sections, then the code page and the thread's blocks.
-        assert_eq!(env.maps.len(), 6);
+        // Two sections, then the code page, the thread's three blocks, the
+        // module list, and the heap.
+        assert_eq!(env.maps.len(), 8);
 
         let (va, prot, _) = &env.maps[0];
         assert_eq!(*va, 0x1_4000_1000);
@@ -498,8 +538,9 @@ mod tests {
                 &mut env,
             )
             .expect("load");
-        // Four sections, then the code page and the thread's three blocks.
-        assert_eq!(env.maps.len(), 8);
+        // Four sections, then the code page, the thread's three blocks, the
+        // module list, and the heap.
+        assert_eq!(env.maps.len(), 10);
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
         assert_eq!(env.maps[1].1, Prot::READ);
         assert_eq!(env.maps[2].1, Prot::READ | Prot::WRITE);
@@ -725,7 +766,7 @@ mod tests {
             .expect("the code page past the last module");
         assert_eq!(
             &code[..thunk::STUB_LEN],
-            &thunk::stub(crate::win32::Win32Call::ExitProcess)
+            &thunk::stub(crate::win32::Win32Call::EXIT_PROCESS)
         );
         assert_eq!(loaded.entry, code_va + thunk::STUB_LEN as u64);
     }
@@ -788,6 +829,60 @@ mod tests {
                     .unwrap()
             ),
             0x1_4000_0000
+        );
+    }
+
+    #[test]
+    fn the_peb_publishes_the_module_list_and_the_heap() {
+        let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
+        let dll = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/app/fake.dll".to_string(), dll)]),
+            ..RecordingEnv::default()
+        };
+
+        let loaded = load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+
+        let at =
+            |va: u64| -> &Vec<u8> { &env.maps.iter().find(|(v, ..)| *v == va).expect("mapped").2 };
+        let word = |b: &[u8], off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+        let teb = at(loaded.thread_pointer);
+        let peb_va = word(teb, teb_peb::TEB_PEB);
+        let peb = at(peb_va);
+
+        // The load-order list starts with the program and continues with the
+        // library, each entry saying where it is and what it is called.
+        let ldr_va = word(peb, teb_peb::PEB_LDR);
+        let ldr = at(ldr_va);
+        let first = word(ldr, teb_peb::LDR_IN_LOAD_ORDER) - ldr_va;
+        let entry = &ldr[first as usize..];
+        assert_eq!(word(entry, teb_peb::LDR_DLL_BASE), 0x1_4000_0000);
+        let name_len = u16::from_le_bytes(entry[teb_peb::LDR_BASE_NAME..][..2].try_into().unwrap());
+        let name_at = word(entry, teb_peb::LDR_BASE_NAME + 8) - ldr_va;
+        let name: Vec<u16> = ldr[name_at as usize..][..name_len as usize]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16_lossy(&name), "prog.exe");
+        let second = word(entry, 0) - ldr_va;
+        assert_eq!(
+            word(&ldr[second as usize..], teb_peb::LDR_DLL_BASE),
+            0x1_4000_2000
+        );
+        // The initialization list holds the library alone.
+        let init = word(ldr, teb_peb::LDR_IN_INIT_ORDER) - ldr_va;
+        assert_eq!(init, second + teb_peb::LDR_INIT_LINKS as u64);
+
+        // The heap is an arena with its header written and its end known.
+        let heap_va = word(peb, teb_peb::PEB_PROCESS_HEAP);
+        let heap = at(heap_va);
+        assert_eq!(word(heap, 0), win32::heap::MAGIC);
+        assert_eq!(word(heap, win32::heap::LIMIT), heap_va + HEAP_LEN);
+        // And the TLS bitmap pointer names a bitmap over the PEB's own bits.
+        let bitmap = word(peb, teb_peb::PEB_TLS_BITMAP) - peb_va;
+        assert_eq!(
+            word(peb, bitmap as usize + 8),
+            peb_va + teb_peb::PEB_TLS_BITMAP_BITS as u64
         );
     }
 
@@ -939,7 +1034,7 @@ mod tests {
         assert_eq!(*prot, Prot::READ | Prot::EXEC);
         assert_eq!(
             &code[..thunk::STUB_LEN],
-            &thunk::stub(crate::win32::Win32Call::WriteFile)
+            &thunk::stub(crate::win32::Win32Call::WRITE_FILE)
         );
     }
 
@@ -974,7 +1069,10 @@ mod tests {
             .find(|(va, ..)| *va == stubs_va)
             .expect("a stub region past the image");
         assert_eq!(*prot, Prot::READ | Prot::EXEC);
-        assert_eq!(&code[..thunk::STUB_LEN], &thunk::stub(Win32Call::WriteFile));
+        assert_eq!(
+            &code[..thunk::STUB_LEN],
+            &thunk::stub(Win32Call::WRITE_FILE)
+        );
 
         // The section holding the address table was rewritten rather than
         // mapped from the file, and its one entry now points at the stub.
@@ -1024,7 +1122,10 @@ mod tests {
             .iter()
             .find(|(va, ..)| *va == stubs_va)
             .expect("the import was seen and a stub was mapped");
-        assert_eq!(&code[..thunk::STUB_LEN], &thunk::stub(Win32Call::WriteFile));
+        assert_eq!(
+            &code[..thunk::STUB_LEN],
+            &thunk::stub(Win32Call::WRITE_FILE)
+        );
         let (_, _, page) = env
             .maps
             .iter()
@@ -1107,7 +1208,11 @@ impl ImageFormat for PeFormat {
         let tls_va = peb_va + page_up(teb_peb::PEB_SIZE as u64);
         let tls = thread_locals(&mut linked.modules, tls_va);
 
-        let (mut teb, peb) = teb_peb::build(&teb_peb::BlockLayout {
+        let ldr_va = tls_va + page_up(tls.len() as u64);
+        let ldr = module_list(&linked.modules, ldr_va);
+        let heap_va = ldr_va + page_up(ldr.len() as u64);
+
+        let (mut teb, mut peb) = teb_peb::build(&teb_peb::BlockLayout {
             teb_va,
             peb_va,
             image_base: linked.modules[0].base,
@@ -1116,6 +1221,7 @@ impl ImageFormat for PeFormat {
         });
         teb[teb_peb::TEB_TLS_POINTER..teb_peb::TEB_TLS_POINTER + 8]
             .copy_from_slice(&tls_va.to_le_bytes());
+        teb_peb::fill_peb(&mut peb, peb_va, ldr_va, heap_va);
         let mut code = linked.stubs.clone();
         code.extend(start::emit(&steps, program_entry, peb_va, linked.exit_stub));
 
@@ -1148,6 +1254,15 @@ impl ImageFormat for PeFormat {
         env.map_region(teb_va, page_up(teb.len() as u64), rw, Some(&teb))?;
         env.map_region(peb_va, page_up(peb.len() as u64), rw, Some(&peb))?;
         env.map_region(tls_va, page_up(tls.len() as u64), rw, Some(&tls))?;
+        env.map_region(ldr_va, page_up(ldr.len() as u64), rw, Some(&ldr))?;
+        // The process heap: an arena the Win32 layer carves blocks from. The
+        // header is all that is written; the rest arrives zeroed.
+        env.map_region(
+            heap_va,
+            HEAP_LEN,
+            rw,
+            Some(&win32::heap::arena(heap_va, HEAP_LEN)),
+        )?;
         Ok(Loaded {
             entry: startup_va,
             stack: 0,

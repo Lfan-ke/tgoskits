@@ -55,14 +55,14 @@ mod tests {
 
     #[test]
     fn a_stub_moves_the_arguments_and_asks_for_its_own_number() {
-        let code = stub(Win32Call::WriteFile);
+        let code = stub(Win32Call::WRITE_FILE);
         // mov eax, <nr> carries the number the trap is answered by.
         let at = code
             .windows(5)
             .position(|w| w[0] == 0xB8)
             .expect("the number is loaded");
         let nr = u32::from_le_bytes(code[at + 1..at + 5].try_into().unwrap());
-        assert_eq!(nr, Win32Call::WriteFile.nr());
+        assert_eq!(nr, Win32Call::WRITE_FILE.nr());
         // The number is loaded last, so the moves cannot clobber it.
         assert_eq!(&code[at + 5..at + 7], &[0x0F, 0x05], "syscall follows");
         assert_eq!(code[at + 7], 0xC3, "then a return");
@@ -72,6 +72,6 @@ mod tests {
 
     #[test]
     fn two_calls_get_different_numbers_and_so_different_stubs() {
-        assert_ne!(stub(Win32Call::WriteFile), stub(Win32Call::ExitProcess));
+        assert_ne!(stub(Win32Call::WRITE_FILE), stub(Win32Call::EXIT_PROCESS));
     }
 }
