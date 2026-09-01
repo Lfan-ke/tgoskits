@@ -965,6 +965,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "SleepConditionVariableSRW" => runtime::sleep_condition_variable_srw(&mut c),
         "OutputDebugStringW" | "OutputDebugStringA" => runtime::output_debug_string(&mut c),
         "GetEnvironmentVariableA" => runtime::get_environment_variable_a(&mut c),
+        "GetEnvironmentVariableW" => runtime::get_environment_variable_w(&mut c),
         "PathCchSkipRoot" => file::path_cch_skip_root(&mut c),
         "PathCchCombineEx" => file::path_cch_combine_ex(&mut c),
         "GetFileAttributesW" => file::get_file_attributes_w(&mut c),
