@@ -198,9 +198,9 @@ fn process_params(req: &LoadRequest<'_>, path: &str, at: u64) -> Vec<u8> {
 
 /// The loader's view of the process, as `PEB.Ldr` publishes it: which modules
 /// are where, under what names, in what order they were loaded and started.
-fn module_list(modules: &[dll::Module], at: u64) -> Vec<u8> {
+fn module_list(modules: &[dll::Module], kernel32_va: u64, kernel32_len: u64, at: u64) -> Vec<u8> {
     let mut tls_slot = 0i16;
-    let described: Vec<teb_peb::LdrModule<'_>> = modules
+    let described = modules
         .iter()
         .map(|module| {
             let tls_index = if module.pe.tls(&module.bytes).is_some() {
@@ -209,22 +209,49 @@ fn module_list(modules: &[dll::Module], at: u64) -> Vec<u8> {
             } else {
                 -1
             };
-            teb_peb::LdrModule {
-                base: module.base,
-                entry: if module.pe.entry_rva == 0 {
+            (
+                teb_peb::windows_path(&module.path),
+                module.base,
+                if module.pe.entry_rva == 0 {
                     0
                 } else {
                     module.base + u64::from(module.pe.entry_rva)
                 },
-                size: page_up(image_extent(&module.pe, &module.bytes)),
-                path: &module.path,
-                name: &module.name,
+                page_up(image_extent(&module.pe, &module.bytes)),
                 tls_index,
-            }
+            )
         })
+        .collect::<Vec<_>>();
+    let mut entries: Vec<teb_peb::LdrModule<'_>> = described
+        .iter()
+        .zip(modules)
+        .map(
+            |((path, base, entry, size, tls_index), module)| teb_peb::LdrModule {
+                base: *base,
+                entry: *entry,
+                size: *size,
+                path,
+                name: &module.name,
+                tls_index: *tls_index,
+            },
+        )
         .collect();
-    teb_peb::build_ldr(&described, &dll::init_order(modules), at)
+    // kernel32 is a module like any other to a program that asks: it has a
+    // base, a name, and exports - the stubs - even though no file was read.
+    entries.push(teb_peb::LdrModule {
+        base: kernel32_va,
+        entry: 0,
+        size: page_up(kernel32_len),
+        path: KERNEL32_PATH,
+        name: "kernel32.dll",
+        tls_index: -1,
+    });
+    teb_peb::build_ldr(&entries, &dll::init_order(modules), at)
 }
+
+/// Where the synthesized kernel32 says it lives, as a program would see the
+/// real one's path.
+const KERNEL32_PATH: &str = "Z:\\windows\\system32\\kernel32.dll";
 
 /// The first thread's TLS area, to map at `tls_va`: an array with one entry per
 /// module that keeps thread locals, then each module's block - its template
@@ -463,10 +490,11 @@ mod tests {
                 &mut env,
             )
             .expect("load");
-        // The process starts in the startup sequence, which follows the one
-        // stub every process has (ExitProcess) on the page after the image.
+        // The process starts in the startup sequence, which follows the
+        // kernel32 image - a header page and a stub per table entry - on the
+        // page after the program.
         let code_va = 0x1_4000_4000;
-        assert_eq!(loaded.entry, code_va + thunk::STUB_LEN as u64);
+        assert_eq!(loaded.entry, code_va + startup_offset());
         // Two sections, then the code page, the thread's three blocks, the
         // module list, the parameters, and the heap.
         assert_eq!(env.maps.len(), 9);
@@ -780,19 +808,64 @@ mod tests {
             u64::from_le_bytes(code[..8].try_into().unwrap()),
             dll_base + 0x2000
         );
-        // Nothing here imports from the system, so the only stub is the one
-        // every process gets, and the startup sequence follows it.
+        // Nothing here imports from the system; the kernel32 image is there
+        // all the same, and the startup sequence follows it.
         let code_va = dll_base + 0x4000;
         let (_, _, code) = env
             .maps
             .iter()
             .find(|(va, ..)| *va == code_va)
             .expect("the code page past the last module");
-        assert_eq!(
-            &code[..thunk::STUB_LEN],
-            &thunk::stub(crate::win32::Win32Call::EXIT_PROCESS)
-        );
-        assert_eq!(loaded.entry, code_va + thunk::STUB_LEN as u64);
+        assert_eq!(&code[..2], b"MZ");
+        assert_eq!(loaded.entry, code_va + startup_offset());
+    }
+
+    /// Where the startup sequence begins inside the code region: after the
+    /// kernel32 header page and one stub per table entry.
+    fn startup_offset() -> u64 {
+        (thunk::MODULE_HEADER + crate::win32::table_len() * thunk::STUB_LEN) as u64
+    }
+
+    #[test]
+    fn kernel32_is_a_module_the_program_can_ask_about() {
+        let exe = image_with_imports(&[(b"KERNEL32.dll\0", b"WriteFile\0")], 0x400);
+        let mut env = RecordingEnv::default();
+        let loaded = load_at(&exe, "/app/prog.exe", &mut env).expect("loaded");
+
+        let at =
+            |va: u64| -> &Vec<u8> { &env.maps.iter().find(|(v, ..)| *v == va).expect("mapped").2 };
+        let word = |b: &[u8], off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+        let teb = at(loaded.thread_pointer);
+        let peb = at(word(teb, teb_peb::TEB_PEB));
+        let ldr_va = word(peb, teb_peb::PEB_LDR);
+        let ldr = at(ldr_va);
+        // Walk the load-order list to its last entry: kernel32, at the code
+        // region, under its Windows path.
+        let head = teb_peb::LDR_IN_LOAD_ORDER;
+        let mut link = word(ldr, head) - ldr_va;
+        let mut last = None;
+        while link as usize != head {
+            last = Some(link as usize);
+            link = word(ldr, link as usize) - ldr_va;
+        }
+        let entry = &ldr[last.expect("a module")..];
+        assert_eq!(word(entry, teb_peb::LDR_DLL_BASE), 0x1_4000_2000);
+        let len = u16::from_le_bytes(entry[teb_peb::LDR_FULL_NAME..][..2].try_into().unwrap());
+        let name_at = word(entry, teb_peb::LDR_FULL_NAME + 8) - ldr_va;
+        let name: Vec<u16> = ldr[name_at as usize..][..len as usize]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16_lossy(&name), KERNEL32_PATH);
+        // And the program's own entry names it the Windows way.
+        let first = &ldr[(word(ldr, head) - ldr_va) as usize..];
+        let len = u16::from_le_bytes(first[teb_peb::LDR_FULL_NAME..][..2].try_into().unwrap());
+        let name_at = word(first, teb_peb::LDR_FULL_NAME + 8) - ldr_va;
+        let name: Vec<u16> = ldr[name_at as usize..][..len as usize]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16_lossy(&name), "Z:\\app\\prog.exe");
     }
 
     #[test]
@@ -828,8 +901,8 @@ mod tests {
 
         // The thread's block sits after the code, points at itself, at the
         // PEB, and at its TLS array; the process starts with `gs` on it.
-        let teb_va = code_va + 0x1000;
-        assert_eq!(loaded.thread_pointer, teb_va);
+        let teb_va = loaded.thread_pointer;
+        assert!(teb_va > code_va, "the thread block follows the code");
         let (_, prot, teb) = env
             .maps
             .iter()
@@ -940,11 +1013,11 @@ mod tests {
             ..RecordingEnv::default()
         };
 
-        load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+        let loaded = load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
 
-        // This library spans 0x5000, so everything after it moves up.
+        // The TLS area follows the thread block and the PEB.
         let dll_base = 0x1_4000_2000u64;
-        let tls_va = dll_base + 0x5000 + 0x1000 + 0x2000 + 0x1000;
+        let tls_va = loaded.thread_pointer + 0x2000 + 0x1000;
         let (_, _, area) = env
             .maps
             .iter()
@@ -1063,24 +1136,23 @@ mod tests {
 
         load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
 
-        // Program, then the library, then the stubs on the page after it.
+        // Program, then the library, then kernel32 on the page after it, with
+        // WriteFile's stub the first past its header.
         let stubs_va = 0x1_4000_2000u64 + 0x4000;
-        assert_eq!(slot_of(&env, 1), stubs_va);
+        assert_eq!(slot_of(&env, 1), stubs_va + thunk::MODULE_HEADER as u64);
         let (_, prot, code) = env
             .maps
             .iter()
             .find(|(va, ..)| *va == stubs_va)
-            .expect("a stub region past the last module");
+            .expect("the kernel32 image past the last module");
         assert_eq!(*prot, Prot::READ | Prot::EXEC);
-        assert_eq!(
-            &code[..thunk::STUB_LEN],
-            &thunk::stub(crate::win32::Win32Call::WRITE_FILE)
-        );
+        let first = &code[thunk::MODULE_HEADER..thunk::MODULE_HEADER + thunk::STUB_LEN];
+        assert_eq!(first, &thunk::stub(crate::win32::Win32Call::WRITE_FILE));
     }
 
     #[test]
     fn binds_an_import_to_a_stub_mapped_past_the_image() {
-        use crate::{thunk, win32::Win32Call};
+        use crate::thunk;
 
         let img = image_importing(b"WriteFile\0");
         let mut env = RecordingEnv::default();
@@ -1096,9 +1168,8 @@ mod tests {
                 &mut env,
             )
             .expect("an import this package serves is bound");
-        // The process starts in the startup sequence, after the two stubs
-        // this program needs: WriteFile, and the ExitProcess every one gets.
-        assert_eq!(loaded.entry, 0x1_4000_2000 + 2 * thunk::STUB_LEN as u64);
+        // The process starts in the startup sequence, after the kernel32 image.
+        assert_eq!(loaded.entry, 0x1_4000_2000 + startup_offset());
 
         // The image spans one page from RVA 0x1000, so the stubs land on the
         // page after it.
@@ -1107,12 +1178,12 @@ mod tests {
             .maps
             .iter()
             .find(|(va, ..)| *va == stubs_va)
-            .expect("a stub region past the image");
+            .expect("the kernel32 image past the program");
         assert_eq!(*prot, Prot::READ | Prot::EXEC);
-        assert_eq!(
-            &code[..thunk::STUB_LEN],
-            &thunk::stub(Win32Call::WRITE_FILE)
-        );
+        // Its header is a PE, and WriteFile's stub is the first past it.
+        assert_eq!(&code[..2], b"MZ");
+        let first = &code[thunk::MODULE_HEADER..thunk::MODULE_HEADER + thunk::STUB_LEN];
+        assert_eq!(first, &thunk::stub(crate::win32::Win32Call::WRITE_FILE));
 
         // The section holding the address table was rewritten rather than
         // mapped from the file, and its one entry now points at the stub.
@@ -1123,7 +1194,7 @@ mod tests {
             .expect("the import section is mapped from a rewritten buffer");
         assert_eq!(
             u64::from_le_bytes(page[0x60..0x68].try_into().unwrap()),
-            stubs_va
+            stubs_va + thunk::MODULE_HEADER as u64
         );
         assert!(
             env.from_file.is_empty(),
@@ -1161,11 +1232,9 @@ mod tests {
             .maps
             .iter()
             .find(|(va, ..)| *va == stubs_va)
-            .expect("the import was seen and a stub was mapped");
-        assert_eq!(
-            &code[..thunk::STUB_LEN],
-            &thunk::stub(Win32Call::WRITE_FILE)
-        );
+            .expect("the import was seen and the kernel32 image was mapped");
+        let first = &code[thunk::MODULE_HEADER..thunk::MODULE_HEADER + thunk::STUB_LEN];
+        assert_eq!(first, &thunk::stub(Win32Call::WRITE_FILE));
         let (_, _, page) = env
             .maps
             .iter()
@@ -1173,7 +1242,7 @@ mod tests {
             .expect("the import section was rewritten");
         assert_eq!(
             u64::from_le_bytes(page[0x60..0x68].try_into().unwrap()),
-            stubs_va
+            stubs_va + thunk::MODULE_HEADER as u64
         );
     }
 
@@ -1249,7 +1318,12 @@ impl ImageFormat for PeFormat {
         let tls = thread_locals(&mut linked.modules, tls_va);
 
         let ldr_va = tls_va + page_up(tls.len() as u64);
-        let ldr = module_list(&linked.modules, ldr_va);
+        let ldr = module_list(
+            &linked.modules,
+            linked.stubs_va,
+            linked.stubs.len() as u64,
+            ldr_va,
+        );
         let params_va = ldr_va + page_up(ldr.len() as u64);
         let params = process_params(req, &linked.modules[0].path, params_va);
         let heap_va = params_va + page_up(params.len() as u64);
