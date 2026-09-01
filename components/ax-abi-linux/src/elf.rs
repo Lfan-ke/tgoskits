@@ -332,7 +332,6 @@ mod riscv {
 
     const R_RISCV_64: u32 = 2;
     const R_RISCV_RELATIVE: u32 = 3;
-    const R_RISCV_COPY: u32 = 4;
 
     const DYN_ENTRY: usize = 16;
     const RELA_ENTRY: usize = 24;
@@ -343,7 +342,7 @@ mod riscv {
         base: usize,
         env: &mut dyn LoadEnv,
     ) -> AbiResult<()> {
-        let ph = elf.headers().ph;
+        let ph = &elf.headers().ph;
         let Some(dynamic) = ph
             .iter()
             .find(|p| p.get_type() == Ok(xmas_elf::program::Type::Dynamic))
@@ -358,7 +357,7 @@ mod riscv {
         env.read_image(dynamic.offset, &mut data)?;
 
         let (mut rela, mut rela_size, mut symtab) = (0u64, 0u64, 0u64);
-        for chunk in data.chunks_exact(DYN_ENTRY) {
+        for chunk in data.as_chunks::<DYN_ENTRY>().0 {
             let tag = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let value = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             match tag {
@@ -406,7 +405,10 @@ mod riscv {
                     let value = (base as i64 + st_value as i64 + addend) as u64;
                     env.write((base + offset) as u64, &value.to_le_bytes())?;
                 }
-                R_RISCV_COPY | _ => {}
+                // R_RISCV_COPY moves a symbol's bytes out of the interpreter's
+                // image, which only arises once one is mapped; anything else is
+                // a relocation this domain does not apply.
+                _ => {}
             }
         }
         Ok(())

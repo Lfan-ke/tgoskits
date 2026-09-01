@@ -40,7 +40,12 @@ use ax_crate_interface::call_interface;
 use ax_dispatch::{Abi, Dispatch, SysAbi, TrapEnv, TrapOutcome};
 use ops::{ENOSYS, Host, SysResult};
 use syscalls::Sysno;
-
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+use syscalls::Sysno::fstatat as SYS_FSTATAT;
+// One call under two names: the generic table spells it `fstatat`, while
+// x86_64 and riscv64 keep the historical `newfstatat`.
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+use syscalls::Sysno::newfstatat as SYS_FSTATAT;
 /// The page size every supported target agrees on, which the ABI's alignment
 /// rules are written against.
 #[cfg(feature = "mm")]
@@ -190,7 +195,7 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         // Name resolution - the domain owns the flag vocabulary and the
         // architecture's stat layout; the host only resolves and describes.
         #[cfg(feature = "paths")]
-        Sysno::newfstatat => sys_newfstatat(
+        SYS_FSTATAT => sys_newfstatat(
             host.platform(),
             host.paths()?,
             arg(0) as i32,
