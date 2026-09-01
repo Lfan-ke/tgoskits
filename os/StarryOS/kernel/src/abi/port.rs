@@ -143,6 +143,12 @@ impl Paths for KernelHost {
         describe(resolve_at(fd, None, AT_EMPTY_PATH))
     }
 
+    fn path_of(&self, fd: i32, put: &mut dyn FnMut(&str)) -> Result<(), i32> {
+        let file = get_file_like(fd).map_err(errno)?;
+        put(&file.path());
+        Ok(())
+    }
+
     fn permitted(
         &self,
         at: At,

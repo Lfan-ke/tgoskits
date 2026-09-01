@@ -1215,6 +1215,15 @@ mod tests {
         fn attributes_of(&self, _fd: i32) -> Result<Attributes, i32> {
             self.describes.clone().ok_or(ax_abi_port::EBADF)
         }
+        fn path_of(&self, _fd: i32, put: &mut dyn FnMut(&str)) -> Result<(), i32> {
+            match &self.describes {
+                Some(_) => {
+                    put("/python/python.exe");
+                    Ok(())
+                }
+                None => Err(ax_abi_port::EBADF),
+            }
+        }
 
         fn permitted(
             &self,
