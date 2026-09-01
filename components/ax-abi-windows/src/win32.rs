@@ -306,7 +306,8 @@ struct Call<'a> {
 impl Call<'_> {
     /// Argument `i`. The stub moved the first six into the trap frame; a
     /// function with more leaves the rest where the caller put them, above
-    /// the return address and the spill space on its stack.
+    /// the return address and the spill space on its stack - and above the
+    /// two registers the stub pushed to keep for the caller.
     fn arg(&self, i: usize) -> usize {
         if i < 6 {
             return self.env.arg(i);
@@ -315,7 +316,7 @@ impl Call<'_> {
         if sp == 0 {
             return 0;
         }
-        self.read_u64(sp + 0x28 + (i - 4) * 8).unwrap_or(0) as usize
+        self.read_u64(sp + 0x38 + (i - 4) * 8).unwrap_or(0) as usize
     }
 
     fn read<const N: usize>(&self, at: usize) -> Option<[u8; N]> {
@@ -758,8 +759,14 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                 Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
             }
         }
-        // Bound so the runtime links; reached, it says so rather than pretend.
-        _ => c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0),
+        // Bound so the runtime links; reached, it says so rather than pretend,
+        // and names itself for whoever reads the host's log.
+        _ => {
+            c.host
+                .platform()
+                .trace(&alloc::format!("{} is not implemented", call.symbol()));
+            c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0)
+        }
     }
 }
 
