@@ -141,6 +141,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[],
@@ -204,6 +205,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &b,
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[],
@@ -234,6 +236,7 @@ mod tests {
             MachoFormat.load(
                 &LoadRequest {
                     image: b"\x7fELF",
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[]

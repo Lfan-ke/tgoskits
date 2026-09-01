@@ -74,6 +74,10 @@ pub struct LoadRequest<'a> {
     /// Where the host wants the image placed, for a format whose addresses are
     /// relative. A format with fixed addresses ignores it.
     pub load_base: u64,
+    /// The pathname the host resolved the program by. A format that looks
+    /// for other files beside the program needs it: Windows searches a
+    /// program's own directory for its libraries before the system's.
+    pub path: &'a str,
     /// Program arguments (`argv`), personality-neutral.
     pub args: &'a [&'a str],
     /// Environment strings (`envp`), personality-neutral.

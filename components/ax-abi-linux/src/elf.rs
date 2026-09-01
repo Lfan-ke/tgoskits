@@ -539,6 +539,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &env.image.clone(),
+                    path: "",
                     load_base: 0,
                     args: &["/bin/x"],
                     envs: &[],
@@ -577,6 +578,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &image,
+                    path: "",
                     load_base: 0,
                     args: &["/bin/x"],
                     envs: &[],

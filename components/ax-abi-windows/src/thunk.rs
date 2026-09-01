@@ -15,13 +15,6 @@
 //! The stub is where the two conventions meet, which is why the Win32 layer
 //! reads every argument from the trap frame and none from the stack.
 
-use alloc::{vec, vec::Vec};
-
-use ax_binfmt::{
-    AbiError, AbiResult,
-    pe::{ImportedSymbol, PeInfo},
-};
-
 use crate::win32::Win32Call;
 
 /// Bytes reserved for each stub. The instructions are shorter; a fixed stride
@@ -54,53 +47,6 @@ pub fn stub(call: Win32Call) -> [u8; STUB_LEN] {
         at += part.len();
     }
     out
-}
-
-/// What binding an image's imports produced.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Thunks {
-    /// The stubs, to map as one executable region at the address they were
-    /// bound against.
-    pub code: Vec<u8>,
-    /// Address table entries to write, as `(rva, value)`. They are applied to a
-    /// section before it is mapped, the way a relocation is.
-    pub binds: Vec<(u32, u64)>,
-}
-
-/// Bind every import to a stub placed at `stubs_va`.
-///
-/// An import this package does not serve is refused here rather than left as a
-/// zero for the first call to jump to, so a program that needs more than the
-/// synthesized library offers fails while it can still be told why.
-pub fn bind(pe: &PeInfo, image: &[u8], stubs_va: u64) -> AbiResult<Thunks> {
-    let Some(imports) = pe.imports(image) else {
-        return Ok(Thunks::default());
-    };
-    let mut calls: Vec<Win32Call> = Vec::new();
-    let mut binds = Vec::new();
-    for import in imports {
-        // An ordinal names a position in a real library's export table, which
-        // a synthesized one does not have.
-        let ImportedSymbol::Name(symbol) = import.symbol else {
-            return Err(AbiError::MissingLibrary);
-        };
-        let call = Win32Call::resolve(import.library, symbol).ok_or(AbiError::MissingLibrary)?;
-        // Two imports of the same function share a stub, as they would share
-        // the one address a real library exports.
-        let slot = match calls.iter().position(|it| *it == call) {
-            Some(at) => at,
-            None => {
-                calls.push(call);
-                calls.len() - 1
-            }
-        };
-        binds.push((import.thunk, stubs_va + (slot * STUB_LEN) as u64));
-    }
-    let mut code = vec![0u8; calls.len() * STUB_LEN];
-    for (slot, call) in calls.iter().enumerate() {
-        code[slot * STUB_LEN..(slot + 1) * STUB_LEN].copy_from_slice(&stub(*call));
-    }
-    Ok(Thunks { code, binds })
 }
 
 #[cfg(test)]
