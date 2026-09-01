@@ -139,6 +139,12 @@ pub trait LoadEnv {
         Err(AbiError::Unsupported)
     }
 
+    /// Record `message` wherever the host keeps its diagnostics: what a format
+    /// could not do for an image - a library it could not find, an import
+    /// nothing provides - so a refused load says why in the host's log and
+    /// not only in its error. A host with nowhere to put it drops it.
+    fn trace(&mut self, _message: &str) {}
+
     /// Record key/value metadata the format wants kept, for a host that
     /// republishes it. Linux exposes the auxiliary vector this way, under
     /// procfs; a host with nowhere to put it ignores the call.
