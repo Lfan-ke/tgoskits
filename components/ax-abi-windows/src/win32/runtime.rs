@@ -17,6 +17,7 @@ use super::{
 };
 use crate::{
     dll,
+    nt::Ntstatus,
     teb_peb::{
         LDR_DLL_BASE, LDR_IN_LOAD_ORDER, LDR_SIZE_OF_IMAGE, PEB_IMAGE_BASE, PEB_LDR, PEB_OS_MAJOR,
         PEB_PRIVATE, PEB_PROCESS_HEAP, TEB_FLS_SLOTS,
@@ -411,6 +412,159 @@ fn module_at(c: &Call<'_>, peb: usize, address: usize) -> Option<usize> {
         link = c.read_u64(link)? as usize;
     }
     None
+}
+
+// --- Locks and condition variables ---------------------------------------
+//
+// The process has one thread, so a lock is never contended: acquiring one that
+// is free succeeds, and the only way to find one held is to have deadlocked,
+// which a single thread cannot recover from. An SRW lock is one pointer-sized
+// word (Wine's `RtlAcquireSRWLockExclusive`); zero is free, and the exclusive
+// bit marks it held. A condition variable is one word too; waking it touches
+// that word, and sleeping on it releases the lock and returns at once, because
+// nothing else exists to do the waking - a caller's `while (!ready) sleep`
+// loop is satisfied by the predicate it set before waiting, in this one thread.
+
+const SRW_HELD_EXCLUSIVE: u64 = 1;
+
+pub fn acquire_srw_lock_exclusive(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    // Held already, with only one thread, is a deadlock; say so in the log
+    // rather than spin, and take it anyway so the caller makes progress.
+    if c.read_u64(at) == Some(SRW_HELD_EXCLUSIVE) {
+        c.host
+            .platform()
+            .trace("AcquireSRWLockExclusive on a lock this thread already holds");
+    }
+    c.write_u64(at, SRW_HELD_EXCLUSIVE);
+    c.finish(0)
+}
+
+pub fn release_srw_lock_exclusive(c: &mut Call<'_>) -> Dispatch {
+    c.write_u64(c.arg(0), 0);
+    c.finish(0)
+}
+
+/// TryAcquireSRWLockExclusive: always free here, so always taken.
+pub fn try_acquire_srw_lock_exclusive(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    if c.read_u64(at) == Some(SRW_HELD_EXCLUSIVE) {
+        return c.finish(FALSE);
+    }
+    c.write_u64(at, SRW_HELD_EXCLUSIVE);
+    c.finish(TRUE)
+}
+
+/// A shared lock is counted in the word above the exclusive bit; with no
+/// contention the count is bookkeeping a reader can always join.
+pub fn acquire_srw_lock_shared(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    let readers = c.read_u64(at).unwrap_or(0) >> 1;
+    c.write_u64(at, (readers + 1) << 1);
+    c.finish(0)
+}
+
+pub fn release_srw_lock_shared(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    let readers = (c.read_u64(at).unwrap_or(0) >> 1).saturating_sub(1);
+    c.write_u64(at, readers << 1);
+    c.finish(0)
+}
+
+/// InitializeSRWLock / InitializeConditionVariable: a fresh one is a zero word.
+pub fn init_sync_word(c: &mut Call<'_>) -> Dispatch {
+    c.write_u64(c.arg(0), 0);
+    c.finish(0)
+}
+
+/// WakeConditionVariable / WakeAllConditionVariable: nothing waits, so this
+/// only records that a wake happened, as ntdll's counter does.
+pub fn wake_condition_variable(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    let count = c.read_u64(at).unwrap_or(0);
+    c.write_u64(at, count.wrapping_add(1));
+    c.finish(0)
+}
+
+/// SleepConditionVariableSRW(cond, lock, timeout, flags): release the lock and
+/// return as if woken. With one thread the predicate the caller rechecks is
+/// its own to have set; a wait that truly needed another thread would be a
+/// deadlock, which is out of a single thread's reach either way.
+pub fn sleep_condition_variable_srw(c: &mut Call<'_>) -> Dispatch {
+    const SHARED: usize = 0x1;
+    let (lock, flags) = (c.arg(1), c.arg(3) as u32);
+    if flags & SHARED as u32 != 0 {
+        let readers = (c.read_u64(lock).unwrap_or(0) >> 1).saturating_sub(1);
+        c.write_u64(lock, readers << 1);
+    } else {
+        c.write_u64(lock, 0);
+    }
+    // TRUE: woken, not timed out, so the caller rechecks its predicate.
+    c.finish(TRUE)
+}
+
+/// OutputDebugStringW(lpOutputString): to the host's log, as a debugger would
+/// receive it.
+pub fn output_debug_string(c: &mut Call<'_>) -> Dispatch {
+    if let Some(units) = c.read_wstr(c.arg(0)) {
+        let text: alloc::string::String = char::decode_utf16(units)
+            .map(|r| r.unwrap_or('\u{FFFD}'))
+            .collect();
+        c.host
+            .platform()
+            .trace(&alloc::format!("OutputDebugString: {}", text.trim_end()));
+    }
+    c.finish(0)
+}
+
+/// GetEnvironmentVariableA(lpName, lpBuffer, nSize): the value of `name` from
+/// the environment block, as bytes. The block is UTF-16; an ASCII name and an
+/// ASCII value pass through unchanged, which is all a C runtime reads at
+/// startup, and anything wider is left to the wide form the runtime prefers.
+pub fn get_environment_variable_a(c: &mut Call<'_>) -> Dispatch {
+    use crate::teb_peb::PARAMS_ENVIRONMENT;
+    const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+    let (name_ptr, buf, size) = (c.arg(0), c.arg(1), c.arg(2));
+    let Some(name) = c.read_cstr(name_ptr).map(|mut v| {
+        v.pop();
+        v
+    }) else {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    };
+    let Some(env) = c.params().and_then(|p| c.read_u64(p + PARAMS_ENVIRONMENT)) else {
+        return c.fail(ERROR_ENVVAR_NOT_FOUND, 0);
+    };
+    // Walk NAME=value\0 entries to the double NUL.
+    let mut at = env as usize;
+    loop {
+        let Some(units) = c.read_wstr(at) else {
+            return c.fail(ERROR_ENVVAR_NOT_FOUND, 0);
+        };
+        if units.is_empty() {
+            return c.fail(ERROR_ENVVAR_NOT_FOUND, 0);
+        }
+        at += (units.len() + 1) * 2;
+        let bytes: alloc::vec::Vec<u8> = units
+            .iter()
+            .map(|u| if *u < 0x80 { *u as u8 } else { b'?' })
+            .collect();
+        if let Some(eq) = bytes.iter().position(|b| *b == b'=') {
+            // Windows compares names without regard to case.
+            if bytes[..eq].eq_ignore_ascii_case(&name) {
+                let value = &bytes[eq + 1..];
+                if size <= value.len() {
+                    return c.finish(value.len() + 1);
+                }
+                let mut out = value.to_vec();
+                out.push(0);
+                if !c.write(buf, &out) {
+                    return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+                }
+                c.set_last_error(0);
+                return c.finish(value.len());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
