@@ -128,6 +128,7 @@ impl VectorTable<'_> {
         Ok(Loaded {
             entry: self.base,
             stack: 0,
+            thread_pointer: 0,
         })
     }
 }

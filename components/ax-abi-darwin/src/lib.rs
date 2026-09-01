@@ -284,7 +284,11 @@ impl ImageFormat for MachoFormat {
                 seg.fileoff + seg.filesize,
             )?;
         }
-        Ok(Loaded { entry, stack: 0 })
+        Ok(Loaded {
+            entry,
+            stack: 0,
+            thread_pointer: 0,
+        })
     }
 }
 

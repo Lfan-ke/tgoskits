@@ -48,6 +48,8 @@ pub struct Module {
     pub base: u64,
     /// Address table entries to write before its sections are mapped.
     pub binds: Vec<(u32, u64)>,
+    /// Single words to write likewise: the TLS slot a module's index takes.
+    pub words: Vec<(u32, u32)>,
 }
 
 /// Everything a program needs mapped before it starts.
@@ -59,6 +61,10 @@ pub struct Linked {
     pub stubs_va: u64,
     /// The stubs, one per distinct system function imported.
     pub stubs: Vec<u8>,
+    /// Where `ExitProcess`'s stub is. It is always among them, because the
+    /// startup sequence ends the process through it whether or not the
+    /// program imports it.
+    pub exit_stub: u64,
 }
 
 /// Reach every library the program needs and resolve every import in the set.
@@ -74,6 +80,7 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         path: path.to_string(),
         base: pe.image_base,
         binds: Vec::new(),
+        words: Vec::new(),
         pe,
         bytes,
     };
@@ -98,6 +105,7 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
                 path,
                 base: next,
                 binds: Vec::new(),
+                words: Vec::new(),
                 pe,
                 bytes,
             };
@@ -127,6 +135,7 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         modules[at].binds = binds;
     }
 
+    let exit_stub = stubs_va + (slot_of(&mut calls, Win32Call::ExitProcess) * STUB_LEN) as u64;
     let mut stubs = vec![0u8; calls.len() * STUB_LEN];
     for (slot, call) in calls.iter().enumerate() {
         stubs[slot * STUB_LEN..(slot + 1) * STUB_LEN].copy_from_slice(&thunk::stub(*call));
@@ -135,7 +144,33 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         modules,
         stubs_va,
         stubs,
+        exit_stub,
     })
+}
+
+/// The order libraries are initialized in: each after everything it depends
+/// on, the program's own dependencies last, the program itself not at all -
+/// its entry is where the process starts once the libraries are ready. This is
+/// `process_attach` walking the dependency graph post-order.
+pub fn init_order(modules: &[Module]) -> Vec<usize> {
+    fn visit(modules: &[Module], at: usize, seen: &mut [bool], order: &mut Vec<usize>) {
+        if seen[at] {
+            return;
+        }
+        seen[at] = true;
+        for lib in libraries(&modules[at]) {
+            if let Some(dep) = modules.iter().position(|m| m.name == lib) {
+                visit(modules, dep, seen, order);
+            }
+        }
+        if at != 0 {
+            order.push(at);
+        }
+    }
+    let mut order = Vec::new();
+    let mut seen = vec![false; modules.len()];
+    visit(modules, 0, &mut seen, &mut order);
+    order
 }
 
 /// The module an import's library name really means.

@@ -13,6 +13,8 @@ pub const DIR_BASERELOC: usize = 5;
 pub const DIR_IMPORT: usize = 1;
 /// Data-directory index of the export table (`IMAGE_DIRECTORY_ENTRY_EXPORT`).
 pub const DIR_EXPORT: usize = 0;
+/// Data directory index of the TLS directory.
+pub const DIR_TLS: usize = 9;
 
 /// Base-relocation padding entry, ignored (`IMAGE_REL_BASED_ABSOLUTE`).
 pub const REL_ABSOLUTE: u16 = 0;
@@ -231,6 +233,77 @@ impl<'a> Iterator for Exports<'a> {
             ordinal: self.ordinal_base + slot as u32,
             target,
         })
+    }
+}
+
+/// `IMAGE_TLS_DIRECTORY64`, with the addresses it holds turned back into RVAs.
+///
+/// The file spells them for the preferred base; relocation moves them with the
+/// image, but a loader reading the file wants them base-independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsDir {
+    /// The template every thread's block starts as, `[raw_start, raw_end)`.
+    pub raw_start: u32,
+    pub raw_end: u32,
+    /// Bytes of zeros that follow the template in each block.
+    pub zero_fill: u32,
+    /// Where the loader writes the slot it assigned, a `DWORD`.
+    pub index: u32,
+    /// A null-terminated array of callback addresses, or 0 for none.
+    pub callbacks: u32,
+}
+
+/// The callbacks a TLS directory names, as RVAs, in call order.
+pub struct TlsCallbacks<'a> {
+    pe: PeInfo,
+    image: &'a [u8],
+    at: Option<usize>,
+}
+
+impl Iterator for TlsCallbacks<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        let at = self.at?;
+        let va = read_u64(self.image, at)?;
+        if va == 0 {
+            self.at = None;
+            return None;
+        }
+        self.at = Some(at + 8);
+        u32::try_from(va.checked_sub(self.pe.image_base)?).ok()
+    }
+}
+
+impl PeInfo {
+    /// The image's TLS directory, or `None` when it keeps no thread locals.
+    pub fn tls(&self, image: &[u8]) -> Option<TlsDir> {
+        let dir = self.data_dir(image, DIR_TLS)?;
+        let at = self.rva_to_file(image, dir.rva)?;
+        let rva = |off: usize| -> Option<u32> {
+            match read_u64(image, at + off)? {
+                0 => Some(0),
+                va => u32::try_from(va.checked_sub(self.image_base)?).ok(),
+            }
+        };
+        Some(TlsDir {
+            raw_start: rva(0)?,
+            raw_end: rva(8)?,
+            index: rva(16)?,
+            callbacks: rva(24)?,
+            zero_fill: read_u32(image, at + 32)?,
+        })
+    }
+
+    /// Walk the callbacks `dir` names.
+    pub fn tls_callbacks<'a>(&self, image: &'a [u8], dir: &TlsDir) -> TlsCallbacks<'a> {
+        TlsCallbacks {
+            pe: *self,
+            image,
+            at: (dir.callbacks != 0)
+                .then(|| self.rva_to_file(image, dir.callbacks))
+                .flatten(),
+        }
     }
 }
 

@@ -92,6 +92,10 @@ pub struct Loaded {
     /// Initial user stack pointer, or `0` when the personality defers stack
     /// setup to the kernel (e.g. an ELF aux vector built during exec).
     pub stack: u64,
+    /// Where the thread's own control block is, for an ABI that fixes it at
+    /// load - Windows places the TEB and points `gs` at it - or `0` for one
+    /// that sets its thread pointer itself once running, as ELF does.
+    pub thread_pointer: u64,
 }
 
 /// Load-time capabilities the kernel exposes to a personality.

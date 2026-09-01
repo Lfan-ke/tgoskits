@@ -278,9 +278,10 @@ fn prot_flags(prot: ax_binfmt::Prot) -> MappingFlags {
 }
 
 /// What loading an image leaves the caller: where execution starts, where
-/// the initial stack is, and the auxiliary vector the program reads its own
-/// layout from.
-type LoadedImage = (VirtAddr, VirtAddr, Vec<(usize, usize)>);
+/// the initial stack is, the auxiliary vector the program reads its own
+/// layout from, and the thread pointer a format fixed at load (zero for one
+/// that sets its own).
+type LoadedImage = (VirtAddr, VirtAddr, Vec<(usize, usize)>, u64);
 
 /// Load the user app to the user address space.
 ///
@@ -436,5 +437,10 @@ fn load_user_app_with_depth(
         0 => VirtAddr::from_usize(crate::config::USER_STACK_TOP),
         at => VirtAddr::from_usize(at as usize),
     };
-    Ok((VirtAddr::from_usize(loaded.entry as usize), sp, auxv))
+    Ok((
+        VirtAddr::from_usize(loaded.entry as usize),
+        sp,
+        auxv,
+        loaded.thread_pointer,
+    ))
 }
