@@ -134,6 +134,7 @@ impl PeInfo {
             pe: *self,
             image,
             descriptor: start,
+            iat: 0,
             thunk: 0,
             library: None,
         })
@@ -250,6 +251,10 @@ pub struct Import<'a> {
     pub library: &'a str,
     /// The symbol taken from it.
     pub symbol: ImportedSymbol<'a>,
+    /// Where this symbol's address table entry is, as an RVA. The name table
+    /// says what to resolve and this says where to put the answer; a loader
+    /// walks the two in step, as `import_dll` does.
+    pub thunk: u32,
 }
 
 /// Iterator over every symbol every imported library supplies.
@@ -263,6 +268,9 @@ pub struct Imports<'a> {
     thunk: usize,
     /// The library the current thunks belong to.
     library: Option<&'a str>,
+    /// RVA of the address table entry the next symbol answers to. It advances
+    /// with the name table even when the two are the same array.
+    iat: u32,
 }
 
 /// `IMAGE_IMPORT_DESCRIPTOR`: five 32-bit words, terminated by an all-zero one.
@@ -301,6 +309,7 @@ impl<'a> Iterator for Imports<'a> {
                     self.pe.rva_to_file(self.image, name_rva)?,
                 )?);
                 self.thunk = self.pe.rva_to_file(self.image, thunks)?;
+                self.iat = first_thunk;
                 continue;
             };
 
@@ -316,6 +325,8 @@ impl<'a> Iterator for Imports<'a> {
                 continue;
             }
             self.thunk += width;
+            let thunk = self.iat;
+            self.iat += width as u32;
 
             let ordinal = if self.pe.pe64 {
                 raw & IMPORT_ORDINAL_FLAG64 != 0
@@ -329,7 +340,11 @@ impl<'a> Iterator for Imports<'a> {
                 let at = self.pe.rva_to_file(self.image, raw as u32)?;
                 ImportedSymbol::Name(ascii_at(self.image, at + 2)?)
             };
-            return Some(Import { library, symbol });
+            return Some(Import {
+                library,
+                symbol,
+                thunk,
+            });
         }
     }
 }
@@ -762,13 +777,17 @@ mod tests {
         assert_eq!(
             imports,
             vec![
+                // FirstThunk is at RVA 0x1060, and each PE32+ entry is eight
+                // bytes, so the two symbols answer to consecutive slots.
                 Import {
                     library: "KERNEL32.dll",
                     symbol: ImportedSymbol::Name("WriteFile"),
+                    thunk: 0x1060,
                 },
                 Import {
                     library: "KERNEL32.dll",
                     symbol: ImportedSymbol::Ordinal(7),
+                    thunk: 0x1068,
                 },
             ]
         );
