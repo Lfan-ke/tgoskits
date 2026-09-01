@@ -101,13 +101,6 @@ pub trait LoadEnv {
     /// (the remainder is zero-filled, as `.bss` and PE uninitialized data need).
     fn map_region(&mut self, va: u64, len: u64, prot: Prot, init: Option<&[u8]>) -> AbiResult<()>;
 
-    /// Map `[va, va + len)` from `image` at `offset`, copy-on-write, with the
-    /// file's contribution ending at `file_end` and the rest zero-filled.
-    ///
-    /// The difference from [`map_region`](Self::map_region) is where the bytes
-    /// come from and when: this leaves them in the host's page cache and lets
-    /// them arrive on demand, which is what a format wants for a large image it
-    /// mostly does not touch. A host without demand paging may copy instead.
     /// Map `[va, va + len)` from the image being loaded, at `offset` in the
     /// file, copy-on-write, with the file's contribution ending at `file_end`
     /// and the rest zero-filled.
