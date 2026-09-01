@@ -116,6 +116,127 @@ impl PeInfo {
             page_rva: 0,
         })
     }
+
+    /// Walk the import directory, naming every library the image needs and what
+    /// it takes from each.
+    ///
+    /// A program that reaches the system through a library rather than through
+    /// the trap instruction says so here, so this is what tells a loader whether
+    /// an image can run with the packages present or is asking for a layer that
+    /// is not there yet. Mirrors `RtlImageDirectoryEntryToData` walking
+    /// `IMAGE_IMPORT_DESCRIPTOR` and the thunk arrays behind it.
+    pub fn imports<'a>(&self, image: &'a [u8]) -> Option<Imports<'a>> {
+        let dir = self.data_dir(image, DIR_IMPORT)?;
+        let start = self.rva_to_file(image, dir.rva)?;
+        Some(Imports {
+            pe: *self,
+            image,
+            descriptor: start,
+            thunk: 0,
+            library: None,
+        })
+    }
+}
+
+/// One thing an image takes from a library: a name, or an ordinal for an entry
+/// exported without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportedSymbol<'a> {
+    /// Imported by name, as `IMAGE_IMPORT_BY_NAME` spells it.
+    Name(&'a str),
+    /// Imported by ordinal (`IMAGE_ORDINAL_FLAG` set in the thunk).
+    Ordinal(u16),
+}
+
+/// One import: which library, and what is taken from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Import<'a> {
+    /// The library's name as the descriptor spells it, e.g. `KERNEL32.dll`.
+    pub library: &'a str,
+    /// The symbol taken from it.
+    pub symbol: ImportedSymbol<'a>,
+}
+
+/// Iterator over every symbol every imported library supplies.
+pub struct Imports<'a> {
+    pe: PeInfo,
+    image: &'a [u8],
+    /// File offset of the descriptor being walked.
+    descriptor: usize,
+    /// File offset of the next thunk within the current library, or 0 before a
+    /// library has been entered.
+    thunk: usize,
+    /// The library the current thunks belong to.
+    library: Option<&'a str>,
+}
+
+/// `IMAGE_IMPORT_DESCRIPTOR`: five 32-bit words, terminated by an all-zero one.
+const IMPORT_DESCRIPTOR_LEN: usize = 20;
+/// `IMAGE_ORDINAL_FLAG64`: the thunk names an ordinal rather than an RVA.
+const IMPORT_ORDINAL_FLAG64: u64 = 1 << 63;
+/// The same for PE32.
+const IMPORT_ORDINAL_FLAG32: u32 = 1 << 31;
+
+/// Read a NUL-terminated ASCII string at a file offset.
+fn ascii_at(image: &[u8], off: usize) -> Option<&str> {
+    let rest = image.get(off..)?;
+    let end = rest.iter().position(|b| *b == 0)?;
+    core::str::from_utf8(&rest[..end]).ok()
+}
+
+impl<'a> Iterator for Imports<'a> {
+    type Item = Import<'a>;
+
+    fn next(&mut self) -> Option<Import<'a>> {
+        loop {
+            // Enter the next library when the current one has no more thunks.
+            let Some(library) = self.library else {
+                let name_rva = read_u32(self.image, self.descriptor + 12)?;
+                let first_thunk = read_u32(self.image, self.descriptor + 16)?;
+                // An all-zero descriptor ends the table.
+                if name_rva == 0 && first_thunk == 0 {
+                    return None;
+                }
+                // The name table is preferred: it survives the loader writing
+                // resolved addresses over the address table.
+                let original = read_u32(self.image, self.descriptor)?;
+                let thunks = if original != 0 { original } else { first_thunk };
+                self.library = Some(ascii_at(
+                    self.image,
+                    self.pe.rva_to_file(self.image, name_rva)?,
+                )?);
+                self.thunk = self.pe.rva_to_file(self.image, thunks)?;
+                continue;
+            };
+
+            let (raw, width) = if self.pe.pe64 {
+                (read_u64(self.image, self.thunk)?, 8)
+            } else {
+                (u64::from(read_u32(self.image, self.thunk)?), 4)
+            };
+            if raw == 0 {
+                // End of this library's thunks; move to the next descriptor.
+                self.library = None;
+                self.descriptor += IMPORT_DESCRIPTOR_LEN;
+                continue;
+            }
+            self.thunk += width;
+
+            let ordinal = if self.pe.pe64 {
+                raw & IMPORT_ORDINAL_FLAG64 != 0
+            } else {
+                raw as u32 & IMPORT_ORDINAL_FLAG32 != 0
+            };
+            let symbol = if ordinal {
+                ImportedSymbol::Ordinal(raw as u16)
+            } else {
+                // IMAGE_IMPORT_BY_NAME: a 2-byte hint, then the name.
+                let at = self.pe.rva_to_file(self.image, raw as u32)?;
+                ImportedSymbol::Name(ascii_at(self.image, at + 2)?)
+            };
+            return Some(Import { library, symbol });
+        }
+    }
 }
 
 /// A data-directory entry: an RVA and byte size.
@@ -498,5 +619,72 @@ mod tests {
         let mut b = synth(0x1_4000_0000, 0x1000, 1, 3);
         b.truncate(0x84);
         assert_eq!(parse(&b), None);
+    }
+
+    /// A PE whose import directory names one library and takes two things from
+    /// it: one by name, one by ordinal.
+    fn synth_with_imports() -> Vec<u8> {
+        let mut b = synth(0x1_4000_0000, 0x1000, 3, 1);
+        // One section maps RVA 0x1000 onto file offset 0x400.
+        put_section(
+            &mut b,
+            0,
+            Section {
+                rva: 0x1000,
+                vsize: 0x200,
+                raw_ptr: 0x400,
+                raw_size: 0x200,
+                characteristics: SCN_MEM_READ,
+            },
+        );
+        put_data_dir(&mut b, DIR_IMPORT, 0x1000, 40);
+
+        // IMAGE_IMPORT_DESCRIPTOR at RVA 0x1000 (file 0x400).
+        b[0x400..0x404].copy_from_slice(&0x1040u32.to_le_bytes()); // OriginalFirstThunk
+        b[0x40C..0x410].copy_from_slice(&0x1080u32.to_le_bytes()); // Name
+        b[0x410..0x414].copy_from_slice(&0x1060u32.to_le_bytes()); // FirstThunk
+        // The next descriptor is left zeroed, which ends the table.
+
+        // Name table at RVA 0x1040 (file 0x440): one by-name, one by-ordinal.
+        b[0x440..0x448].copy_from_slice(&0x1090u64.to_le_bytes());
+        b[0x448..0x450].copy_from_slice(&(IMPORT_ORDINAL_FLAG64 | 7).to_le_bytes());
+        // A zero thunk ends this library's list.
+
+        b[0x480..0x48D].copy_from_slice(b"KERNEL32.dll\0");
+        // IMAGE_IMPORT_BY_NAME: a hint, then the name.
+        b[0x490..0x492].copy_from_slice(&0u16.to_le_bytes());
+        b[0x492..0x49C].copy_from_slice(b"WriteFile\0");
+        b
+    }
+
+    #[test]
+    fn walks_the_import_directory() {
+        let b = synth_with_imports();
+        let pe = parse(&b).expect("valid PE32+");
+
+        let imports: Vec<Import> = pe.imports(&b).expect("an import directory").collect();
+
+        assert_eq!(
+            imports,
+            vec![
+                Import {
+                    library: "KERNEL32.dll",
+                    symbol: ImportedSymbol::Name("WriteFile"),
+                },
+                Import {
+                    library: "KERNEL32.dll",
+                    symbol: ImportedSymbol::Ordinal(7),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_without_an_import_directory_has_no_imports() {
+        // The direct-syscall images this kernel runs today reach the system
+        // through the trap instruction, so they import nothing at all.
+        let b = synth(0x1_4000_0000, 0x1000, 1, 1);
+        let pe = parse(&b).expect("valid PE32+");
+        assert!(pe.imports(&b).is_none());
     }
 }
