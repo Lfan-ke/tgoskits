@@ -56,6 +56,37 @@ impl SysAbi for WindowsAbi {
 /// Map a parsed PE image into `env` at `load_base`, applying base relocations
 /// when that differs from the image's preferred base. Mirrors the map + fix-up
 /// sequence ntdll's loader performs (`LdrpMapDll` + `LdrRelocateImage`).
+/// Map the image's headers at its base, read-only, as Windows does: a program
+/// finds its NT headers by reading the DOS header at its own base, and a
+/// runtime does exactly that to walk the program's load configuration and
+/// tables. The mapping stops short of the first section, which begins on the
+/// next page in any image a linker produced.
+fn map_headers(
+    pe: &PeInfo,
+    image: &[u8],
+    load_base: u64,
+    from_file: bool,
+    env: &mut dyn LoadEnv,
+) -> AbiResult<()> {
+    let headers = u64::from(pe.size_of_headers(image).unwrap_or(0));
+    let first = pe
+        .sections(image)
+        .map(|sec| u64::from(sec.rva))
+        .min()
+        .unwrap_or(u64::MAX);
+    let len = page_up(headers).min(first);
+    if headers == 0 || len == 0 {
+        return Ok(());
+    }
+    let bytes = headers.min(len);
+    if from_file {
+        env.map_image(load_base, len, Prot::READ, 0, bytes)
+    } else {
+        let init = &image[..(bytes as usize).min(image.len())];
+        env.map_region(load_base, len, Prot::READ, Some(init))
+    }
+}
+
 /// Map every section of `image` at `load_base`, relocated for that base and
 /// with `binds` written into its address tables.
 ///
@@ -439,6 +470,9 @@ mod tests {
         b[OPT..OPT + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
         b[OPT + 16..OPT + 20].copy_from_slice(&entry_rva.to_le_bytes());
         b[OPT + 24..OPT + 32].copy_from_slice(&image_base.to_le_bytes());
+        // SizeOfHeaders: a linker always sets it, and the loader maps that much
+        // at the base; the sections here begin at 0x400 at the earliest.
+        b[OPT + 60..OPT + 64].copy_from_slice(&0x400u32.to_le_bytes());
         b[OPT + 68..OPT + 70].copy_from_slice(&1u16.to_le_bytes()); // NATIVE subsystem
         b[OPT + 108..OPT + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
         for (i, (s, data)) in sections.iter().enumerate() {
@@ -495,20 +529,26 @@ mod tests {
         // page after the program.
         let code_va = 0x1_4000_4000;
         assert_eq!(loaded.entry, code_va + startup_offset());
-        // Two sections, then the code page, the thread's three blocks, the
-        // module list, the parameters, and the heap.
-        assert_eq!(env.maps.len(), 9);
+        // The headers, two sections, then the code page, the thread's three
+        // blocks, the module list, the parameters, and the heap.
+        assert_eq!(env.maps.len(), 10);
 
+        // The headers sit at the base, readable, straight from the file.
         let (va, prot, _) = &env.maps[0];
+        assert_eq!(*va, 0x1_4000_0000);
+        assert_eq!(*prot, Prot::READ);
+        assert_eq!(env.from_file[0].0, 0);
+
+        let (va, prot, _) = &env.maps[1];
         assert_eq!(*va, 0x1_4000_1000);
         assert_eq!(*prot, Prot::READ | Prot::EXEC);
         // The section occupies its virtual size, of which only the raw range
         // comes from the file; the host zero-fills the tail.
-        assert_eq!(env.sizes[0], 0x2000);
-        let (off, end) = env.from_file[0];
+        assert_eq!(env.sizes[1], 0x2000);
+        let (off, end) = env.from_file[1];
         assert_eq!(end - off, 4);
 
-        let (va, prot, _) = &env.maps[1];
+        let (va, prot, _) = &env.maps[2];
         assert_eq!(*va, 0x1_4000_3000);
         assert_eq!(*prot, Prot::READ | Prot::WRITE);
     }
@@ -592,16 +632,17 @@ mod tests {
             .expect("load");
         // Four sections, then the code page, the thread's three blocks, the
         // module list, the parameters, and the heap.
-        assert_eq!(env.maps.len(), 11);
-        assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
-        assert_eq!(env.maps[1].1, Prot::READ);
-        assert_eq!(env.maps[2].1, Prot::READ | Prot::WRITE);
+        assert_eq!(env.maps.len(), 12);
+        assert_eq!(env.maps[0].1, Prot::READ, "the headers");
+        assert_eq!(env.maps[1].1, Prot::READ | Prot::EXEC);
+        assert_eq!(env.maps[2].1, Prot::READ);
+        assert_eq!(env.maps[3].1, Prot::READ | Prot::WRITE);
         // .bss occupies its virtual size with nothing coming from the file.
-        let (va, prot, _) = &env.maps[3];
+        let (va, prot, _) = &env.maps[4];
         assert_eq!(*va, 0x1_4000_4000);
         assert_eq!(*prot, Prot::READ | Prot::WRITE);
-        assert_eq!(env.sizes[3], 0x1000);
-        let (off, end) = env.from_file[3];
+        assert_eq!(env.sizes[4], 0x1000);
+        let (off, end) = env.from_file[4];
         assert_eq!(end, off);
     }
 
@@ -1068,6 +1109,26 @@ mod tests {
     }
 
     #[test]
+    fn every_module_has_its_headers_readable_at_its_base() {
+        let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
+        let dll = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/app/fake.dll".to_string(), dll)]),
+            ..RecordingEnv::default()
+        };
+        load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+        for base in [0x1_4000_0000u64, 0x1_4000_2000] {
+            let (_, prot, bytes) = env
+                .maps
+                .iter()
+                .find(|(va, ..)| *va == base)
+                .expect("headers at the base");
+            assert_eq!(*prot, Prot::READ);
+            assert_eq!(&bytes[..2], b"MZ", "the DOS header a program walks from");
+        }
+    }
+
+    #[test]
     fn a_library_that_cannot_be_found_is_refused_before_the_space_is_touched() {
         let exe = image_with_imports(&[(b"NOPE.dll\0", b"Hello\0")], 0x400);
         let mut env = RecordingEnv::default();
@@ -1196,10 +1257,9 @@ mod tests {
             u64::from_le_bytes(page[0x60..0x68].try_into().unwrap()),
             stubs_va + thunk::MODULE_HEADER as u64
         );
-        assert!(
-            env.from_file.is_empty(),
-            "nothing came straight from the file"
-        );
+        // Only the headers came straight from the file; the section holding
+        // the address table had to be rewritten first.
+        assert_eq!(env.from_file.len(), 1);
     }
 
     #[test]
@@ -1350,6 +1410,13 @@ impl ImageFormat for PeFormat {
         // from its own file.
         let alone = linked.modules.len() == 1;
         for (at, module) in linked.modules.iter().enumerate() {
+            map_headers(
+                &module.pe,
+                &module.bytes,
+                module.base,
+                alone && at == 0,
+                env,
+            )?;
             map_image(
                 &module.pe,
                 &module.bytes,

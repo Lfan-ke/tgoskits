@@ -730,6 +730,8 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "LoadLibraryExW" => runtime::load_library_ex(&mut c),
         "FreeLibrary" => runtime::free_library(&mut c),
         "GetModuleHandleExW" => runtime::get_module_handle_ex(&mut c),
+        // No thread here was converted to a fiber.
+        "IsThreadAFiber" => c.finish(FALSE),
         "CloseHandle" => {
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
