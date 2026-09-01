@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+pub mod dll;
 pub mod handle;
 pub mod nt;
 pub mod teb_peb;
@@ -54,11 +55,19 @@ impl SysAbi for WindowsAbi {
 /// Map a parsed PE image into `env` at `load_base`, applying base relocations
 /// when that differs from the image's preferred base. Mirrors the map + fix-up
 /// sequence ntdll's loader performs (`LdrpMapDll` + `LdrRelocateImage`).
+/// Map every section of `image` at `load_base`, relocated for that base and
+/// with `binds` written into its address tables.
+///
+/// `from_file` says the host still holds this very file as the image, so a
+/// section that needs no rewriting may be mapped from it and paged in as it is
+/// touched. Once a library has been read through the host, the program is no
+/// longer what it holds, and every section comes from memory instead.
 fn map_image(
     pe: &PeInfo,
     image: &[u8],
     load_base: u64,
     binds: &[(u32, u64)],
+    from_file: bool,
     env: &mut dyn LoadEnv,
 ) -> AbiResult<()> {
     let delta = load_base.wrapping_sub(pe.image_base);
@@ -73,7 +82,7 @@ fn map_image(
         let va = load_base + sec.rva as u64;
         let range = sec.rva..sec.rva + sec.vsize;
         let bound = binds.iter().any(|(rva, _)| range.contains(rva));
-        if delta == 0 && !bound {
+        if delta == 0 && !bound && from_file {
             // At its preferred base nothing is rewritten, so the section maps
             // from the file and its pages arrive as they are touched - the same
             // reason `binfmt_elf` uses `vm_mmap` for a `PT_LOAD`.
@@ -87,7 +96,8 @@ fn map_image(
             continue;
         }
         // A section that is rewritten - relocated, or holding an address
-        // table that was bound - cannot come straight from the page cache.
+        // table that was bound - cannot come straight from the page cache, and
+        // neither can one whose file the host no longer holds.
         let mut page = vec![0u8; sec.vsize as usize];
         if let Some(raw) = sec.raw_data(image) {
             let n = raw.len().min(page.len());
@@ -112,28 +122,9 @@ fn bind_section(page: &mut [u8], sec: &Section, binds: &[(u32, u64)]) -> AbiResu
     Ok(())
 }
 
-/// The whole file, when the host has more of it than the request carries;
-/// `None` when the request already holds all there is, so nothing is copied.
-fn read_whole(head: &[u8], env: &mut dyn LoadEnv) -> AbiResult<Option<Vec<u8>>> {
-    let len = env.image_len() as usize;
-    if len <= head.len() {
-        return Ok(None);
-    }
-    let mut whole = vec![0u8; len];
-    let mut got = 0;
-    while got < len {
-        match env.read_image(got as u64, &mut whole[got..])? {
-            0 => break,
-            n => got += n,
-        }
-    }
-    whole.truncate(got);
-    Ok(Some(whole))
-}
-
 /// Where the image ends, as an offset from its base: the first address free for
 /// anything the loader adds alongside it.
-fn image_extent(pe: &PeInfo, image: &[u8]) -> u64 {
+pub(crate) fn image_extent(pe: &PeInfo, image: &[u8]) -> u64 {
     pe.sections(image)
         .map(|sec| sec.rva as u64 + sec.vsize as u64)
         .max()
@@ -142,7 +133,7 @@ fn image_extent(pe: &PeInfo, image: &[u8]) -> u64 {
 
 const PAGE: u64 = 0x1000;
 
-fn page_up(at: u64) -> u64 {
+pub(crate) fn page_up(at: u64) -> u64 {
     at.div_ceil(PAGE) * PAGE
 }
 
@@ -176,6 +167,8 @@ fn section_prot(sec: &Section) -> Prot {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{collections::BTreeMap, string::ToString};
+
     use super::*;
 
     // Records every mapping a loader requests, so tests can assert on placement,
@@ -189,6 +182,9 @@ mod tests {
         /// The whole file, for a loader that reads past the head the request
         /// carries; empty means the request already has all there is.
         file: Vec<u8>,
+        /// Files a loader may ask for by path, as libraries beside the program
+        /// or in the system directory.
+        files: BTreeMap<String, Vec<u8>>,
     }
 
     impl LoadEnv for RecordingEnv {
@@ -231,6 +227,15 @@ mod tests {
         }
         fn image_len(&self) -> u64 {
             self.file.len() as u64
+        }
+        fn interpret(&mut self, path: &str) -> AbiResult<()> {
+            // The kernel swaps the file it holds and keeps everything mapped.
+            self.file = self
+                .files
+                .get(path)
+                .cloned()
+                .ok_or(AbiError::UnknownFormat)?;
+            Ok(())
         }
         fn reset(&mut self) -> AbiResult<()> {
             self.reset = true;
@@ -305,6 +310,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[],
@@ -351,7 +357,7 @@ mod tests {
         let pe = pe::parse(&img).unwrap();
         let new_base = 0x1_8000_0000u64;
         let mut env = RecordingEnv::default();
-        map_image(&pe, &img, new_base, &[], &mut env).expect("relocated load");
+        map_image(&pe, &img, new_base, &[], true, &mut env).expect("relocated load");
 
         // The pointer in .text now reads image_base_moved + 0x1000.
         let text_page = &env.maps[0].2;
@@ -367,7 +373,7 @@ mod tests {
         let mut env = RecordingEnv::default();
         // No reloc directory, but the base must move -> cannot relocate.
         assert_eq!(
-            map_image(&pe, &img, 0x1_8000_0000, &[], &mut env),
+            map_image(&pe, &img, 0x1_8000_0000, &[], true, &mut env),
             Err(AbiError::Unsupported)
         );
     }
@@ -398,6 +404,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[],
@@ -426,6 +433,7 @@ mod tests {
             PeFormat.load(
                 &LoadRequest {
                     image: b"not pe",
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[]
@@ -436,19 +444,103 @@ mod tests {
         );
     }
 
-    /// A section whose bytes are an import directory taking one `symbol` from
-    /// kernel32; the address table entry for it is at RVA 0x1060.
-    fn import_section(symbol: &[u8]) -> Vec<u8> {
+    /// An import directory at RVA 0x1000 taking one symbol from each library
+    /// in `entries`. Library `i` keeps its name table at `0x1040 + 0x60 * i`,
+    /// its address table at `0x1060 + 0x60 * i`, and its strings after those.
+    fn import_section_of(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut data = vec![0u8; 0x200];
-        // IMAGE_IMPORT_DESCRIPTOR at the section's start (RVA 0x1000).
-        data[0x00..0x04].copy_from_slice(&0x1040u32.to_le_bytes()); // OriginalFirstThunk
-        data[0x0C..0x10].copy_from_slice(&0x1080u32.to_le_bytes()); // Name
-        data[0x10..0x14].copy_from_slice(&0x1060u32.to_le_bytes()); // FirstThunk
-        // The descriptor after it stays zeroed, which ends the table.
-        data[0x40..0x48].copy_from_slice(&0x1090u64.to_le_bytes()); // one by-name thunk
-        data[0x80..0x8D].copy_from_slice(b"KERNEL32.dll\0");
-        data[0x92..0x92 + symbol.len()].copy_from_slice(symbol);
+        for (i, (library, symbol)) in entries.iter().enumerate() {
+            let (desc, block) = (i * 20, 0x40 + i * 0x60);
+            let (names, addrs, lib, sym) = (block, block + 0x20, block + 0x40, block + 0x50);
+            data[desc..desc + 4].copy_from_slice(&(0x1000 + names as u32).to_le_bytes());
+            data[desc + 12..desc + 16].copy_from_slice(&(0x1000 + lib as u32).to_le_bytes());
+            data[desc + 16..desc + 20].copy_from_slice(&(0x1000 + addrs as u32).to_le_bytes());
+            data[names..names + 8].copy_from_slice(&(0x1000 + sym as u64).to_le_bytes());
+            data[lib..lib + library.len()].copy_from_slice(library);
+            // IMAGE_IMPORT_BY_NAME: a two-byte hint, then the name.
+            data[sym + 2..sym + 2 + symbol.len()].copy_from_slice(symbol);
+        }
+        // The descriptor after the last stays zeroed, which ends the table.
         data
+    }
+
+    /// An export directory at RVA 0x1000 naming one `symbol`, which leads to
+    /// `target`: an RVA in the image, or a forwarder string.
+    fn export_section(symbol: &[u8], target: Result<u32, &[u8]>) -> Vec<u8> {
+        let mut data = vec![0u8; 0x100];
+        data[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // Base
+        data[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // NumberOfFunctions
+        data[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes()); // NumberOfNames
+        data[0x1C..0x20].copy_from_slice(&0x1040u32.to_le_bytes()); // AddressOfFunctions
+        data[0x20..0x24].copy_from_slice(&0x1050u32.to_le_bytes()); // AddressOfNames
+        data[0x24..0x28].copy_from_slice(&0x1060u32.to_le_bytes()); // AddressOfNameOrdinals
+        data[0x50..0x54].copy_from_slice(&0x1070u32.to_le_bytes()); // names[0]
+        data[0x70..0x70 + symbol.len()].copy_from_slice(symbol);
+        match target {
+            Ok(rva) => data[0x40..0x44].copy_from_slice(&rva.to_le_bytes()),
+            Err(forwarder) => {
+                // An address inside the directory is what marks a forwarder.
+                data[0x40..0x44].copy_from_slice(&0x1090u32.to_le_bytes());
+                data[0x90..0x90 + forwarder.len()].copy_from_slice(forwarder);
+            }
+        }
+        data
+    }
+
+    /// A library preferring base `0x1_8000_0000`, exporting `exports`, whose
+    /// code section holds one absolute pointer with a relocation for it - as a
+    /// real library carries, since it is never placed where it asked to be.
+    /// It spans 0x4000, so the next module lands 0x4000 past its base.
+    fn dll_image(exports: &[u8]) -> Vec<u8> {
+        let ptr = (0x1_8000_0000u64 + 0x2000).to_le_bytes();
+        let mut reloc = Vec::new();
+        reloc.extend_from_slice(&0x2000u32.to_le_bytes());
+        reloc.extend_from_slice(&(8u32 + 2).to_le_bytes());
+        reloc.extend_from_slice(&(pe::REL_DIR64 << 12).to_le_bytes());
+        let mut img = synth(
+            0x1_8000_0000,
+            0x2000,
+            &[
+                (sect(0x1000, 0x100, 0x100, 0x400, RX), exports),
+                (sect(0x2000, 0x1000, 8, 0x600, RX), &ptr),
+                (
+                    sect(0x3000, 0x1000, reloc.len() as u32, 0x800, 0x4000_0000),
+                    &reloc,
+                ),
+            ],
+        );
+        let dd = OPT + 112 + pe::DIR_EXPORT * 8;
+        img[dd..dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[dd + 4..dd + 8].copy_from_slice(&0x100u32.to_le_bytes());
+        let dd = OPT + 112 + pe::DIR_BASERELOC * 8;
+        img[dd..dd + 4].copy_from_slice(&0x3000u32.to_le_bytes());
+        img[dd + 4..dd + 8].copy_from_slice(&(reloc.len() as u32).to_le_bytes());
+        img
+    }
+
+    /// The address table slot of library `i` in an image built by
+    /// `image_with_imports`, read out of its mapped import section.
+    fn slot_of(env: &RecordingEnv, i: usize) -> u64 {
+        let (_, _, page) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == 0x1_4000_1000)
+            .expect("the import section was rewritten");
+        let at = 0x60 + 0x60 * i;
+        u64::from_le_bytes(page[at..at + 8].try_into().unwrap())
+    }
+
+    fn load_at(img: &[u8], path: &str, env: &mut RecordingEnv) -> AbiResult<Loaded> {
+        PeFormat.load(
+            &LoadRequest {
+                image: img,
+                path,
+                load_base: 0,
+                args: &[],
+                envs: &[],
+            },
+            env,
+        )
     }
 
     /// An image whose only section is `import_section(symbol)`, with the import
@@ -459,7 +551,14 @@ mod tests {
 
     /// The same, with the section's bytes at file offset `raw`.
     fn image_importing_at(symbol: &[u8], raw: u32) -> Vec<u8> {
-        let data = import_section(symbol);
+        image_with_imports(&[(b"KERNEL32.dll\0", symbol)], raw)
+    }
+
+    /// A program at base `0x1_4000_0000` whose only section, at file offset
+    /// `raw`, is `import_section_of(entries)`. It spans one page, so the next
+    /// module lands at `0x1_4000_2000`.
+    fn image_with_imports(entries: &[(&[u8], &[u8])], raw: u32) -> Vec<u8> {
+        let data = import_section_of(entries);
         let mut img = synth(
             0x1_4000_0000,
             0x1000,
@@ -467,8 +566,123 @@ mod tests {
         );
         let dir = OPT + 112 + pe::DIR_IMPORT * 8;
         img[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
-        img[dir + 4..dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        img[dir + 4..dir + 8].copy_from_slice(&((entries.len() as u32 + 1) * 20).to_le_bytes());
         img
+    }
+
+    #[test]
+    fn links_a_library_beside_the_program_and_binds_to_its_export() {
+        let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
+        let dll = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/app/fake.dll".to_string(), dll)]),
+            ..RecordingEnv::default()
+        };
+
+        let loaded = load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+        assert_eq!(loaded.entry, 0x1_4000_1000, "the program's own entry");
+
+        // The library lands on the page after the program, and the program's
+        // address table now leads to the export inside it.
+        let dll_base = 0x1_4000_2000u64;
+        assert_eq!(slot_of(&env, 0), dll_base + 0x2000);
+        // Its code was relocated for the base it got, not the one it asked for.
+        let (_, prot, code) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == dll_base + 0x2000)
+            .expect("the library's code section is mapped");
+        assert_eq!(*prot, Prot::READ | Prot::EXEC);
+        assert_eq!(
+            u64::from_le_bytes(code[..8].try_into().unwrap()),
+            dll_base + 0x2000
+        );
+        // Nothing here imports from the system, so no stubs were made.
+        assert!(!env.maps.iter().any(|(va, ..)| *va == dll_base + 0x4000));
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_found_is_refused_before_the_space_is_touched() {
+        let exe = image_with_imports(&[(b"NOPE.dll\0", b"Hello\0")], 0x400);
+        let mut env = RecordingEnv::default();
+
+        let err = load_at(&exe, "/app/prog.exe", &mut env).expect_err("nothing to link against");
+
+        assert_eq!(err, AbiError::MissingLibrary);
+        assert!(!env.reset, "the caller keeps the space it had");
+        assert!(env.maps.is_empty());
+    }
+
+    #[test]
+    fn follows_a_forwarder_into_a_library_the_program_never_named() {
+        // A forwards Hello to B; the program only knows about A.
+        let exe = image_with_imports(&[(b"A.dll\0", b"Hello\0")], 0x400);
+        let a = dll_image(&export_section(b"Hello\0", Err(b"B.Hello\0")));
+        let b = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/app/a.dll".to_string(), a), ("/app/b.dll".to_string(), b)]),
+            ..RecordingEnv::default()
+        };
+
+        load_at(&exe, "/app/prog.exe", &mut env).expect("linked through the forwarder");
+
+        // A is placed first, B after it, and the slot leads into B.
+        let b_base = 0x1_4000_2000u64 + 0x4000;
+        assert_eq!(slot_of(&env, 0), b_base + 0x2000);
+    }
+
+    #[test]
+    fn a_library_beside_the_program_wins_over_the_system_one() {
+        let exe = image_with_imports(&[(b"FAKE.dll\0", b"Hello\0")], 0x400);
+        let beside = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
+        let system = dll_image(&export_section(b"Hello\0", Ok(0x2008)));
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([
+                ("/app/fake.dll".to_string(), beside),
+                ("/windows/system32/fake.dll".to_string(), system),
+            ]),
+            ..RecordingEnv::default()
+        };
+
+        load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+
+        assert_eq!(
+            slot_of(&env, 0),
+            0x1_4000_2000 + 0x2000,
+            "the one beside the program"
+        );
+    }
+
+    #[test]
+    fn stubs_land_past_the_last_module() {
+        let exe = image_with_imports(
+            &[
+                (b"FAKE.dll\0", b"Hello\0"),
+                (b"KERNEL32.dll\0", b"WriteFile\0"),
+            ],
+            0x400,
+        );
+        let dll = dll_image(&export_section(b"Hello\0", Ok(0x2000)));
+        let mut env = RecordingEnv {
+            files: BTreeMap::from([("/windows/system32/fake.dll".to_string(), dll)]),
+            ..RecordingEnv::default()
+        };
+
+        load_at(&exe, "/app/prog.exe", &mut env).expect("linked");
+
+        // Program, then the library, then the stubs on the page after it.
+        let stubs_va = 0x1_4000_2000u64 + 0x4000;
+        assert_eq!(slot_of(&env, 1), stubs_va);
+        let (_, prot, code) = env
+            .maps
+            .iter()
+            .find(|(va, ..)| *va == stubs_va)
+            .expect("a stub region past the last module");
+        assert_eq!(*prot, Prot::READ | Prot::EXEC);
+        assert_eq!(
+            &code[..thunk::STUB_LEN],
+            &thunk::stub(crate::win32::Win32Call::WriteFile)
+        );
     }
 
     #[test]
@@ -481,6 +695,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[],
@@ -534,6 +749,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img[..0x1000],
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[],
@@ -570,6 +786,7 @@ mod tests {
             .load(
                 &LoadRequest {
                     image: &img,
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[],
@@ -605,32 +822,46 @@ impl ImageFormat for PeFormat {
         // headers and nothing else: a real image keeps its import directory
         // and its relocations in sections well past the first page. The rest
         // is read through the host, the way an ELF loader reads its segments.
-        let whole = read_whole(req.image, env)?;
-        let image: &[u8] = whole.as_deref().unwrap_or(req.image);
-        // Honor the image's preferred base, so a well-formed image needs no
-        // relocation; relocation is exercised only when the base must change.
-        let base = pe.image_base;
-        // The stubs go on the page after the image, where an import binds to
-        // an address the image's own relocations never move.
-        let stubs_va = page_up(base + image_extent(&pe, image));
-        // Bound before anything is mapped, so an import this package cannot
-        // serve is refused while the caller still has the space it came with.
-        let thunks = thunk::bind(&pe, image, stubs_va)?;
+        let all = dll::read_all(env)?;
+        let bytes = if all.len() > req.image.len() {
+            all
+        } else {
+            req.image.to_vec()
+        };
+        // Every library is reached and every import resolved before anything
+        // is mapped, so a program that cannot be completed is refused while
+        // the caller still has the space it came with. The program keeps its
+        // preferred base; libraries follow it, each relocated to where it lands.
+        let linked = dll::link(pe, bytes, req.path, env)?;
         // The image is this package's from here, so the space it goes into is
         // torn down and prepared. Doing it after the checks is what lets a
         // malformed image be refused without destroying the caller's.
         env.reset()?;
-        map_image(&pe, image, base, &thunks.binds, env)?;
-        if !thunks.code.is_empty() {
-            env.map_region(
-                stubs_va,
-                page_up(thunks.code.len() as u64),
-                Prot::READ | Prot::EXEC,
-                Some(&thunks.code),
+        // Reading a library through the host replaced the program as the file
+        // it holds, so only a program that reached none can still be paged in
+        // from its own file.
+        let alone = linked.modules.len() == 1;
+        for (at, module) in linked.modules.iter().enumerate() {
+            map_image(
+                &module.pe,
+                &module.bytes,
+                module.base,
+                &module.binds,
+                alone && at == 0,
+                env,
             )?;
         }
+        if !linked.stubs.is_empty() {
+            env.map_region(
+                linked.stubs_va,
+                page_up(linked.stubs.len() as u64),
+                Prot::READ | Prot::EXEC,
+                Some(&linked.stubs),
+            )?;
+        }
+        let program = &linked.modules[0];
         Ok(Loaded {
-            entry: base + pe.entry_rva as u64,
+            entry: program.base + program.pe.entry_rva as u64,
             stack: 0,
         })
     }

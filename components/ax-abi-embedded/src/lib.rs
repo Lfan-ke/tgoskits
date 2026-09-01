@@ -280,6 +280,7 @@ mod tests {
         let image = [0x90u8; 64];
         let req = LoadRequest {
             image: &image,
+            path: "",
             load_base: 0,
             args: &[],
             envs: &[],
@@ -298,6 +299,7 @@ mod tests {
             TABLE.load(
                 &LoadRequest {
                     image: &[],
+                    path: "",
                     load_base: 0,
                     args: &[],
                     envs: &[]

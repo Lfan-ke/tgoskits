@@ -392,6 +392,7 @@ fn load_user_app_with_depth(
         .load(
             &ax_binfmt::LoadRequest {
                 image: &head,
+                path,
                 load_base: crate::config::USER_SPACE_BASE as u64,
                 args: &arg_refs,
                 envs: &env_refs,
