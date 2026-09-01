@@ -42,6 +42,11 @@ pub enum AbiError {
     /// Mapping the image into the target address space failed (`ENOMEM`).
     #[error("mapping user memory failed")]
     MapFailed,
+    /// The image reaches the system through a library this system does not
+    /// provide, so mapping it would only defer the failure to its first call
+    /// into an unresolved address (`ENOEXEC`).
+    #[error("image imports a library this system does not provide")]
+    MissingLibrary,
 }
 
 /// Result type for personality operations.
