@@ -608,3 +608,59 @@ pub fn get_file_attributes_w(c: &mut Call<'_>) -> Dispatch {
         Err(errno) => c.fail_status(nt::status_from_errno(errno), INVALID_FILE_ATTRIBUTES),
     }
 }
+
+/// GetFileInformationByHandleEx(hFile, class, info, size): the classes a
+/// runtime reads about an open file - basic, standard and attribute-tag - out
+/// of what the host describes. A class this does not answer says so, as Wine's
+/// unimplemented ones do, rather than leave the caller a filled-looking buffer.
+pub fn get_file_information_by_handle_ex(c: &mut Call<'_>) -> Dispatch {
+    const FILE_BASIC_INFO: usize = 0;
+    const FILE_STANDARD_INFO: usize = 1;
+    const FILE_ATTRIBUTE_TAG_INFO: usize = 9;
+    let (handle, class, info) = (c.arg(0), c.arg(1), c.arg(2));
+    let (Ok(fd), Some(paths)) = (descriptor(handle), c.host.paths()) else {
+        return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
+    };
+    let attr = match paths.attributes_of(fd) {
+        Ok(attr) => attr,
+        Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
+    };
+    let attributes = nt::file_attributes(&attr);
+    let ok = match class {
+        FILE_BASIC_INFO => {
+            // FILE_BASIC_INFO: four times, then the attribute word.
+            let mut buf = [0u8; 40];
+            buf[..8].copy_from_slice(&file_time(attr.changed_ns));
+            buf[8..16].copy_from_slice(&file_time(attr.accessed_ns));
+            buf[16..24].copy_from_slice(&file_time(attr.modified_ns));
+            buf[24..32].copy_from_slice(&file_time(attr.changed_ns));
+            buf[32..36].copy_from_slice(&attributes.to_le_bytes());
+            c.write(info, &buf)
+        }
+        FILE_STANDARD_INFO => {
+            // AllocationSize, EndOfFile, NumberOfLinks, DeletePending, Directory.
+            let mut buf = [0u8; 24];
+            buf[..8].copy_from_slice(&attr.size.to_le_bytes());
+            buf[8..16].copy_from_slice(&attr.size.to_le_bytes());
+            buf[16..20].copy_from_slice(&(attr.links as u32).to_le_bytes());
+            buf[21] = u8::from(attr.kind == NodeKind::Directory);
+            c.write(info, &buf)
+        }
+        FILE_ATTRIBUTE_TAG_INFO => {
+            let mut buf = [0u8; 8];
+            buf[..4].copy_from_slice(&attributes.to_le_bytes());
+            c.write(info, &buf)
+        }
+        _ => {
+            c.host.platform().trace(&alloc::format!(
+                "GetFileInformationByHandleEx class {class} is not implemented"
+            ));
+            return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+        }
+    };
+    if ok {
+        c.finish(TRUE)
+    } else {
+        c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE)
+    }
+}

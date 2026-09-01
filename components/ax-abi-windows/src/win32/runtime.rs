@@ -328,6 +328,12 @@ fn module_named(c: &Call<'_>, name: &str) -> Option<usize> {
 /// LoadLibraryExW(lpLibFileName, hFile, dwFlags): a library already in the
 /// process, or the system library for a name that means it. Loading a file
 /// the process has not got yet is not done from a trap here.
+/// LoadLibraryW(lpLibFileName): LoadLibraryExW with no file handle and no
+/// flags; the name is the only argument that matters.
+pub fn load_library_ex_w(c: &mut Call<'_>) -> Dispatch {
+    load_library_ex(c)
+}
+
 pub fn load_library_ex(c: &mut Call<'_>) -> Dispatch {
     let name = c.arg(0);
     if name == 0 {
@@ -668,6 +674,32 @@ pub fn reg_close_key(c: &mut Call<'_>) -> Dispatch {
 
 pub fn reg_not_found(c: &mut Call<'_>) -> Dispatch {
     c.finish(ERROR_FILE_NOT_FOUND)
+}
+
+/// GetTimeZoneInformation(lpTimeZoneInformation): the process runs in UTC, so
+/// the bias is zero and the names are empty. Returns TIME_ZONE_ID_UNKNOWN.
+pub fn get_time_zone_information(c: &mut Call<'_>) -> Dispatch {
+    const TIME_ZONE_ID_UNKNOWN: usize = 0;
+    // TIME_ZONE_INFORMATION is 172 bytes: a LONG bias, two 32-wide-char names
+    // with a SYSTEMTIME and a bias each. All zero is UTC with no seasonal
+    // change, which is what a clock in UTC reports.
+    let zeroed = [0u8; 172];
+    if c.arg(0) != 0 {
+        c.write(c.arg(0), &zeroed);
+    }
+    c.finish(TIME_ZONE_ID_UNKNOWN)
+}
+
+/// CreateWaitableTimerExW(...): a handle a program can hold and later wait on.
+/// Nothing arms or fires it yet; it is a distinct object so the program's
+/// bookkeeping is consistent, and a wait on it is what would need a scheduler.
+pub fn create_waitable_timer(c: &mut Call<'_>) -> Dispatch {
+    // A pseudo-handle distinct from the standard ones and from NULL. Reusing
+    // the current-thread pseudo-handle space above what descriptors occupy
+    // keeps it clear of a real file handle.
+    const TIMER: usize = 0xF000_0000;
+    let _ = c;
+    c.finish(TIMER)
 }
 
 #[cfg(test)]
