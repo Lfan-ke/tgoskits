@@ -567,6 +567,109 @@ pub fn get_environment_variable_a(c: &mut Call<'_>) -> Dispatch {
     }
 }
 
+/// GetSystemInfo(lpSystemInfo): SYSTEM_INFO for a single-processor AMD64
+/// machine, as `fill_system_info` lays it out (`winbase.h`).
+pub fn get_system_info(c: &mut Call<'_>) -> Dispatch {
+    const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
+    let at = c.arg(0);
+    let mut info = [0u8; 48];
+    info[0..2].copy_from_slice(&PROCESSOR_ARCHITECTURE_AMD64.to_le_bytes());
+    info[4..8].copy_from_slice(&0x1000u32.to_le_bytes()); // dwPageSize
+    info[8..16].copy_from_slice(&0x1_0000u64.to_le_bytes()); // lpMinimumApplicationAddress
+    info[16..24].copy_from_slice(&0x7FFF_FFFE_FFFFu64.to_le_bytes()); // lpMaximumApplicationAddress
+    info[24..32].copy_from_slice(&1u64.to_le_bytes()); // dwActiveProcessorMask
+    info[32..36].copy_from_slice(&1u32.to_le_bytes()); // dwNumberOfProcessors
+    info[40..44].copy_from_slice(&0x1_0000u32.to_le_bytes()); // dwAllocationGranularity
+    info[44..46].copy_from_slice(&6u16.to_le_bytes()); // wProcessorLevel
+    if !c.write(at, &info) {
+        return c.finish(0);
+    }
+    c.finish(0)
+}
+
+/// LocalFree(hMem): a block from the local heap goes back; nothing is tracked
+/// there yet, so this only reports success by returning NULL.
+pub fn local_free(_c: &mut Call<'_>) -> Dispatch {
+    _c.finish(0)
+}
+
+/// LoadLibraryA(lpLibFileName): the ANSI form of LoadLibraryExW; the name is
+/// ASCII where a system library's is, which is all this loads.
+pub fn load_library_a(c: &mut Call<'_>) -> Dispatch {
+    let Some(bytes) = c.read_cstr(c.arg(0)).map(|mut v| {
+        v.pop();
+        v
+    }) else {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    };
+    let text = alloc::string::String::from_utf8_lossy(&bytes);
+    let stem = text.rsplit(['\\', '/']).next().unwrap_or(&text);
+    match module_named(c, stem) {
+        Some(base) => c.finish(base),
+        None => {
+            c.host.platform().trace(&alloc::format!(
+                "LoadLibraryA: {text} is not loaded and cannot be loaded here"
+            ));
+            c.fail(ERROR_MOD_NOT_FOUND, 0)
+        }
+    }
+}
+
+/// BCryptGenRandom(hAlgorithm, pbBuffer, cbBuffer, dwFlags): fill the buffer
+/// from the host's random source.
+pub fn bcrypt_gen_random(c: &mut Call<'_>) -> Dispatch {
+    const STATUS_INVALID_HANDLE: usize = 0xC000_0008;
+    const STATUS_SUCCESS: usize = 0;
+    let (buffer, len) = (c.arg(1), c.arg(2));
+    let Some(random) = c.host.random() else {
+        return c.finish(STATUS_INVALID_HANDLE);
+    };
+    match random.fill(buffer, len, false) {
+        Ok(_) => c.finish(STATUS_SUCCESS),
+        Err(_) => c.finish(STATUS_INVALID_HANDLE),
+    }
+}
+
+/// FormatMessageW(dwFlags, ...): the message text for a system error. There is
+/// no message table here, so nothing is written and zero characters are
+/// reported, which a caller treats as "no text for this code".
+pub fn format_message_w(c: &mut Call<'_>) -> Dispatch {
+    const FORMAT_MESSAGE_ALLOCATE_BUFFER: u32 = 0x100;
+    let (flags, out) = (c.arg(0) as u32, c.arg(4));
+    // With ALLOCATE_BUFFER the out argument is a pointer to a pointer, which
+    // is set to null since nothing was allocated.
+    if flags & FORMAT_MESSAGE_ALLOCATE_BUFFER != 0 && out != 0 {
+        c.write_u64(out, 0);
+    } else if out != 0 {
+        c.write(out, &[0, 0]);
+    }
+    c.finish(0)
+}
+
+// Registry: there is no registry, so opening any key fails with the code that
+// makes a caller fall back - CPython computes its paths relatively when the
+// install key is absent - and closing one always succeeds. LSTATUS is the
+// return value itself, not the last error.
+const ERROR_FILE_NOT_FOUND: usize = 2;
+const ERROR_SUCCESS: usize = 0;
+
+pub fn reg_open_key(c: &mut Call<'_>) -> Dispatch {
+    // The out handle, when the call takes one, is cleared.
+    let out = c.arg(4);
+    if out != 0 {
+        c.write_u64(out, 0);
+    }
+    c.finish(ERROR_FILE_NOT_FOUND)
+}
+
+pub fn reg_close_key(c: &mut Call<'_>) -> Dispatch {
+    c.finish(ERROR_SUCCESS)
+}
+
+pub fn reg_not_found(c: &mut Call<'_>) -> Dispatch {
+    c.finish(ERROR_FILE_NOT_FOUND)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

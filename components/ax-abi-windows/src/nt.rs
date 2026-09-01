@@ -2841,4 +2841,67 @@ mod tests {
         win32::dispatch(&mut err, &host);
         assert_eq!(err.result, Some(203), "ERROR_ENVVAR_NOT_FOUND");
     }
+
+    #[test]
+    fn getpath_helpers_parse_and_describe_windows_paths() {
+        use crate::win32;
+        let host = MockHost {
+            describes: Some(node(NodeKind::File, 0)),
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+
+        // PathCchSkipRoot on Z:\python\lib points just past the drive root.
+        put_wide(&host, 0x7000, "Z:\\python\\lib\0");
+        let mut skip = call("PathCchSkipRoot", [0x7000, 0x7200, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut skip, &host);
+        assert_eq!(skip.result, Some(0), "S_OK");
+        let past = u64::from_le_bytes(host.mem.borrow()[0x7200..0x7208].try_into().unwrap());
+        assert_eq!(past, 0x7000 + 3 * 2, "one past the drive root");
+
+        // PathCchCombineEx joins and folds "..".
+        put_wide(&host, 0x7300, "Z:\\python\0");
+        put_wide(&host, 0x7400, "lib\\..\\DLLs\0");
+        let mut comb = call("PathCchCombineEx", [0x7500, 64, 0x7300, 0x7400, 0, 0], teb);
+        win32::dispatch(&mut comb, &host);
+        assert_eq!(comb.result, Some(0));
+        assert_eq!(wide_at(&host, 0x7500), "Z:\\python\\DLLs");
+
+        // GetFileAttributesW describes a name; a normal file is 0x80.
+        put_wide(&host, 0x7600, "Z:\\python\\python.exe\0");
+        let mut attr = call("GetFileAttributesW", [0x7600, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut attr, &host);
+        assert_eq!(attr.result, Some(0x80));
+
+        // GetSystemInfo fills an AMD64, single-processor block.
+        let mut si = call("GetSystemInfo", [0x7700, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut si, &host);
+        let mem = host.mem.borrow();
+        assert_eq!(
+            u16::from_le_bytes(mem[0x7700..0x7702].try_into().unwrap()),
+            9,
+            "AMD64"
+        );
+        assert_eq!(
+            u32::from_le_bytes(mem[0x7704..0x7708].try_into().unwrap()),
+            0x1000,
+            "page size"
+        );
+        assert_eq!(
+            u32::from_le_bytes(mem[0x7720..0x7724].try_into().unwrap()),
+            1,
+            "one processor"
+        );
+        drop(mem);
+
+        // A registry key nothing provides is not found, so a caller falls back.
+        let mut reg = call("RegOpenKeyExW", [0x8000_0002, 0x7000, 0, 0, 0x7800, 0], teb);
+        win32::dispatch(&mut reg, &host);
+        assert_eq!(reg.result, Some(2), "ERROR_FILE_NOT_FOUND");
+        assert_eq!(
+            u64::from_le_bytes(host.mem.borrow()[0x7800..0x7808].try_into().unwrap()),
+            0
+        );
+    }
 }

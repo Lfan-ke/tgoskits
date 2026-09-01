@@ -270,13 +270,38 @@ pub fn get_string_type(c: &mut Call<'_>) -> Dispatch {
 /// upper and lower case, one unit to one unit, which is all a runtime asks of
 /// the invariant locale at startup.
 pub fn lc_map_string(c: &mut Call<'_>) -> Dispatch {
-    let (flags, src, srclen, dst, dstlen) = (
+    lc_map(
+        c,
         c.arg(1) as u32,
         c.arg(2),
         c.arg(3) as i32,
         c.arg(4),
         c.arg(5) as i32,
-    );
+    )
+}
+
+/// LCMapStringEx(locale, flags, src, srclen, dst, dstlen, ...): the same
+/// mapping, with the locale named rather than an LCID; the arguments are
+/// shifted by one.
+pub fn lc_map_string_ex(c: &mut Call<'_>) -> Dispatch {
+    lc_map(
+        c,
+        c.arg(1) as u32,
+        c.arg(2),
+        c.arg(3) as i32,
+        c.arg(4),
+        c.arg(5) as i32,
+    )
+}
+
+fn lc_map(
+    c: &mut Call<'_>,
+    flags: u32,
+    src: usize,
+    srclen: i32,
+    dst: usize,
+    dstlen: i32,
+) -> Dispatch {
     let casing = flags & !LCMAP_LINGUISTIC_CASING;
     if casing != LCMAP_UPPERCASE && casing != LCMAP_LOWERCASE {
         return c.fail(ERROR_INVALID_FLAGS, 0);
@@ -386,4 +411,60 @@ mod tests {
         assert_eq!(ctype1(u16::from(b'\n')), C1_DEFINED | C1_SPACE | C1_CNTRL);
         assert_eq!(ctype1(u16::from(b'!')), C1_DEFINED | C1_PUNCT);
     }
+}
+
+// The few LCTYPEs a C runtime reads at startup, answered for en-US
+// (`winnls.h`); anything else is an empty string, which a caller treats as
+// "not available" rather than a failure.
+const LOCALE_ILANGUAGE: u32 = 0x1;
+const LOCALE_SLANGUAGE: u32 = 0x2;
+const LOCALE_SISO639LANGNAME: u32 = 0x59;
+const LOCALE_SISO3166CTRYNAME: u32 = 0x5A;
+const LOCALE_IDEFAULTANSICODEPAGE: u32 = 0x1004;
+const LOCALE_IDEFAULTCODEPAGE: u32 = 0xB;
+const LOCALE_SNAME: u32 = 0x5C;
+const LOCALE_RETURN_NUMBER: u32 = 0x2000_0000;
+
+/// GetLocaleInfoW(lcid, lctype, buffer, len): a short answer for the locale
+/// this process runs as. `len` of zero asks for the length needed.
+pub fn get_locale_info_w(c: &mut Call<'_>) -> Dispatch {
+    let (lctype, buffer, len) = (c.arg(1) as u32, c.arg(2), c.arg(3) as i32);
+    if len < 0 {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    // LOCALE_RETURN_NUMBER wants the value as a DWORD in the buffer, not text.
+    if lctype & LOCALE_RETURN_NUMBER != 0 {
+        let value: u32 = match lctype & !LOCALE_RETURN_NUMBER {
+            LOCALE_IDEFAULTANSICODEPAGE | LOCALE_IDEFAULTCODEPAGE => ACP,
+            LOCALE_ILANGUAGE => USER_LCID,
+            _ => 0,
+        };
+        if len < 2 {
+            return c.finish(2);
+        }
+        if !c.write(buffer, &value.to_le_bytes()) {
+            return c.fail(ERROR_INVALID_PARAMETER, 0);
+        }
+        return c.finish(2);
+    }
+    let text = match lctype & 0xFFFF {
+        LOCALE_SISO639LANGNAME => "en",
+        LOCALE_SISO3166CTRYNAME => "US",
+        LOCALE_SNAME => "en-US",
+        LOCALE_SLANGUAGE => "English (United States)",
+        _ => "",
+    };
+    let units: alloc::vec::Vec<u16> = text.encode_utf16().collect();
+    if len == 0 {
+        return c.finish(units.len() + 1);
+    }
+    if units.len() + 1 > len as usize {
+        return c.fail(ERROR_INSUFFICIENT_BUFFER, 0);
+    }
+    let mut out: alloc::vec::Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    out.extend_from_slice(&[0, 0]);
+    if !c.write(buffer, &out) {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    c.finish(units.len() + 1)
 }

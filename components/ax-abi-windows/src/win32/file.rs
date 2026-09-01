@@ -487,3 +487,124 @@ pub fn set_current_directory(c: &mut Call<'_>) -> Dispatch {
     }
     c.finish(TRUE)
 }
+
+const E_INVALIDARG: usize = 0x8007_0057;
+const S_OK: usize = 0;
+const INVALID_FILE_ATTRIBUTES: usize = usize::MAX;
+
+/// Write a UTF-16 string with its terminator at `at`.
+fn write_wide(c: &Call<'_>, at: usize, text: &str) -> bool {
+    let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.extend_from_slice(&[0, 0]);
+    c.write(at, &bytes)
+}
+
+/// Where the root of a Windows path ends, as a character offset, following
+/// `get_root_end` in Wine's `kernelbase/path.c`. `None` for a path with no
+/// root this recognizes.
+fn root_end(units: &[u16]) -> Option<usize> {
+    let at = |i: usize| units.get(i).copied().unwrap_or(0);
+    let is_drive = at(0) < 0x80 && (at(0) as u8).is_ascii_alphabetic() && at(1) == u16::from(b':');
+    if at(0) == u16::from(b'\\') && at(1) == u16::from(b'\\') {
+        Some(1)
+    } else if at(0) == u16::from(b'\\') {
+        Some(0)
+    } else if is_drive {
+        Some(if at(2) == u16::from(b'\\') { 2 } else { 1 })
+    } else {
+        None
+    }
+}
+
+/// PathCchSkipRoot(path, root_end): write, through `root_end`, a pointer just
+/// past the path's root. `\\` shares are not produced here, so the drive and
+/// rooted cases are what this serves.
+pub fn path_cch_skip_root(c: &mut Call<'_>) -> Dispatch {
+    let (path, out) = (c.arg(0), c.arg(1));
+    let Some(units) = c.read_wstr(path) else {
+        return c.finish(E_INVALIDARG);
+    };
+    if units.is_empty() || out == 0 {
+        return c.finish(E_INVALIDARG);
+    }
+    match root_end(&units) {
+        // One past the root: get_root_end then the `++` Wine applies.
+        Some(end) if c.write_u64(out, (path + (end + 1) * 2) as u64) => c.finish(S_OK),
+        Some(_) => c.fail_status(Ntstatus::ACCESS_VIOLATION, E_INVALIDARG),
+        None => c.finish(E_INVALIDARG),
+    }
+}
+
+/// PathCchCombineEx(out, size, path1, path2, flags): path2 against path1, or
+/// path2 alone when it is absolute, canonicalized lexically. `size` is in
+/// characters.
+pub fn path_cch_combine_ex(c: &mut Call<'_>) -> Dispatch {
+    let (out, size, p1, p2) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+    if out == 0 || size == 0 {
+        return c.finish(E_INVALIDARG);
+    }
+    let s1 = name_at(c, p1).unwrap_or_default();
+    let s2 = name_at(c, p2).unwrap_or_default();
+    let s2_absolute = root_end(&s2.encode_utf16().collect::<Vec<_>>()).is_some();
+    let combined = if s2.is_empty() {
+        s1
+    } else if s2_absolute || s1.is_empty() {
+        s2
+    } else {
+        let sep = if s1.ends_with('\\') { "" } else { "\\" };
+        alloc::format!("{s1}{sep}{s2}")
+    };
+    // Lexical .. and . folding, keeping the drive.
+    let combined = canonicalize(&combined);
+    if combined.encode_utf16().count() + 1 > size {
+        return c.finish(0x8007_007A); // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)
+    }
+    if !write_wide(c, out, &combined) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, E_INVALIDARG);
+    }
+    c.finish(S_OK)
+}
+
+/// Fold `.` and `..` out of a Windows path lexically, keeping any drive.
+fn canonicalize(path: &str) -> String {
+    let (drive, rest) = match path.as_bytes() {
+        [d, b':', ..] if d.is_ascii_alphabetic() => (&path[..2], &path[2..]),
+        _ => ("", path),
+    };
+    let rooted = rest.starts_with('\\') || rest.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split(['\\', '/']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    let mut out = String::from(drive);
+    if rooted {
+        out.push('\\');
+    }
+    out.push_str(&parts.join("\\"));
+    out
+}
+
+/// GetFileAttributesW(lpFileName): the attribute word, or INVALID with the
+/// error the host's refusal means.
+pub fn get_file_attributes_w(c: &mut Call<'_>) -> Dispatch {
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    let Some(path) = name_at(c, c.arg(0)).and_then(|n| host_path(c, &n)) else {
+        return c.fail(ERROR_PATH_NOT_FOUND, INVALID_FILE_ATTRIBUTES);
+    };
+    let Some(paths) = c.host.paths() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, INVALID_FILE_ATTRIBUTES);
+    };
+    match paths.attributes(At::Cwd, &path, true) {
+        Ok(attr) => {
+            c.set_last_error(0);
+            c.finish(nt::file_attributes(&attr) as usize)
+        }
+        Err(errno) => c.fail_status(nt::status_from_errno(errno), INVALID_FILE_ATTRIBUTES),
+    }
+}
