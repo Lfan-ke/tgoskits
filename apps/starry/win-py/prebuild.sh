@@ -37,3 +37,11 @@ done
 # the host is expanded into Lib.
 install -d "$overlay_dir/python/Lib"
 unzip -qo "$dll_dir/python313.zip" -d "$overlay_dir/python/Lib"
+
+# getpath reads pyvenv.cfg beside the executable; a home line pointing at the
+# install lets it set the prefix directly, without the realpath-based landmark
+# search that fails here.
+cat > "$overlay_dir/python/pyvenv.cfg" <<'CFG'
+home = Z:\python
+include-system-site-packages = false
+CFG
