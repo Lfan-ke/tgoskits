@@ -33,6 +33,30 @@ pub struct Ntstatus(pub u32);
 impl Ntstatus {
     /// `STATUS_SUCCESS`.
     pub const SUCCESS: Ntstatus = Ntstatus(0x0000_0000);
+    /// The Win32 error code `RtlNtStatusToDosError` maps this status to, which
+    /// is what `GetLastError` reports after a Win32 wrapper fails.
+    ///
+    /// Only the statuses this package produces are listed; each pair is read
+    /// from Wine's generated table (`dlls/ntdll/error.h`) rather than guessed,
+    /// and anything unlisted takes the catch-all an unmapped failure gets.
+    pub(crate) fn dos_error(self) -> u32 {
+        const ERROR_GEN_FAILURE: u32 = 31;
+        const MAP: &[(Ntstatus, u32)] = &[
+            (Ntstatus::SUCCESS, 0),
+            (Ntstatus::NOT_IMPLEMENTED, 1),
+            (Ntstatus::INVALID_HANDLE, 6),
+            (Ntstatus::INFO_LENGTH_MISMATCH, 24),
+            (Ntstatus::UNSUCCESSFUL, ERROR_GEN_FAILURE),
+            (Ntstatus::INVALID_PARAMETER, 87),
+            (Ntstatus::OBJECT_NAME_INVALID, 123),
+            (Ntstatus::NAME_TOO_LONG, 206),
+            (Ntstatus::NO_YIELD_PERFORMED, 721),
+            (Ntstatus::ACCESS_VIOLATION, 998),
+        ];
+        MAP.iter()
+            .find(|(status, _)| *status == self)
+            .map_or(ERROR_GEN_FAILURE, |(_, error)| *error)
+    }
     /// `STATUS_NOT_IMPLEMENTED`.
     pub const NOT_IMPLEMENTED: Ntstatus = Ntstatus(0xC000_0002);
     /// `STATUS_INVALID_HANDLE`.
@@ -130,6 +154,36 @@ fn status_from_errno(errno: i32) -> Ntstatus {
 }
 
 /// The 64-bit `IO_STATUS_BLOCK`: the status word, then the byte count.
+/// The body of `NtReadFile`/`NtWriteFile`: resolve the handle and move the
+/// bytes, reporting how many moved.
+///
+/// `Err` is a handle that names nothing, which happens before any transfer is
+/// attempted and so leaves the caller's status block untouched; `Ok` carries
+/// the status the transfer itself produced. The Win32 entry points reach the
+/// same work through here, the way kernelbase reaches it through ntdll.
+pub(crate) fn transfer(
+    host: &dyn Host,
+    write: bool,
+    handle: usize,
+    buffer: usize,
+    length: usize,
+    at: Option<u64>,
+) -> Result<(Ntstatus, usize), Ntstatus> {
+    let (Some(files), Ok(fd)) = (host.files(), descriptor(handle)) else {
+        return Err(Ntstatus::INVALID_HANDLE);
+    };
+    let transferred = match (write, at) {
+        (true, None) => files.write(fd, buffer, length),
+        (true, Some(at)) => files.pwrite(fd, buffer, length, at),
+        (false, None) => files.read(fd, buffer, length),
+        (false, Some(at)) => files.pread(fd, buffer, length, at),
+    };
+    Ok(match transferred {
+        Ok(n) => (Ntstatus::SUCCESS, n as usize),
+        Err(errno) => (status_from_errno(errno), 0),
+    })
+}
+
 fn write_io_status(host: &dyn Host, at: usize, status: Ntstatus, information: usize) -> Ntstatus {
     if at == 0 {
         return status;
@@ -396,7 +450,7 @@ fn prot_from_page(protect: usize) -> Prot {
 
 /// The descriptor an NT handle names. Handles are indices in this personality,
 /// so a handle is a descriptor with the NT numbering applied.
-fn descriptor(handle: usize) -> Result<i32, Ntstatus> {
+pub(crate) fn descriptor(handle: usize) -> Result<i32, Ntstatus> {
     u32::try_from(handle)
         .ok()
         .and_then(|raw| Handle(raw).slot())
@@ -453,9 +507,6 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             if a(1) != 0 || a(2) != 0 {
                 return finish(env, Ntstatus::NOT_IMPLEMENTED);
             }
-            let (Some(files), Ok(fd)) = (host.files(), descriptor(a(0))) else {
-                return finish(env, Ntstatus::INVALID_HANDLE);
-            };
             let (io_status, buffer, length, offset_ptr) = (a(4), a(5), a(6), a(7));
             // A null ByteOffset means "wherever the file is now"; otherwise it
             // points at the offset to transfer at.
@@ -467,15 +518,10 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                     Err(status) => return finish(env, status),
                 }
             };
-            let transferred = match (matches!(call, NtSyscall::WriteFile), at) {
-                (true, None) => files.write(fd, buffer, length),
-                (true, Some(at)) => files.pwrite(fd, buffer, length, at),
-                (false, None) => files.read(fd, buffer, length),
-                (false, Some(at)) => files.pread(fd, buffer, length, at),
-            };
-            match transferred {
-                Ok(n) => write_io_status(host, io_status, Ntstatus::SUCCESS, n as usize),
-                Err(errno) => write_io_status(host, io_status, status_from_errno(errno), 0),
+            let write = matches!(call, NtSyscall::WriteFile);
+            match transfer(host, write, a(0), buffer, length, at) {
+                Ok((status, information)) => write_io_status(host, io_status, status, information),
+                Err(status) => return finish(env, status),
             }
         }
         NtSyscall::AllocateVirtualMemory => {
@@ -874,6 +920,39 @@ mod tests {
         }
         fn stack_pointer(&self) -> usize {
             self.sp
+        }
+        fn set_result(&mut self, value: usize) {
+            self.result = Some(value);
+        }
+    }
+
+    // A trap frame that also says where the caller's thread block is, which is
+    // where the Win32 layer keeps the last error.
+    struct Win32Trap {
+        nr: usize,
+        args: [usize; 4],
+        teb: usize,
+        result: Option<usize>,
+    }
+    impl Win32Trap {
+        fn new(call: crate::win32::Win32Call, args: [usize; 4], teb: usize) -> Self {
+            Self {
+                nr: call.nr() as usize,
+                args,
+                teb,
+                result: None,
+            }
+        }
+    }
+    impl TrapEnv for Win32Trap {
+        fn nr(&self) -> usize {
+            self.nr
+        }
+        fn arg(&self, i: usize) -> usize {
+            self.args[i]
+        }
+        fn thread_pointer(&self) -> usize {
+            self.teb
         }
         fn set_result(&mut self, value: usize) {
             self.result = Some(value);
@@ -1616,5 +1695,161 @@ mod tests {
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(Ntstatus::INVALID_PARAMETER.0 as usize));
         assert!(host.sought.borrow().is_none());
+    }
+
+    #[test]
+    fn a_win32_write_moves_bytes_and_reports_the_count() {
+        use crate::win32::{self, Win32Call};
+
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x100]),
+            ..MockHost::default()
+        };
+        // WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite,
+        // lpNumberOfBytesWritten, lpOverlapped). Handle 4 is descriptor 0.
+        let mut env = FakeTrap {
+            nr: Win32Call::WriteFile.nr() as usize,
+            args: [4, 0x40, 8, 0x80],
+            sp: 0,
+            result: None,
+        };
+
+        assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
+        // A Windows API function reports success as a nonzero return, where an
+        // NT call would return a status.
+        assert_eq!(env.result, Some(1));
+        assert_eq!(*host.wrote.borrow(), Some((0, 0x40, 8)));
+        let mem = host.mem.borrow();
+        assert_eq!(u32::from_le_bytes(mem[0x80..0x84].try_into().unwrap()), 8);
+    }
+
+    #[test]
+    fn a_win32_write_without_a_count_pointer_still_succeeds() {
+        use crate::win32::{self, Win32Call};
+
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x100]),
+            ..MockHost::default()
+        };
+        let mut env = FakeTrap {
+            nr: Win32Call::WriteFile.nr() as usize,
+            args: [4, 0x40, 4, 0],
+            sp: 0,
+            result: None,
+        };
+
+        assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(1));
+        assert_eq!(*host.wrote.borrow(), Some((0, 0x40, 4)));
+    }
+
+    #[test]
+    fn a_failed_win32_write_records_the_error_in_the_thread_block() {
+        use crate::win32::{self, Win32Call};
+
+        let host = MockHost {
+            mem: RefCell::new(vec![0xFFu8; 0x200]),
+            ..MockHost::default()
+        };
+        // A handle that is not a multiple of four names no slot, so the write
+        // is refused before any bytes move.
+        let teb = 0xC0;
+        let mut env = Win32Trap::new(Win32Call::WriteFile, [3, 0x40, 8, 0x80], teb);
+
+        assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(0), "a Win32 failure is a zero BOOL");
+        assert!(host.wrote.borrow().is_none(), "nothing was transferred");
+
+        let mem = host.mem.borrow();
+        // The count is cleared before the attempt, so the caller does not read
+        // whatever happened to be there.
+        assert_eq!(u32::from_le_bytes(mem[0x80..0x84].try_into().unwrap()), 0);
+        // ERROR_INVALID_HANDLE, which is what RtlNtStatusToDosError maps
+        // STATUS_INVALID_HANDLE to.
+        let at = teb + crate::teb_peb::TEB_LAST_ERROR;
+        assert_eq!(u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()), 6);
+    }
+
+    #[test]
+    fn the_last_error_survives_between_calls() {
+        use crate::win32::{self, Win32Call};
+
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x200]),
+            ..MockHost::default()
+        };
+        let teb = 0xC0;
+
+        let mut set = Win32Trap::new(Win32Call::SetLastError, [87, 0, 0, 0], teb);
+        assert_eq!(win32::dispatch(&mut set, &host), Dispatch::Handled);
+
+        let mut get = Win32Trap::new(Win32Call::GetLastError, [0; 4], teb);
+        assert_eq!(win32::dispatch(&mut get, &host), Dispatch::Handled);
+        assert_eq!(get.result, Some(87));
+    }
+
+    #[test]
+    fn a_thread_block_the_host_cannot_place_keeps_no_error() {
+        use crate::win32::{self, Win32Call};
+
+        // A host that cannot say where the block is must still answer, with a
+        // clean error rather than a reading of unrelated memory.
+        let host = MockHost::default();
+        let mut env = Win32Trap::new(Win32Call::GetLastError, [0; 4], 0);
+
+        assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(0));
+    }
+
+    #[test]
+    fn get_std_handle_answers_the_three_streams_and_refuses_the_rest() {
+        use crate::win32::{self, Win32Call};
+
+        let host = MockHost {
+            mem: RefCell::new(vec![0u8; 0x200]),
+            ..MockHost::default()
+        };
+        // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE and STD_ERROR_HANDLE arrive as
+        // DWORDs, so each is the low half of a negative selector.
+        for (selector, descriptor) in [(-10i32, 0usize), (-11, 1), (-12, 2)] {
+            let mut env = Win32Trap::new(
+                Win32Call::GetStdHandle,
+                [selector as u32 as usize, 0, 0, 0],
+                0xC0,
+            );
+            assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
+            let handle = env.result.expect("answered");
+            // The handle must name the descriptor the stream starts on, or a
+            // later WriteFile through it would reach the wrong file.
+            assert_eq!(Handle(handle as u32).slot(), Some(descriptor));
+        }
+
+        let teb = 0xC0;
+        let mut env = Win32Trap::new(Win32Call::GetStdHandle, [0, 0, 0, 0], teb);
+        assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(usize::MAX), "INVALID_HANDLE_VALUE");
+        let mem = host.mem.borrow();
+        let at = teb + crate::teb_peb::TEB_LAST_ERROR;
+        assert_eq!(u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()), 6);
+    }
+
+    #[test]
+    fn every_status_maps_to_the_error_wine_records() {
+        // Read out of Wine's generated table (dlls/ntdll/error.h) with the
+        // values from include/winerror.h, not from memory.
+        for (status, error) in [
+            (Ntstatus::SUCCESS, 0),
+            (Ntstatus::NOT_IMPLEMENTED, 1),
+            (Ntstatus::INVALID_HANDLE, 6),
+            (Ntstatus::INFO_LENGTH_MISMATCH, 24),
+            (Ntstatus::UNSUCCESSFUL, 31),
+            (Ntstatus::INVALID_PARAMETER, 87),
+            (Ntstatus::OBJECT_NAME_INVALID, 123),
+            (Ntstatus::NAME_TOO_LONG, 206),
+            (Ntstatus::NO_YIELD_PERFORMED, 721),
+            (Ntstatus::ACCESS_VIOLATION, 998),
+        ] {
+            assert_eq!(status.dos_error(), error, "{status:?}");
+        }
     }
 }

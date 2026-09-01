@@ -73,6 +73,14 @@ pub trait TrapEnv {
     /// ignores this, and an ABI that encodes failure in the value alone never
     /// calls it.
     fn set_error(&mut self, _failed: bool) {}
+
+    /// Where the caller thread's control block lives in its own address space,
+    /// or zero from a host that cannot say. A domain keeping per-thread state
+    /// where the thread itself reads it - a Windows TEB, a Linux TCB - needs
+    /// this address; one that keeps no such state never asks.
+    fn thread_pointer(&self) -> usize {
+        0
+    }
 }
 
 /// Whether a trapped index was serviced.

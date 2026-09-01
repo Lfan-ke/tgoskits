@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod handle;
 pub mod nt;
 pub mod teb_peb;
+pub mod win32;
 
 use alloc::{vec, vec::Vec};
 
@@ -38,10 +39,14 @@ impl SysAbi for WindowsAbi {
     }
 
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
-        nt::dispatch(
-            env,
-            ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current),
-        )
+        let host = ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current);
+        // A program that links against the Windows API arrives on a number this
+        // package reserved for its own entry points; one that issues the trap
+        // itself arrives on an NT number. Both are this package's.
+        if win32::Win32Call::from_nr(env.nr() as u32).is_some() {
+            return win32::dispatch(env, host);
+        }
+        nt::dispatch(env, host)
     }
 }
 
