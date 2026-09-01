@@ -59,17 +59,6 @@ pub(crate) fn validate_exec_arg_size(args: &[String], envs: &[String]) -> Starry
     Ok(())
 }
 
-// RISC-V relocation types
-#[cfg(target_arch = "riscv64")]
-const R_RISCV_RELATIVE: u32 = 3;
-#[cfg(target_arch = "riscv64")]
-const R_RISCV_JUMP_SLOT: u32 = 5;
-#[cfg(target_arch = "riscv64")]
-const R_RISCV_64: u32 = 2;
-#[cfg(target_arch = "riscv64")]
-const R_RISCV_COPY: u32 = 4;
-
-
 /// Creates a new empty user address space.
 pub fn new_user_aspace_empty() -> StarryResult<AddrSpace> {
     AddrSpace::new_empty(VirtAddr::from_usize(USER_SPACE_BASE), USER_SPACE_SIZE)
@@ -111,50 +100,6 @@ pub fn map_trampoline(aspace: &mut AddrSpace) -> StarryResult {
     Ok(())
 }
 
-
-
-/// Map the elf file to the user address space.
-///
-/// # Arguments
-/// - `uspace`: The address space of the user app.
-/// - `elf`: The elf file.
-///
-
-/// Convert a virtual address to a file offset using PT_LOAD segments.
-///
-/// This function searches through the program headers to find which PT_LOAD
-/// segment contains the given virtual address, then calculates the
-/// corresponding file offset.
-///
-
-/// Apply relocations for static-pie binaries.
-///
-
-
-
-
-
-
-/// Load the user app to the user address space.
-///
-/// The executable is identified by an already-resolved [`Location`] — the
-/// caller resolves and opens it once (mirroring Linux's `do_open_execat`,
-/// which honors `AT_SYMLINK_NOFOLLOW` at that single lookup), and this never
-/// re-resolves the main executable from its pathname. Interpreters reached
-/// through a `.sh` redirect or a `#!` shebang are resolved here by path, which
-/// is Linux's `open_exec(interp)` and legitimately follows symlinks.
-///
-/// # Arguments
-/// - `uspace`: The address space of the user app.
-/// - `loc`: The resolved executable to load.
-/// - `path`: The pathname the executable was invoked as, used for the `.sh`
-///   redirect and for the script name an interpreter receives in `argv`.
-/// - `args`: The arguments of the user app.
-/// - `envs`: The environment variables of the user app.
-///
-/// # Returns
-/// - The entry point of the user app.
-/// - The stack pointer of the user app.
 /// Lends a personality the address space `exec` is building, so an image the
 /// kernel does not parse itself is still mapped by the package that does.
 struct ExecSpace<'a> {
@@ -332,13 +277,37 @@ fn prot_flags(prot: ax_binfmt::Prot) -> MappingFlags {
     flags
 }
 
+/// What loading an image leaves the caller: where execution starts, where
+/// the initial stack is, and the auxiliary vector the program reads its own
+/// layout from.
+type LoadedImage = (VirtAddr, VirtAddr, Vec<(usize, usize)>);
+
+/// Load the user app to the user address space.
+///
+/// The executable is identified by an already-resolved [`Location`] — the
+/// caller resolves and opens it once (mirroring Linux's `do_open_execat`,
+/// which honors `AT_SYMLINK_NOFOLLOW` at that single lookup), and this never
+/// re-resolves the main executable from its pathname. Interpreters reached
+/// through a `.sh` redirect or a `#!` shebang are resolved here by path, which
+/// is Linux's `open_exec(interp)` and legitimately follows symlinks.
+///
+/// # Arguments
+/// - `uspace`: The address space of the user app.
+/// - `loc`: The resolved executable to load.
+/// - `path`: The pathname the executable was invoked as, used for the `.sh`
+///   redirect and for the script name an interpreter receives in `argv`.
+/// - `args`: The arguments of the user app.
+/// - `envs`: The environment variables of the user app.
+///
+/// # Returns
+/// A [`LoadedImage`].
 pub fn load_user_app(
     uspace: &mut AddrSpace,
     loc: Location,
     path: &str,
     args: &[String],
     envs: &[String],
-) -> StarryResult<(VirtAddr, VirtAddr, Vec<(usize, usize)>)> {
+) -> StarryResult<LoadedImage> {
     validate_exec_arg_size(args, envs)?;
 
     load_user_app_with_depth(uspace, loc, path, args, envs, 0)
@@ -351,7 +320,7 @@ fn load_user_app_with_depth(
     args: &[String],
     envs: &[String],
     interpreter_depth: usize,
-) -> StarryResult<(VirtAddr, VirtAddr, Vec<(usize, usize)>)> {
+) -> StarryResult<LoadedImage> {
     // `/proc/self/exe` is available in procfs; busybox can `readlink` it
     // to re-exec itself as a shell on ENOEXEC, provided the busybox build
     // includes that fallback (Alpine's prebuilt binary may not).
