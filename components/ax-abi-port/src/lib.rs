@@ -53,6 +53,46 @@ pub const ESPIPE: i32 = 29;
 pub const EOPNOTSUPP: i32 = 95;
 /// `EINTR` - a signal cut the call short.
 pub const EINTR: i32 = 4;
+/// `EPERM` - the operation is not permitted.
+pub const EPERM: i32 = 1;
+/// `EIO` - the device failed.
+pub const EIO: i32 = 5;
+/// `ENXIO` - no such device or address.
+pub const ENXIO: i32 = 6;
+/// `EAGAIN` - the resource is busy; try again.
+pub const EAGAIN: i32 = 11;
+/// `ENOMEM` - out of memory.
+pub const ENOMEM: i32 = 12;
+/// `EACCES` - permission denied.
+pub const EACCES: i32 = 13;
+/// `EBUSY` - the device or resource is busy.
+pub const EBUSY: i32 = 16;
+/// `EEXIST` - the file exists.
+pub const EEXIST: i32 = 17;
+/// `ENOTDIR` - a component of the path is not a directory.
+pub const ENOTDIR: i32 = 20;
+/// `EISDIR` - the name is a directory.
+pub const EISDIR: i32 = 21;
+/// `ENFILE` - the system has too many open files.
+pub const ENFILE: i32 = 23;
+/// `EMFILE` - the process has too many open files.
+pub const EMFILE: i32 = 24;
+/// `ENOTTY` - not a terminal, or an inappropriate control request.
+pub const ENOTTY: i32 = 25;
+/// `ENOSPC` - no space left on the device.
+pub const ENOSPC: i32 = 28;
+/// `EROFS` - the filesystem is read-only.
+pub const EROFS: i32 = 30;
+/// `EPIPE` - the other end of the pipe is gone.
+pub const EPIPE: i32 = 32;
+/// `ENOTEMPTY` - the directory is not empty.
+pub const ENOTEMPTY: i32 = 39;
+/// `ELOOP` - too many symbolic links were followed.
+pub const ELOOP: i32 = 40;
+/// `ETIME` - the operation timed out.
+pub const ETIME: i32 = 62;
+/// `ECONNRESET` - the connection was reset by the peer.
+pub const ECONNRESET: i32 = 104;
 
 /// The minimal arch/memory platform, à la gVisor's `Platform`: move bytes across
 /// the user/kernel boundary. Everything a personality needs from the CPU/MMU

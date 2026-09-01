@@ -81,6 +81,9 @@ pub const PARAMS_SIZE: usize = 0x410;
 pub const PARAMS_COMMAND_LINE_A: usize = 0x410;
 const PARAMS_HEADER: usize = 0x420;
 
+/// `MAX_PATH`, in characters.
+pub const MAX_PATH: usize = 260;
+
 /// `STARTF_USESTDHANDLES`: the standard handles in the parameters are meant.
 pub const STARTF_USESTDHANDLES: u32 = 0x100;
 /// `PROCESS_PARAMS_FLAG_NORMALIZED`: the pointers are absolute, as they are
@@ -214,16 +217,19 @@ pub fn build_params(info: &ProcessInfo<'_>, at: u64) -> Vec<u8> {
     put_u32(&mut out, PARAMS_FLAGS, STARTF_USESTDHANDLES);
     put_u32(&mut out, PARAMS_SHOW_WINDOW, 1); // SW_SHOWNORMAL
 
-    // A UNICODE_STRING over `text`, appended as UTF-16 with a terminator.
-    let unicode = |out: &mut Vec<u8>, field: usize, text: &str| {
+    // A UNICODE_STRING over `text`, appended as UTF-16 with a terminator,
+    // in a buffer of at least `reserve` bytes.
+    let unicode = |out: &mut Vec<u8>, field: usize, text: &str, reserve: usize| {
         let start = out.len();
         for unit in text.encode_utf16() {
             out.extend_from_slice(&unit.to_le_bytes());
         }
         let len = (out.len() - start) as u16;
         out.extend_from_slice(&[0, 0]);
+        let room = (out.len() - start).max(reserve);
+        out.resize(start + room, 0);
         put_u16(out, field, len);
-        put_u16(out, field + 2, len + 2);
+        put_u16(out, field + 2, room as u16);
         put_u64(out, field + 8, at + start as u64);
     };
     // The current directory carries its trailing separator, as CURDIR does.
@@ -232,11 +238,13 @@ pub fn build_params(info: &ProcessInfo<'_>, at: u64) -> Vec<u8> {
     } else {
         alloc::format!("{}\\", info.dir)
     };
-    unicode(&mut out, PARAMS_CURRENT_DIRECTORY, &cwd);
-    unicode(&mut out, PARAMS_DLL_PATH, info.dir);
-    unicode(&mut out, PARAMS_IMAGE_PATH, info.image);
+    // The current directory is rewritten in place when the process changes
+    // it, so its buffer is MAX_PATH wide from the start, as Windows sizes it.
+    unicode(&mut out, PARAMS_CURRENT_DIRECTORY, &cwd, MAX_PATH * 2);
+    unicode(&mut out, PARAMS_DLL_PATH, info.dir, 0);
+    unicode(&mut out, PARAMS_IMAGE_PATH, info.image, 0);
     let line = command_line(info.args);
-    unicode(&mut out, PARAMS_COMMAND_LINE, &line);
+    unicode(&mut out, PARAMS_COMMAND_LINE, &line, 0);
 
     // The environment: each string with its terminator, then one more.
     let env_at = out.len();
