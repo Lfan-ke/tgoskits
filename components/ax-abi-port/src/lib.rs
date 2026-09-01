@@ -181,6 +181,21 @@ pub struct OpenHow {
 ///
 /// Neutral because the three lay the same facts out differently - a Linux
 /// `struct stat`, an NT `FILE_BASIC_INFORMATION`, a Darwin `struct stat` whose
+/// The ways a caller may want to reach a name.
+///
+/// All false asks only whether the name is there, which is what Linux spells
+/// `F_OK`. Each ABI decodes its own bits into this; the host never sees them.
+#[cfg(feature = "paths")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Access {
+    /// May read its contents.
+    pub read: bool,
+    /// May change its contents.
+    pub write: bool,
+    /// May execute it, or search it when it is a directory.
+    pub execute: bool,
+}
+
 /// fields are in another order - while agreeing on what the facts are. The
 /// times are since the epoch, which is the one origin all three count from.
 #[cfg(feature = "paths")]
@@ -263,6 +278,29 @@ pub trait Paths: Sync {
 
     /// Describe what an open descriptor refers to.
     fn attributes_of(&self, fd: i32) -> Result<Attributes, i32>;
+
+    /// Whether the caller may reach `path` in the ways `wants` names.
+    ///
+    /// The decision is the host's, not the ABI's: it turns on mount flags, the
+    /// caller's whole credential set including supplementary groups, and any
+    /// capability that overrides the ordinary permission bits - none of which
+    /// shows up in [`Attributes`], so a domain that answered this from the mode
+    /// word alone would be a shallower check than the one it replaced.
+    ///
+    /// `real_ids` asks for the decision against the real user and group rather
+    /// than the effective ones, which is what a set-user-ID program means when
+    /// it asks whether the user who invoked it may reach a name.
+    fn permitted(
+        &self,
+        at: At,
+        path: &str,
+        wants: Access,
+        follow: bool,
+        real_ids: bool,
+    ) -> Result<(), i32>;
+
+    /// The same question about an open descriptor.
+    fn permitted_of(&self, fd: i32, wants: Access, real_ids: bool) -> Result<(), i32>;
 }
 
 /// One run of user memory. An ABI decodes its own vector layout and names the
