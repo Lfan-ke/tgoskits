@@ -143,7 +143,7 @@ impl NtSyscall {
 }
 
 /// Translate a port error into the NTSTATUS a Windows program expects.
-fn status_from_errno(errno: i32) -> Ntstatus {
+pub(crate) fn status_from_errno(errno: i32) -> Ntstatus {
     match errno {
         ax_abi_port::EBADF => Ntstatus::INVALID_HANDLE,
         ax_abi_port::EINVAL => Ntstatus::INVALID_PARAMETER,
@@ -437,7 +437,7 @@ const MEM_RELEASE: usize = 0x8000;
 const MEM_TOP_DOWN: usize = 0x0010_0000;
 
 /// Translate the `PAGE_*` protection constants a Windows caller passes.
-fn prot_from_page(protect: usize) -> Prot {
+pub(crate) fn prot_from_page(protect: usize) -> Prot {
     match protect & 0xFF {
         PAGE_READONLY => Prot::READ,
         PAGE_READWRITE => Prot::READ | Prot::WRITE,
@@ -1709,7 +1709,7 @@ mod tests {
         };
         // WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite,
         // lpNumberOfBytesWritten, lpOverlapped). Handle 4 is descriptor 0.
-        let mut env = Win32Trap::new(Win32Call::WriteFile, [4, 0x40, 8, 0x80, 0, 0], 0);
+        let mut env = Win32Trap::new(Win32Call::WRITE_FILE, [4, 0x40, 8, 0x80, 0, 0], 0);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         // A Windows API function reports success as a nonzero return, where an
@@ -1728,7 +1728,7 @@ mod tests {
             mem: RefCell::new(vec![0u8; 0x100]),
             ..MockHost::default()
         };
-        let mut env = Win32Trap::new(Win32Call::WriteFile, [4, 0x40, 4, 0, 0, 0], 0);
+        let mut env = Win32Trap::new(Win32Call::WRITE_FILE, [4, 0x40, 4, 0, 0, 0], 0);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(1));
@@ -1746,7 +1746,7 @@ mod tests {
         // A handle that is not a multiple of four names no slot, so the write
         // is refused before any bytes move.
         let teb = 0xC0;
-        let mut env = Win32Trap::new(Win32Call::WriteFile, [3, 0x40, 8, 0x80, 0, 0], teb);
+        let mut env = Win32Trap::new(Win32Call::WRITE_FILE, [3, 0x40, 8, 0x80, 0, 0], teb);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(0), "a Win32 failure is a zero BOOL");
@@ -1772,10 +1772,14 @@ mod tests {
         };
         let teb = 0xC0;
 
-        let mut set = Win32Trap::new(Win32Call::SetLastError, [87, 0, 0, 0, 0, 0], teb);
+        let mut set = Win32Trap::new(
+            Win32Call::named("SetLastError").unwrap(),
+            [87, 0, 0, 0, 0, 0],
+            teb,
+        );
         assert_eq!(win32::dispatch(&mut set, &host), Dispatch::Handled);
 
-        let mut get = Win32Trap::new(Win32Call::GetLastError, [0; 6], teb);
+        let mut get = Win32Trap::new(Win32Call::named("GetLastError").unwrap(), [0; 6], teb);
         assert_eq!(win32::dispatch(&mut get, &host), Dispatch::Handled);
         assert_eq!(get.result, Some(87));
     }
@@ -1787,7 +1791,7 @@ mod tests {
         // A host that cannot say where the block is must still answer, with a
         // clean error rather than a reading of unrelated memory.
         let host = MockHost::default();
-        let mut env = Win32Trap::new(Win32Call::GetLastError, [0; 6], 0);
+        let mut env = Win32Trap::new(Win32Call::named("GetLastError").unwrap(), [0; 6], 0);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(0));
@@ -1805,7 +1809,7 @@ mod tests {
         // DWORDs, so each is the low half of a negative selector.
         for (selector, descriptor) in [(-10i32, 0usize), (-11, 1), (-12, 2)] {
             let mut env = Win32Trap::new(
-                Win32Call::GetStdHandle,
+                Win32Call::named("GetStdHandle").unwrap(),
                 [selector as u32 as usize, 0, 0, 0, 0, 0],
                 0xC0,
             );
@@ -1817,7 +1821,7 @@ mod tests {
         }
 
         let teb = 0xC0;
-        let mut env = Win32Trap::new(Win32Call::GetStdHandle, [0; 6], teb);
+        let mut env = Win32Trap::new(Win32Call::named("GetStdHandle").unwrap(), [0; 6], teb);
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(usize::MAX), "INVALID_HANDLE_VALUE");
         let mem = host.mem.borrow();
@@ -1856,7 +1860,7 @@ mod tests {
         let teb = 0xC0;
         // The fifth argument is the OVERLAPPED; the stub lifted it off the
         // caller's stack into the fifth trap register.
-        let mut env = Win32Trap::new(Win32Call::WriteFile, [4, 0x40, 8, 0x80, 0x100, 0], teb);
+        let mut env = Win32Trap::new(Win32Call::WRITE_FILE, [4, 0x40, 8, 0x80, 0x100, 0], teb);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(0));
@@ -1868,5 +1872,172 @@ mod tests {
         // ERROR_INVALID_FUNCTION, the mapping of STATUS_NOT_IMPLEMENTED.
         let at = teb + crate::teb_peb::TEB_LAST_ERROR;
         assert_eq!(u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()), 1);
+    }
+
+    /// A thread block with a PEB behind it and a heap arena, as the loader lays
+    /// them out: enough of the process for the Win32 layer to keep its state.
+    fn process(host: &MockHost) -> (usize, usize) {
+        use crate::{
+            teb_peb::{PEB_PROCESS_HEAP, TEB_PEB},
+            win32::heap,
+        };
+        let (teb, peb, arena) = (0x100usize, 0x2000usize, 0x3000usize);
+        let mut mem = host.mem.borrow_mut();
+        mem.resize(0x8000, 0);
+        mem[teb + TEB_PEB..teb + TEB_PEB + 8].copy_from_slice(&(peb as u64).to_le_bytes());
+        mem[peb + PEB_PROCESS_HEAP..peb + PEB_PROCESS_HEAP + 8]
+            .copy_from_slice(&(arena as u64).to_le_bytes());
+        mem[arena..arena + heap::HEADER].copy_from_slice(&heap::arena(arena as u64, 0x1000));
+        (teb, arena)
+    }
+
+    fn call(name: &str, args: [usize; 6], teb: usize) -> Win32Trap {
+        Win32Trap::new(crate::win32::Win32Call::named(name).unwrap(), args, teb)
+    }
+
+    #[test]
+    fn tls_slots_are_handed_out_once_and_hold_their_values() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+
+        let mut a = call("TlsAlloc", [0; 6], teb);
+        win32::dispatch(&mut a, &host);
+        let mut b = call("TlsAlloc", [0; 6], teb);
+        win32::dispatch(&mut b, &host);
+        let (a, b) = (a.result.unwrap(), b.result.unwrap());
+        assert_ne!(a, b, "two live slots are distinct");
+
+        let mut set = call("TlsSetValue", [a, 0xBEEF, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut set, &host);
+        assert_eq!(set.result, Some(1));
+        let mut get = call("TlsGetValue", [a, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut get, &host);
+        assert_eq!(get.result, Some(0xBEEF));
+        let mut other = call("TlsGetValue", [b, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut other, &host);
+        assert_eq!(other.result, Some(0), "a fresh slot reads as NULL");
+
+        // Freed, the slot is refused until allocated again - and then reused.
+        let mut free = call("TlsFree", [a, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut free, &host);
+        assert_eq!(free.result, Some(1));
+        let mut again = call("TlsFree", [a, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut again, &host);
+        assert_eq!(again.result, Some(0), "not allocated any more");
+        let mut c = call("TlsAlloc", [0; 6], teb);
+        win32::dispatch(&mut c, &host);
+        assert_eq!(c.result, Some(a));
+    }
+
+    #[test]
+    fn the_process_heap_hands_out_distinct_blocks_that_know_their_size() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, arena) = process(&host);
+
+        let mut get = call("GetProcessHeap", [0; 6], teb);
+        win32::dispatch(&mut get, &host);
+        assert_eq!(get.result, Some(arena));
+
+        let mut first = call("HeapAlloc", [arena, 0, 24, 0, 0, 0], teb);
+        win32::dispatch(&mut first, &host);
+        let mut second = call("HeapAlloc", [arena, 8, 100, 0, 0, 0], teb);
+        win32::dispatch(&mut second, &host);
+        let (first, second) = (first.result.unwrap(), second.result.unwrap());
+        assert!(first != 0 && second != 0 && first != second);
+        assert_eq!(first % 16, 0, "blocks are paragraph aligned");
+        assert!(second >= first + 24, "blocks do not overlap");
+
+        let mut size = call("HeapSize", [arena, 0, second, 0, 0, 0], teb);
+        win32::dispatch(&mut size, &host);
+        assert_eq!(size.result, Some(100));
+
+        let mut free = call("HeapFree", [arena, 0, first, 0, 0, 0], teb);
+        win32::dispatch(&mut free, &host);
+        assert_eq!(free.result, Some(1));
+        let mut gone = call("HeapSize", [arena, 0, first, 0, 0, 0], teb);
+        win32::dispatch(&mut gone, &host);
+        assert_eq!(gone.result, Some(usize::MAX), "a freed block has no size");
+
+        // Past the arena's end the heap says so rather than hand out memory
+        // it does not have.
+        let mut huge = call("HeapAlloc", [arena, 0, 0x2000, 0, 0, 0], teb);
+        win32::dispatch(&mut huge, &host);
+        assert_eq!(huge.result, Some(0));
+    }
+
+    #[test]
+    fn a_critical_section_counts_recursion_and_releases_on_the_last_leave() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let cs = 0x4000usize;
+
+        let mut init = call(
+            "InitializeCriticalSectionAndSpinCount",
+            [cs, 4000, 0, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut init, &host);
+        assert_eq!(init.result, Some(1));
+        let word = |off: usize| {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[cs + off..cs + off + 4].try_into().unwrap())
+        };
+        assert_eq!(word(8), -1i32 as u32, "LockCount starts free");
+
+        for _ in 0..2 {
+            let mut enter = call("EnterCriticalSection", [cs, 0, 0, 0, 0, 0], teb);
+            win32::dispatch(&mut enter, &host);
+        }
+        assert_eq!(word(12), 2, "RecursionCount");
+        assert_eq!(word(8), 1, "LockCount: two enters from -1");
+
+        let mut leave = call("LeaveCriticalSection", [cs, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut leave, &host);
+        assert_eq!(word(12), 1);
+        let mut leave = call("LeaveCriticalSection", [cs, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut leave, &host);
+        assert_eq!(word(12), 0);
+        assert_eq!(word(8), -1i32 as u32, "free again");
+        let owner = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[cs + 16..cs + 24].try_into().unwrap())
+        };
+        assert_eq!(owner, 0, "no owner once released");
+    }
+
+    #[test]
+    fn an_entry_point_without_its_meaning_yet_says_so_when_called() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+
+        let mut beep = call("Beep", [440, 100, 0, 0, 0, 0], teb);
+        assert_eq!(win32::dispatch(&mut beep, &host), Dispatch::Handled);
+        assert_eq!(beep.result, Some(0));
+        let mut err = call("GetLastError", [0; 6], teb);
+        win32::dispatch(&mut err, &host);
+        // ERROR_CALL_NOT_IMPLEMENTED, as a Wine stub reports itself.
+        assert_eq!(err.result, Some(120));
+    }
+
+    #[test]
+    fn pointers_encode_and_decode_back_to_themselves() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+
+        let mut enc = call("EncodePointer", [0x1234_5678_9ABC, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut enc, &host);
+        let encoded = enc.result.unwrap();
+        assert_ne!(
+            encoded, 0x1234_5678_9ABC,
+            "an encoded pointer is not the raw one"
+        );
+        let mut dec = call("DecodePointer", [encoded, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut dec, &host);
+        assert_eq!(dec.result, Some(0x1234_5678_9ABC));
     }
 }
