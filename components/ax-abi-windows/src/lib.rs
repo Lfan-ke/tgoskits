@@ -172,6 +172,30 @@ fn attach_steps(modules: &[dll::Module]) -> Vec<start::Step> {
 /// does not have.
 const HEAP_LEN: u64 = 8 << 20;
 
+/// What the process was started with, as `PEB.ProcessParameters` records it:
+/// the program's path and directory as Windows spells them, the command line
+/// its arguments make, its environment, and the three standard handles, which
+/// are the descriptors a process starts with.
+fn process_params(req: &LoadRequest<'_>, path: &str, at: u64) -> Vec<u8> {
+    let image = teb_peb::windows_path(path);
+    let dir = match image.rsplit_once('\\') {
+        Some((dir, _)) if !dir.is_empty() && dir != "Z:" => alloc::string::String::from(dir),
+        _ => alloc::string::String::from("Z:\\"),
+    };
+    let own = [image.as_str()];
+    let args: &[&str] = if req.args.is_empty() { &own } else { req.args };
+    teb_peb::build_params(
+        &teb_peb::ProcessInfo {
+            image: &image,
+            dir: &dir,
+            args,
+            envs: req.envs,
+            std: [0, 1, 2].map(|slot| u64::from(handle::Handle::from_slot(slot).0)),
+        },
+        at,
+    )
+}
+
 /// The loader's view of the process, as `PEB.Ldr` publishes it: which modules
 /// are where, under what names, in what order they were loaded and started.
 fn module_list(modules: &[dll::Module], at: u64) -> Vec<u8> {
@@ -444,8 +468,8 @@ mod tests {
         let code_va = 0x1_4000_4000;
         assert_eq!(loaded.entry, code_va + thunk::STUB_LEN as u64);
         // Two sections, then the code page, the thread's three blocks, the
-        // module list, and the heap.
-        assert_eq!(env.maps.len(), 8);
+        // module list, the parameters, and the heap.
+        assert_eq!(env.maps.len(), 9);
 
         let (va, prot, _) = &env.maps[0];
         assert_eq!(*va, 0x1_4000_1000);
@@ -539,8 +563,8 @@ mod tests {
             )
             .expect("load");
         // Four sections, then the code page, the thread's three blocks, the
-        // module list, and the heap.
-        assert_eq!(env.maps.len(), 10);
+        // module list, the parameters, and the heap.
+        assert_eq!(env.maps.len(), 11);
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
         assert_eq!(env.maps[1].1, Prot::READ);
         assert_eq!(env.maps[2].1, Prot::READ | Prot::WRITE);
@@ -878,6 +902,22 @@ mod tests {
         let heap = at(heap_va);
         assert_eq!(word(heap, 0), win32::heap::MAGIC);
         assert_eq!(word(heap, win32::heap::LIMIT), heap_va + HEAP_LEN);
+        // The parameters name the program as Windows spells its path, and a
+        // command line that quotes it.
+        let params_va = word(peb, teb_peb::PEB_PROCESS_PARAMS);
+        let params = at(params_va);
+        let text = |field: usize| -> String {
+            let len = u16::from_le_bytes(params[field..field + 2].try_into().unwrap()) as usize;
+            let buf = (word(params, field + 8) - params_va) as usize;
+            let units: Vec<u16> = params[buf..buf + len]
+                .chunks(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        };
+        assert_eq!(text(teb_peb::PARAMS_IMAGE_PATH), "Z:\\app\\prog.exe");
+        assert_eq!(text(teb_peb::PARAMS_COMMAND_LINE), "\"Z:\\app\\prog.exe\"");
+        assert_eq!(word(params, teb_peb::PARAMS_STD_OUTPUT), 8);
         // And the TLS bitmap pointer names a bitmap over the PEB's own bits.
         let bitmap = word(peb, teb_peb::PEB_TLS_BITMAP) - peb_va;
         assert_eq!(
@@ -1210,7 +1250,9 @@ impl ImageFormat for PeFormat {
 
         let ldr_va = tls_va + page_up(tls.len() as u64);
         let ldr = module_list(&linked.modules, ldr_va);
-        let heap_va = ldr_va + page_up(ldr.len() as u64);
+        let params_va = ldr_va + page_up(ldr.len() as u64);
+        let params = process_params(req, &linked.modules[0].path, params_va);
+        let heap_va = params_va + page_up(params.len() as u64);
 
         let (mut teb, mut peb) = teb_peb::build(&teb_peb::BlockLayout {
             teb_va,
@@ -1221,7 +1263,7 @@ impl ImageFormat for PeFormat {
         });
         teb[teb_peb::TEB_TLS_POINTER..teb_peb::TEB_TLS_POINTER + 8]
             .copy_from_slice(&tls_va.to_le_bytes());
-        teb_peb::fill_peb(&mut peb, peb_va, ldr_va, heap_va);
+        teb_peb::fill_peb(&mut peb, peb_va, ldr_va, params_va, heap_va);
         let mut code = linked.stubs.clone();
         code.extend(start::emit(&steps, program_entry, peb_va, linked.exit_stub));
 
@@ -1255,6 +1297,7 @@ impl ImageFormat for PeFormat {
         env.map_region(peb_va, page_up(peb.len() as u64), rw, Some(&peb))?;
         env.map_region(tls_va, page_up(tls.len() as u64), rw, Some(&tls))?;
         env.map_region(ldr_va, page_up(ldr.len() as u64), rw, Some(&ldr))?;
+        env.map_region(params_va, page_up(params.len() as u64), rw, Some(&params))?;
         // The process heap: an arena the Win32 layer carves blocks from. The
         // header is all that is written; the rest arrives zeroed.
         env.map_region(
