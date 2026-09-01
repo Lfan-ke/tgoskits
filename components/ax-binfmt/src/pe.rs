@@ -11,6 +11,8 @@
 pub const DIR_BASERELOC: usize = 5;
 /// Data-directory index of the import table (`IMAGE_DIRECTORY_ENTRY_IMPORT`).
 pub const DIR_IMPORT: usize = 1;
+/// Data-directory index of the export table (`IMAGE_DIRECTORY_ENTRY_EXPORT`).
+pub const DIR_EXPORT: usize = 0;
 
 /// Base-relocation padding entry, ignored (`IMAGE_REL_BASED_ABSOLUTE`).
 pub const REL_ABSOLUTE: u16 = 0;
@@ -134,6 +136,99 @@ impl PeInfo {
             descriptor: start,
             thunk: 0,
             library: None,
+        })
+    }
+
+    /// Walk the export directory, naming what the image offers and where each
+    /// entry sits.
+    ///
+    /// The counterpart of [`imports`](Self::imports): binding one image's
+    /// imports means finding them among another's exports, so a loader needs
+    /// both sides. Mirrors ReactOS `LdrpGetProcedureAddress` walking
+    /// `IMAGE_EXPORT_DIRECTORY`.
+    ///
+    /// A forwarder - an entry whose address falls inside the directory itself,
+    /// naming another library rather than code - is reported as such rather
+    /// than as an address that would jump into the table.
+    pub fn exports<'a>(&self, image: &'a [u8]) -> Option<Exports<'a>> {
+        let dir = self.data_dir(image, DIR_EXPORT)?;
+        let at = self.rva_to_file(image, dir.rva)?;
+        let count = read_u32(image, at + 24)?;
+        Some(Exports {
+            pe: *self,
+            image,
+            dir,
+            names: self.rva_to_file(image, read_u32(image, at + 32)?)?,
+            ordinals: self.rva_to_file(image, read_u32(image, at + 36)?)?,
+            functions: self.rva_to_file(image, read_u32(image, at + 28)?)?,
+            ordinal_base: read_u32(image, at + 16)?,
+            index: 0,
+            count,
+        })
+    }
+}
+
+/// Where an exported name leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportTarget<'a> {
+    /// An RVA into this image.
+    Rva(u32),
+    /// Another library's entry, as `library.symbol`, which the exporting image
+    /// spells in place of an address.
+    Forwarder(&'a str),
+}
+
+/// One exported name and where it leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Export<'a> {
+    /// The exported name.
+    pub name: &'a str,
+    /// Its ordinal, biased by the directory's base as callers see it.
+    pub ordinal: u32,
+    /// What it resolves to.
+    pub target: ExportTarget<'a>,
+}
+
+/// Iterator over an image's named exports.
+pub struct Exports<'a> {
+    pe: PeInfo,
+    image: &'a [u8],
+    dir: DataDir,
+    names: usize,
+    ordinals: usize,
+    functions: usize,
+    ordinal_base: u32,
+    index: u32,
+    count: u32,
+}
+
+impl<'a> Iterator for Exports<'a> {
+    type Item = Export<'a>;
+
+    fn next(&mut self) -> Option<Export<'a>> {
+        if self.index >= self.count {
+            return None;
+        }
+        let i = self.index as usize;
+        self.index += 1;
+
+        let name_rva = read_u32(self.image, self.names + i * 4)?;
+        let name = ascii_at(self.image, self.pe.rva_to_file(self.image, name_rva)?)?;
+        // The ordinal table is indexed the same as the name table and holds the
+        // index into the function table, unbiased.
+        let slot = read_u16(self.image, self.ordinals + i * 2)? as usize;
+        let rva = read_u32(self.image, self.functions + slot * 4)?;
+
+        // An address inside the export directory is a forwarder string, not code.
+        let target = if rva >= self.dir.rva && rva < self.dir.rva + self.dir.size {
+            ExportTarget::Forwarder(ascii_at(self.image, self.pe.rva_to_file(self.image, rva)?)?)
+        } else {
+            ExportTarget::Rva(rva)
+        };
+        Some(Export {
+            name,
+            ordinal: self.ordinal_base + slot as u32,
+            target,
         })
     }
 }
@@ -686,5 +781,75 @@ mod tests {
         let b = synth(0x1_4000_0000, 0x1000, 1, 1);
         let pe = parse(&b).expect("valid PE32+");
         assert!(pe.imports(&b).is_none());
+    }
+
+    /// A PE that exports two names: one at an address of its own, one forwarded
+    /// to another library.
+    fn synth_with_exports() -> Vec<u8> {
+        let mut b = synth(0x1_4000_0000, 0x1000, 3, 1);
+        put_section(
+            &mut b,
+            0,
+            Section {
+                rva: 0x1000,
+                vsize: 0x200,
+                raw_ptr: 0x400,
+                raw_size: 0x200,
+                characteristics: SCN_MEM_READ,
+            },
+        );
+        // The directory spans RVA 0x1000..0x1100; an address inside it is a
+        // forwarder string rather than code.
+        put_data_dir(&mut b, DIR_EXPORT, 0x1000, 0x100);
+
+        // IMAGE_EXPORT_DIRECTORY at RVA 0x1000 (file 0x400).
+        b[0x410..0x414].copy_from_slice(&5u32.to_le_bytes()); // Base
+        b[0x414..0x418].copy_from_slice(&2u32.to_le_bytes()); // NumberOfFunctions
+        b[0x418..0x41C].copy_from_slice(&2u32.to_le_bytes()); // NumberOfNames
+        b[0x41C..0x420].copy_from_slice(&0x1040u32.to_le_bytes()); // AddressOfFunctions
+        b[0x420..0x424].copy_from_slice(&0x1050u32.to_le_bytes()); // AddressOfNames
+        b[0x424..0x428].copy_from_slice(&0x1060u32.to_le_bytes()); // AddressOfNameOrdinals
+
+        b[0x440..0x444].copy_from_slice(&0x2000u32.to_le_bytes()); // Alpha -> code
+        b[0x444..0x448].copy_from_slice(&0x10C0u32.to_le_bytes()); // Beta -> forwarder
+        b[0x450..0x454].copy_from_slice(&0x1090u32.to_le_bytes());
+        b[0x454..0x458].copy_from_slice(&0x10A0u32.to_le_bytes());
+        b[0x460..0x462].copy_from_slice(&0u16.to_le_bytes());
+        b[0x462..0x464].copy_from_slice(&1u16.to_le_bytes());
+        b[0x490..0x496].copy_from_slice(b"Alpha\0");
+        b[0x4A0..0x4A5].copy_from_slice(b"Beta\0");
+        b[0x4C0..0x4D0].copy_from_slice(b"OTHER.dll.Gamma\0");
+        b
+    }
+
+    #[test]
+    fn walks_the_export_directory() {
+        let b = synth_with_exports();
+        let pe = parse(&b).expect("valid PE32+");
+
+        let exports: Vec<Export> = pe.exports(&b).expect("an export directory").collect();
+
+        assert_eq!(
+            exports,
+            vec![
+                Export {
+                    name: "Alpha",
+                    ordinal: 5,
+                    target: ExportTarget::Rva(0x2000),
+                },
+                Export {
+                    name: "Beta",
+                    ordinal: 6,
+                    target: ExportTarget::Forwarder("OTHER.dll.Gamma"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_that_exports_nothing_has_no_export_directory() {
+        let b = synth(0x1_4000_0000, 0x1000, 1, 1);
+        let pe = parse(&b).expect("valid PE32+");
+        assert!(pe.exports(&b).is_none());
     }
 }
