@@ -193,6 +193,10 @@ impl ax_binfmt::LoadEnv for ExecSpace<'_> {
             .map_err(|_| ax_binfmt::AbiError::MalformedImage)
     }
 
+    fn trace(&mut self, message: &str) {
+        warn!("exec: {message}");
+    }
+
     fn interpret(&mut self, path: &str) -> ax_binfmt::AbiResult<()> {
         let loc = ax_fs_ng::vfs::current_fs_context()
             .lock()

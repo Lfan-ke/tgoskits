@@ -100,7 +100,16 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
             if is_system(&lib) || modules.iter().any(|m| m.name == lib) {
                 continue;
             }
-            let (path, bytes) = find(&lib, &app_dir, env)?;
+            let (path, bytes) = match find(&lib, &app_dir, env) {
+                Ok(found) => found,
+                Err(err) => {
+                    env.trace(&format!(
+                        "{lib} is needed by {} and is neither beside it nor in {SYSTEM_DIR}",
+                        modules[at].name
+                    ));
+                    return Err(err);
+                }
+            };
             let pe = pe::parse(&bytes).ok_or(AbiError::MalformedImage)?;
             if !pe.pe64 {
                 return Err(AbiError::Unsupported);
@@ -132,9 +141,20 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         if let Some(imports) = pe.imports(&modules[at].bytes) {
             for import in imports {
                 let lib = canonical(import.library);
-                let value = match resolve(&modules, &lib, import.symbol, 0)? {
-                    Resolved::At(va) => va,
-                    Resolved::Stub(call) => stub_of(call),
+                let value = match resolve(&modules, &lib, import.symbol, 0) {
+                    Ok(Resolved::At(va)) => va,
+                    Ok(Resolved::Stub(call)) => stub_of(call),
+                    Err(err) => {
+                        let what = match import.symbol {
+                            ImportedSymbol::Name(name) => alloc::string::String::from(name),
+                            ImportedSymbol::Ordinal(n) => format!("#{n}"),
+                        };
+                        env.trace(&format!(
+                            "{}: {lib}!{what} is not provided",
+                            modules[at].name
+                        ));
+                        return Err(err);
+                    }
                 };
                 binds.push((import.thunk, value));
             }
