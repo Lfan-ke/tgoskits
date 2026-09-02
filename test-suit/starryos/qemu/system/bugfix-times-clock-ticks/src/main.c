@@ -32,6 +32,7 @@ static void check(int cond, const char *msg)
 int main(void)
 {
     long clk = sysconf(_SC_CLK_TCK);
+    check(clk == 100, "_SC_CLK_TCK == 100 (glibc/musl 固定, 为 times() 换算依据)");
     if (clk <= 0) {
         clk = 100;
     }
@@ -69,12 +70,8 @@ int main(void)
     check(t2 != (clock_t)-1, "times() 三次调用成功");
     long cpu = (long)(tb2.tms_utime + tb2.tms_stime);
     printf("  tms_utime+tms_stime = %ld ticks after busy loop\n", cpu);
-    if (cpu != 0) {
-        long cpu_hi = 100 * clk; /* 10000 for clk=100; micros bug yields ~1e5+ */
-        check(cpu <= cpu_hi, "tms 字段以节拍计(非微秒)");
-    } else {
-        printf("  SKIP | 内核未累计 CPU 时间, tms 单位判别跳过\n");
-    }
+    check(cpu > 0, "忙循环后 CPU 时间已记账 (tms 非零, 方能判定单位)");
+    check(cpu <= 100 * clk, "tms 字段以节拍计而非微秒");
 
     printf("=== bug-times-clock-ticks: %s ===\n", failed ? "FAIL" : "PASS");
     return failed;
