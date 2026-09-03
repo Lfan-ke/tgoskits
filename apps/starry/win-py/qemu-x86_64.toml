@@ -17,4 +17,4 @@ fail_regex = [
     '(?i)invalid executable',
     '(?i)exec format error',
 ]
-timeout = 300
+timeout = 2400

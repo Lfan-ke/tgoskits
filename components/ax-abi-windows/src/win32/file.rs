@@ -152,8 +152,17 @@ fn descriptor(handle: usize) -> Result<i32, Ntstatus> {
 /// CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
 /// dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile).
 pub fn create_file(c: &mut Call<'_>) -> Dispatch {
-    let (name, access, sa, creation, attributes) =
-        (c.arg(0), c.arg(1), c.arg(3), c.arg(4), c.arg(5));
+    // CreateFileW's dwDesiredAccess / dwCreationDisposition /
+    // dwFlagsAndAttributes are 32-bit DWORDs; the x64 stack slots carrying
+    // them may leave the upper 32 bits dirty, so truncate before use (a
+    // dirty disposition like 0x1_0000_0003 must read as OPEN_EXISTING).
+    let (name, access, sa, creation, attributes) = (
+        c.arg(0),
+        c.arg(1) as u32 as usize,
+        c.arg(3),
+        c.arg(4) as u32 as usize,
+        c.arg(5) as u32 as usize,
+    );
     let Some(name) = name_at(c, name).filter(|n| !n.is_empty()) else {
         return c.fail(ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE);
     };

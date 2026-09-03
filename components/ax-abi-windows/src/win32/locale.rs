@@ -387,6 +387,44 @@ pub fn compare_string(c: &mut Call<'_>) -> Dispatch {
     })
 }
 
+/// CompareStringOrdinal(lpString1, cchCount1, lpString2, cchCount2,
+/// bIgnoreCase): ordinal (code-unit) order of two UTF-16 strings, folding
+/// case when asked. A count of -1 means the string is null-terminated.
+pub fn compare_string_ordinal(c: &mut Call<'_>) -> Dispatch {
+    let (s1, n1, s2, n2, ignore_case) = (
+        c.arg(0),
+        c.arg(1) as i32,
+        c.arg(2),
+        c.arg(3) as i32,
+        c.arg(4) != 0,
+    );
+    let read = |c: &Call<'_>, at: usize, n: i32| {
+        if n < 0 {
+            c.read_wstr(at)
+        } else {
+            c.read_wide_n(at, n as usize)
+        }
+    };
+    let (Some(a), Some(b)) = (read(c, s1, n1), read(c, s2, n2)) else {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    };
+    let fold = |u: &u16| -> u32 {
+        if ignore_case {
+            char::from_u32(u32::from(*u))
+                .and_then(|ch| ch.to_lowercase().next())
+                .map_or(u32::from(*u), u32::from)
+        } else {
+            u32::from(*u)
+        }
+    };
+    let ordering = a.iter().map(fold).cmp(b.iter().map(fold));
+    c.finish(match ordering {
+        core::cmp::Ordering::Less => CSTR_LESS_THAN,
+        core::cmp::Ordering::Equal => CSTR_EQUAL,
+        core::cmp::Ordering::Greater => CSTR_GREATER_THAN,
+    })
+}
+
 /// IsValidLocale(Locale, dwFlags): the one locale here, under each of the
 /// names it goes by.
 pub fn is_valid_locale(c: &mut Call<'_>) -> Dispatch {
