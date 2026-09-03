@@ -26,7 +26,8 @@ done
 install -d "$overlay_dir/python" "$overlay_dir/windows/system32"
 install -m 0755 "$dll_dir/python.exe" "$overlay_dir/python/python.exe"
 install -m 0644 "$dll_dir/python314.dll" "$overlay_dir/python/python314.dll"
-for f in ucrtbase.dll vcruntime140.dll vcruntime140_1.dll python3.dll; do
+for f in ucrtbase.dll vcruntime140.dll vcruntime140_1.dll python3.dll \
+         libcrypto-3.dll libssl-3.dll sqlite3.dll libffi-8.dll libtommath.dll; do
     [[ -f "$dll_dir/$f" ]] || continue
     install -m 0644 "$dll_dir/$f" "$overlay_dir/windows/system32/$f"
     install -m 0644 "$dll_dir/$f" "$overlay_dir/python/$f"
@@ -66,3 +67,8 @@ for f in "$dll_dir"/*.pyd; do
     [[ -f "$f" ]] || continue
     install -m 0644 "$f" "$overlay_dir/python/$(basename "$f")"
 done
+
+# In-process runner for the extended suite: the suite's own run_all.py spawns
+# a child interpreter per module, which needs CreateProcessW; this runs them
+# in one interpreter instead.
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/suite_inproc.py" "$overlay_dir/python/suite_inproc.py"

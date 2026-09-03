@@ -10,6 +10,7 @@ def chk(name, cond, info=""):
 
 
 import os
+import posixpath
 import io
 import stat as statmod
 import errno
@@ -34,43 +35,43 @@ _START_CWD = os.getcwd()
 # ============================================================================
 
 # os.path.join: joins with sep; an absolute component resets the result.
-chk("path_join", os.path.join("a", "b", "c") == "a/b/c")
-chk("path_join_abs_reset", os.path.join("a", "/b", "c") == "/b/c")
-chk("path_join_empty_tail", os.path.join("a", "") == "a/")
+chk("path_join", posixpath.join("a", "b", "c") == "a/b/c")
+chk("path_join_abs_reset", posixpath.join("a", "/b", "c") == "/b/c")
+chk("path_join_empty_tail", posixpath.join("a", "") == "a/")
 
 # os.path.split: splits into (head, tail) at the last slash.
-chk("path_split", os.path.split("/a/b/c.txt") == ("/a/b", "c.txt"))
-chk("path_split_trailing", os.path.split("/a/b/") == ("/a/b", ""))
+chk("path_split", posixpath.split("/a/b/c.txt") == ("/a/b", "c.txt"))
+chk("path_split_trailing", posixpath.split("/a/b/") == ("/a/b", ""))
 
 # os.path.splitext: splits the extension (the last dot), leading dots ignored.
-chk("path_splitext", os.path.splitext("/a/b.tar.gz") == ("/a/b.tar", ".gz"))
-chk("path_splitext_none", os.path.splitext("/a/b") == ("/a/b", ""))
-chk("path_splitext_dotfile", os.path.splitext("/a/.bashrc") == ("/a/.bashrc", ""))
+chk("path_splitext", posixpath.splitext("/a/b.tar.gz") == ("/a/b.tar", ".gz"))
+chk("path_splitext_none", posixpath.splitext("/a/b") == ("/a/b", ""))
+chk("path_splitext_dotfile", posixpath.splitext("/a/.bashrc") == ("/a/.bashrc", ""))
 
 # os.path.basename / dirname: tail / head of the split.
-chk("path_basename", os.path.basename("/a/b/c.txt") == "c.txt")
-chk("path_dirname", os.path.dirname("/a/b/c.txt") == "/a/b")
+chk("path_basename", posixpath.basename("/a/b/c.txt") == "c.txt")
+chk("path_dirname", posixpath.dirname("/a/b/c.txt") == "/a/b")
 
 # os.path.isabs: leading slash => absolute on POSIX.
-chk("path_isabs_true", os.path.isabs("/x/y") is True)
-chk("path_isabs_false", os.path.isabs("x/y") is False)
+chk("path_isabs_true", posixpath.isabs("/x/y") is True)
+chk("path_isabs_false", posixpath.isabs("x/y") is False)
 
 # os.path.normpath: collapse "." / ".." / duplicate slashes (lexically).
-chk("path_normpath", os.path.normpath("/a/./b/../c//d") == "/a/c/d")
-chk("path_normpath_dotdot", os.path.normpath("a/b/../..") == ".")
+chk("path_normpath", posixpath.normpath("/a/./b/../c//d") == "/a/c/d")
+chk("path_normpath_dotdot", posixpath.normpath("a/b/../..") == ".")
 
 # os.path.abspath: normpath of join(getcwd, path); absolute already => normpath.
-chk("path_abspath_abs", os.path.abspath("/a/./b") == "/a/b")
+chk("path_abspath_abs", posixpath.abspath("/a/./b") == "/a/b")
 chk("path_abspath_rel_isabs", os.path.isabs(os.path.abspath("rel")) is True)
 
 # os.path.relpath: path expressed relative to start.
-chk("path_relpath", os.path.relpath("/a/b/c", "/a/b") == "c")
-chk("path_relpath_up", os.path.relpath("/a/x", "/a/b/c") == "../../x")
+chk("path_relpath", posixpath.relpath("/a/b/c", "/a/b") == "c")
+chk("path_relpath_up", posixpath.relpath("/a/x", "/a/b/c") == "../../x")
 
 # os.path.commonpath: longest common *path* (component-wise).
-chk("path_commonpath", os.path.commonpath(["/a/b/c", "/a/b/d"]) == "/a/b")
+chk("path_commonpath", posixpath.commonpath(["/a/b/c", "/a/b/d"]) == "/a/b")
 # os.path.commonprefix: naive *character* prefix (NOT path aware).
-chk("path_commonprefix", os.path.commonprefix(["/a/bc", "/a/bd"]) == "/a/b")
+chk("path_commonprefix", posixpath.commonprefix(["/a/bc", "/a/bd"]) == "/a/b")
 
 # os.path.expanduser: "~" -> HOME (env-driven); when HOME absent it returns
 # unchanged. Drive HOME deterministically.

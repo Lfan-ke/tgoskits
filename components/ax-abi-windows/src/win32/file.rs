@@ -833,6 +833,61 @@ pub fn find_next_file(c: &mut Call<'_>) -> Dispatch {
     c.finish(TRUE)
 }
 
+/// CreatePipe(hReadPipe, hWritePipe, lpPipeAttributes, nSize): an anonymous
+/// pipe from the host, its two ends handed out as handles.
+pub fn create_pipe(c: &mut Call<'_>) -> Dispatch {
+    let (read_out, write_out) = (c.arg(0), c.arg(1));
+    let Some(files) = c.host.files() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    let (read_fd, write_fd) = match files.pipe() {
+        Ok(ends) => ends,
+        Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
+    };
+    let read = Handle::from_slot(read_fd as usize).0 as u64;
+    let write = Handle::from_slot(write_fd as usize).0 as u64;
+    if !c.write_u64(read_out, read) || !c.write_u64(write_out, write) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+    }
+    c.finish(TRUE)
+}
+
+/// CreateDirectoryW(lpPathName, lpSecurityAttributes).
+pub fn create_directory(c: &mut Call<'_>) -> Dispatch {
+    path_op(c, |paths, host| paths.mkdir(At::Cwd, host, 0o777))
+}
+
+/// DeleteFileW(lpFileName).
+pub fn delete_file(c: &mut Call<'_>) -> Dispatch {
+    path_op(c, |paths, host| paths.unlink(At::Cwd, host))
+}
+
+/// RemoveDirectoryW(lpPathName).
+pub fn remove_directory(c: &mut Call<'_>) -> Dispatch {
+    path_op(c, |paths, host| paths.rmdir(At::Cwd, host))
+}
+
+/// What the three share: the name at argument 0 as a host path, one
+/// operation on it, and a BOOL with the failure in the last error.
+fn path_op(
+    c: &mut Call<'_>,
+    op: impl FnOnce(&dyn ax_abi_port::Paths, &str) -> Result<(), i32>,
+) -> Dispatch {
+    let Some(name) = name_at(c, c.arg(0)) else {
+        return c.fail(super::ERROR_INVALID_PARAMETER, FALSE);
+    };
+    let Some(host) = host_path(c, &name) else {
+        return c.fail(ERROR_FILE_NOT_FOUND, FALSE);
+    };
+    let Some(paths) = c.host.paths() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    match op(paths, &host) {
+        Ok(()) => c.finish(TRUE),
+        Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+    }
+}
+
 /// FindClose(hFindFile): free the snapshot.
 pub fn find_close(c: &mut Call<'_>) -> Dispatch {
     let block = c.arg(0);

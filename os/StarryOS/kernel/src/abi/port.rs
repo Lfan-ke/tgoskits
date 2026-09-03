@@ -16,6 +16,7 @@ use ax_abi_port::{
 };
 use ax_runtime::hal;
 use ax_task::current;
+use axfs_ng_vfs::NodePermission;
 use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
 use starry_signal::SignalSet;
 use starry_vm::{vm_load_until_nul, vm_read_slice, vm_write_slice};
@@ -25,7 +26,10 @@ use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, R_OK,
 use super::{KernelHost, errno, port_result};
 use crate::{
     StarryError, StarryResult,
-    file::{Directory, FileLike, ResolveAtResult, add_file_like, close_file_like, get_file_like, resolve_at},
+    file::{
+        Directory, FileLike, ResolveAtResult, add_file_like, close_file_like, get_file_like,
+        resolve_at, with_fs, Pipe,
+    },
     mm::VmBytesMut,
     syscall::access_permitted,
     syscall,
@@ -128,6 +132,46 @@ impl Paths for KernelHost {
             At::Dir(fd) => fd,
         };
         port_result(open_path(dirfd, path, how))
+    }
+
+    fn unlink(&self, at: At, path: &str) -> Result<(), i32> {
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        with_fs(dirfd, |fs| {
+            fs.remove_file(path)?;
+            Ok(())
+        })
+        .map_err(errno)
+    }
+
+    fn mkdir(&self, at: At, path: &str, mode: u32) -> Result<(), i32> {
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let curr = current();
+        let thread = curr.as_thread();
+        let mode = NodePermission::from_bits_truncate((mode & !thread.proc_data.umask()) as u16);
+        let cred = thread.cred();
+        with_fs(dirfd, |fs| {
+            fs.create_dir(path, mode, cred.fsuid, cred.fsgid)?;
+            Ok(())
+        })
+        .map_err(errno)
+    }
+
+    fn rmdir(&self, at: At, path: &str) -> Result<(), i32> {
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        with_fs(dirfd, |fs| {
+            fs.remove_dir(path)?;
+            Ok(())
+        })
+        .map_err(errno)
     }
 
     fn attributes(&self, at: At, path: &str, follow: bool) -> Result<Attributes, i32> {
@@ -267,6 +311,16 @@ impl Files for KernelHost {
     fn close(&self, fd: i32) -> SysResult {
         close_file_like(fd).map_err(errno)?;
         Ok(0)
+    }
+
+    fn pipe(&self) -> Result<(i32, i32), i32> {
+        let (read_end, write_end) = Pipe::new();
+        let read_fd = read_end.add_to_fd_table(true).map_err(errno)?;
+        let write_fd = write_end.add_to_fd_table(true).map_err(|err| {
+            let _ = close_file_like(read_fd);
+            errno(err)
+        })?;
+        Ok((read_fd, write_fd))
     }
 
     fn dup(&self, fd: i32) -> SysResult {

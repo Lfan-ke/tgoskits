@@ -4,16 +4,23 @@
 //! The image is read, mapped at an address the host chooses, relocated for it,
 //! and bound against what the process already holds: a real DLL's exports are
 //! read from its mapped image, a system library's entries are served by their
-//! stubs. It is then entered in the loader list so `GetProcAddress` and
-//! `GetModuleHandleW` find it. `DllMain` is not run: a trap cannot call back
-//! into the program, and an extension module's entry is CRT boilerplate.
+//! stubs. A library it needs that is not loaded yet is brought in first, the
+//! way the loader reaches every library at start. It is then entered in the
+//! loader list so `GetProcAddress` and `GetModuleHandleW` find it.
+//!
+//! `DllMain` has to run - a C runtime initializes its per-module state there,
+//! and OpenSSL, for one, cannot initialize without it - but a trap cannot call
+//! back into the program. So the entry points to call are queued, dependencies
+//! first, where the `LoadLibrary` stub's tail finds them: the attach
+//! trampoline past the kernel32 stubs walks the queue before returning to the
+//! caller (see [`crate::thunk::attach_trampoline`]).
 
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 
 use ax_abi_port::{At, Create, MapRequest, MapSource, OpenHow, Prot};
 use ax_binfmt::pe::{self, ImportedSymbol, PeInfo, Reloc};
 
-use super::{Call, Win32Call, mapped};
+use super::{Call, PEB_PENDING_ATTACH, Win32Call, mapped};
 use crate::{
     bind_section, dll, image_extent, relocate_section,
     teb_peb::{
@@ -25,6 +32,13 @@ use crate::{
 };
 
 const PAGE: usize = 0x1000;
+/// How deep a chain of libraries needing libraries may go before it is taken
+/// for a cycle.
+const DEPTH_LIMIT: u8 = 8;
+const SYSTEM_DIR: &str = "Z:\\windows\\system32";
+
+/// An entry point to call with `DLL_PROCESS_ATTACH`, and the base to pass it.
+type Attach = (u64, u64);
 
 /// Read a guest file whole. The file port reads into user memory, so the bytes
 /// land in a scratch mapping first and are copied out of it.
@@ -71,9 +85,51 @@ fn read_whole(c: &Call<'_>, host: &str) -> Option<Vec<u8>> {
     read
 }
 
+/// A section's characteristics as the memory port spells protection.
+fn port_prot(sec: &pe::Section) -> Prot {
+    let mut prot = Prot::empty();
+    prot.set(Prot::READ, sec.readable());
+    prot.set(Prot::WRITE, sec.writable());
+    prot.set(Prot::EXEC, sec.executable());
+    prot
+}
+
+/// The base of `lib` once it is in the process: found in the loader list, or
+/// brought in from beside the library that needs it or from the system
+/// directory, as the loader searches at start.
+fn library(
+    c: &mut Call<'_>,
+    lib: &str,
+    beside: &str,
+    depth: u8,
+    pending: &mut Vec<Attach>,
+) -> Option<usize> {
+    if let Some(base) = super::runtime::module_named(c, lib) {
+        return Some(base);
+    }
+    if depth >= DEPTH_LIMIT {
+        return None;
+    }
+    for dir in [beside, SYSTEM_DIR] {
+        let path = alloc::format!("{dir}\\{lib}");
+        if let Some(base) = load_at(c, &path, depth + 1, pending) {
+            return Some(base);
+        }
+    }
+    None
+}
+
 /// Where `symbol` from `lib` is in this process: a stub for a system library,
-/// otherwise an export read from the mapped image of a library already loaded.
-fn resolve(c: &Call<'_>, lib: &str, symbol: ImportedSymbol<'_>) -> Option<u64> {
+/// otherwise an export read from the mapped image of the library, loaded
+/// first if need be.
+fn resolve(
+    c: &mut Call<'_>,
+    lib: &str,
+    symbol: ImportedSymbol<'_>,
+    beside: &str,
+    depth: u8,
+    pending: &mut Vec<Attach>,
+) -> Option<u64> {
     if dll::is_system(lib) {
         let call = match symbol {
             ImportedSymbol::Name(name) => Win32Call::resolve(lib, name),
@@ -83,22 +139,13 @@ fn resolve(c: &Call<'_>, lib: &str, symbol: ImportedSymbol<'_>) -> Option<u64> {
         let base = super::runtime::module_named(c, dll::SYSTEM_NAMES[which])?;
         return Some((base + thunk::MODULE_HEADER + at * thunk::STUB_LEN) as u64);
     }
-    let base = super::runtime::module_named(c, lib)?;
+    let base = library(c, lib, beside, depth, pending)?;
     let exports = mapped::exports(c, base)?;
     let at = match symbol {
         ImportedSymbol::Name(name) => mapped::by_name(c, base, &exports, name.as_bytes()),
         ImportedSymbol::Ordinal(n) => mapped::by_ordinal(c, base, &exports, u32::from(n)),
     }?;
     Some(at as u64)
-}
-
-/// A section's characteristics as the memory port spells protection.
-fn port_prot(sec: &pe::Section) -> Prot {
-    let mut prot = Prot::empty();
-    prot.set(Prot::READ, sec.readable());
-    prot.set(Prot::WRITE, sec.writable());
-    prot.set(Prot::EXEC, sec.executable());
-    prot
 }
 
 fn write_units(c: &Call<'_>, at: usize, units: &[u16]) -> bool {
@@ -157,9 +204,34 @@ fn register(c: &Call<'_>, base: usize, pe: &PeInfo, size: usize, path: &str) -> 
     Some(())
 }
 
+/// Leave the entry points to attach where the stub's trampoline reads them: a
+/// block from the process heap of `(entry, base)` pairs ending in a zero pair,
+/// its address in the PEB.
+fn queue_attach(c: &Call<'_>, pending: &[Attach]) -> Option<()> {
+    let peb = c.peb()?;
+    let heap = c.read_u64(peb + PEB_PROCESS_HEAP)? as usize;
+    let block = super::heap::alloc(c, heap, (pending.len() + 1) * 16)?;
+    for (i, (entry, base)) in pending.iter().chain([&(0, 0)]).enumerate() {
+        if !c.write_u64(block + i * 16, *entry) || !c.write_u64(block + i * 16 + 8, *base) {
+            return None;
+        }
+    }
+    c.write_u64(peb + PEB_PENDING_ATTACH, block as u64)
+        .then_some(())
+}
+
 /// Map the library at `text` (a Windows path) into the process and link it.
 /// The base is the module handle.
 pub(super) fn load_library(c: &mut Call<'_>, text: &str) -> Option<usize> {
+    let mut pending = Vec::new();
+    let base = load_at(c, text, 0, &mut pending)?;
+    if !pending.is_empty() {
+        queue_attach(c, &pending)?;
+    }
+    Some(base)
+}
+
+fn load_at(c: &mut Call<'_>, text: &str, depth: u8, pending: &mut Vec<Attach>) -> Option<usize> {
     // A name without an extension means the `.dll`, as Windows takes it.
     let named;
     let text = match text.rsplit(['\\', '/']).next() {
@@ -168,6 +240,10 @@ pub(super) fn load_library(c: &mut Call<'_>, text: &str) -> Option<usize> {
             named.as_str()
         }
         _ => text,
+    };
+    let beside: String = match text.rsplit_once('\\') {
+        Some((dir, _)) if !dir.is_empty() => String::from(dir),
+        _ => String::from("Z:\\python"),
     };
     let host = super::file::host_path(c, text)?;
     let bytes = read_whole(c, &host)?;
@@ -180,9 +256,9 @@ pub(super) fn load_library(c: &mut Call<'_>, text: &str) -> Option<usize> {
     if let Some(imports) = pe.imports(&bytes) {
         for import in imports {
             let lib = dll::canonical(import.library);
-            let Some(value) = resolve(c, &lib, import.symbol) else {
+            let Some(value) = resolve(c, &lib, import.symbol, &beside, depth, pending) else {
                 let what = match import.symbol {
-                    ImportedSymbol::Name(name) => alloc::string::String::from(name),
+                    ImportedSymbol::Name(name) => String::from(name),
                     ImportedSymbol::Ordinal(n) => alloc::format!("#{n}"),
                 };
                 c.host.platform().trace(&alloc::format!(
@@ -234,5 +310,13 @@ pub(super) fn load_library(c: &mut Call<'_>, text: &str) -> Option<usize> {
         );
     }
     register(c, base, &pe, size, text)?;
+    // Dependencies were queued while their imports resolved, so this one
+    // follows them, as its entry point may call into theirs.
+    if pe.entry_rva != 0 {
+        pending.push((base as u64 + u64::from(pe.entry_rva), base as u64));
+    }
+    c.host.platform().trace(&alloc::format!(
+        "LoadLibraryExW: {text} at {base:#x}+{size:#x}"
+    ));
     Some(base)
 }

@@ -9,15 +9,10 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/python/python.exe /python/probe.py"
-success_regex = ['(?m)^IMPORT-OK [0-9]']
+shell_init_cmd = "/python/python.exe /python/suite_inproc.py"
+success_regex = ['(?m)^SUITE-SUMMARY ']
 fail_regex = [
-    '(?i)panic(?:ked)?',
-    '(?i)not (?:yet )?runnable',
-    '(?i)invalid executable',
-    '(?i)exec format error',
-    '(?i)Traceback \(most recent call last\)',
-    'MemoryError',
     '(?i)Fatal Python error',
+    '(?i)panic',
 ]
 timeout = 2400

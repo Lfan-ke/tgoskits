@@ -361,6 +361,18 @@ pub trait Paths: Sync {
     /// kind to `sink`; a `sink` returning `false` stops the walk. `.` and `..`
     /// are not reported, as a program listing a directory does not expect
     /// them. A descriptor that is not a directory is an error.
+    /// Remove the file `path` names.
+    fn unlink(&self, _at: At, _path: &str) -> Result<(), i32> {
+        Err(38)
+    }
+    /// Make a directory at `path` with `mode`.
+    fn mkdir(&self, _at: At, _path: &str, _mode: u32) -> Result<(), i32> {
+        Err(38)
+    }
+    /// Remove the empty directory `path` names.
+    fn rmdir(&self, _at: At, _path: &str) -> Result<(), i32> {
+        Err(38)
+    }
     fn read_dir(&self, _fd: i32, _sink: &mut dyn FnMut(&str, NodeKind) -> bool) -> Result<(), i32> {
         Err(ENOSYS)
     }
@@ -393,6 +405,10 @@ pub trait Files: Sync {
     fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
     fn close(&self, fd: i32) -> SysResult;
     fn dup(&self, fd: i32) -> SysResult;
+    /// A pipe: the read end and the write end, as descriptors.
+    fn pipe(&self) -> Result<(i32, i32), i32> {
+        Err(38)
+    }
     fn seek(&self, fd: i32, to: SeekFrom) -> SysResult;
     /// Report whether `fd` is open, without touching it.
     fn validate(&self, fd: i32) -> SysResult;
