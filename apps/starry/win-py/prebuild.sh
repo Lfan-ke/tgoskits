@@ -55,3 +55,7 @@ install -d "$overlay_dir/suite"
 for f in "$suite_src"/*.py; do
     install -m 0644 "$f" "$overlay_dir/suite/$(basename "$f")"
 done
+
+# A small import smoke: exercises the C-runtime heap and directory
+# enumeration by importing real stdlib modules, then prints IMPORT-OK.
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe.py" "$overlay_dir/python/probe.py"

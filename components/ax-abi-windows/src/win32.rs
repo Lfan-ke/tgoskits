@@ -24,8 +24,11 @@
 //! and PEB and the structures they point at, so a program reading them
 //! directly sees what the functions report.
 
+use alloc::collections::BTreeMap;
+
 use ax_abi_port::{Host, MapRequest, MapSource, Prot};
 use ax_dispatch::{Dispatch, TrapEnv};
+use ax_sync::SpinLock;
 
 use crate::{
     handle::Handle,
@@ -857,11 +860,11 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         // Blocks are not returned to the arena yet; freeing is the record that
         // the caller is done with it, which HeapSize and HeapReAlloc respect.
         "HeapFree" => {
-            let block = c.arg(2);
+            let (heap, block) = (c.arg(0), c.arg(2));
             if block == 0 || heap::size_of(&c, block).is_none() {
                 return c.fail(ERROR_INVALID_PARAMETER, FALSE);
             }
-            heap::mark_free(&c, block);
+            heap::mark_free(&c, heap, block);
             c.finish(TRUE)
         }
         "InitializeCriticalSectionAndSpinCount" | "InitializeCriticalSectionEx" => {
@@ -927,7 +930,11 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             if heap::size_of(&c, block).is_none() {
                 return c.fail(ERROR_INVALID_PARAMETER, FALSE);
             }
-            heap::mark_free(&c, block);
+            let heap = c
+                .peb()
+                .and_then(|peb| c.read_u64(peb + PEB_PROCESS_HEAP))
+                .unwrap_or(0) as usize;
+            heap::mark_free(&c, heap, block);
             c.finish(TRUE)
         }
         "GetStartupInfoW" => get_startup_info(&mut c),
@@ -1040,6 +1047,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             c.finish(0)
         }
         "VirtualAlloc" => virtual_alloc(&mut c),
+        "VirtualFree" => virtual_free(&mut c),
         "VirtualProtect" => {
             let Some(mem) = host.mem() else {
                 return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
@@ -1219,6 +1227,8 @@ pub mod heap {
     pub const MAGIC: u64 = 0x5041_4548_5859_4152; // "RAXYHEAP"
     pub const LIMIT: usize = 8;
     pub const NEXT: usize = 16;
+    /// Head of the free list: header address of the first freed block, or 0.
+    pub const FREE_HEAD: usize = 24;
     pub const HEADER: usize = 32;
 
     /// Each block is preceded by its size and a state word.
@@ -1235,20 +1245,43 @@ pub mod heap {
         header
     }
 
-    /// Carve `size` bytes from the arena at `heap`, sixteen-byte aligned.
+    /// Carve `size` bytes from the arena at `heap`, sixteen-byte aligned. A
+    /// freed block big enough is taken off the free list before the frontier
+    /// is bumped, so a C runtime's constant malloc/free churn reuses memory
+    /// instead of marching the frontier to the limit. The scan walks only the
+    /// free list (freed blocks), not every block ever allocated.
     pub(super) fn alloc(c: &Call<'_>, heap: usize, size: usize) -> Option<usize> {
         if c.read_u64(heap)? != MAGIC {
             return None;
         }
+        let want = size.max(1);
+        let mut prev = 0usize;
+        let mut cur = c.read_u64(heap + FREE_HEAD)? as usize;
+        while cur != 0 {
+            let bsize = c.read_u64(cur)? as usize;
+            let next = c.read_u64(cur + BLOCK_HEADER)? as usize;
+            if bsize >= want {
+                if prev == 0 {
+                    c.write_u64(heap + FREE_HEAD, next as u64).then_some(())?;
+                } else {
+                    c.write_u64(prev + BLOCK_HEADER, next as u64)
+                        .then_some(())?;
+                }
+                c.write_u64(cur + 8, IN_USE).then_some(())?;
+                return Some(cur + BLOCK_HEADER);
+            }
+            prev = cur;
+            cur = next;
+        }
         let limit = c.read_u64(heap + LIMIT)? as usize;
-        let next = c.read_u64(heap + NEXT)? as usize;
-        let block = next + BLOCK_HEADER;
-        let end = block.checked_add(size.max(1))?.next_multiple_of(16);
+        let bump = c.read_u64(heap + NEXT)? as usize;
+        let block = bump + BLOCK_HEADER;
+        let end = block.checked_add(want)?.next_multiple_of(16);
         if end > limit {
             return None;
         }
-        c.write_u64(next, size as u64).then_some(())?;
-        c.write_u64(next + 8, IN_USE).then_some(())?;
+        c.write_u64(bump, size as u64).then_some(())?;
+        c.write_u64(bump + 8, IN_USE).then_some(())?;
         c.write_u64(heap + NEXT, end as u64).then_some(())?;
         Some(block)
     }
@@ -1262,8 +1295,14 @@ pub mod heap {
             .then(|| c.read_u64(block - BLOCK_HEADER).map(|n| n as usize))?
     }
 
-    pub(super) fn mark_free(c: &Call<'_>, block: usize) {
+    /// Return a block to the free list so a later `alloc` can reuse it. The
+    /// next-free link is stored in the block's own (now unused) data.
+    pub(super) fn mark_free(c: &Call<'_>, heap: usize, block: usize) {
+        let header = block - BLOCK_HEADER;
+        let old = c.read_u64(heap + FREE_HEAD).unwrap_or(0);
         c.write_u64(block - 8, FREE);
+        c.write_u64(block, old);
+        c.write_u64(heap + FREE_HEAD, header as u64);
     }
 }
 
@@ -1307,7 +1346,7 @@ fn heap_realloc(c: &mut Call<'_>) -> Dispatch {
     if flags & HEAP_ZERO_MEMORY != 0 && size > keep && !zero(c, block + keep, size - keep) {
         return c.fail(ERROR_NOT_ENOUGH_MEMORY, 0);
     }
-    heap::mark_free(c, old);
+    heap::mark_free(c, heap, old);
     c.finish(block)
 }
 
@@ -1522,6 +1561,15 @@ fn get_current_directory(c: &mut Call<'_>) -> Dispatch {
     c.finish(units)
 }
 
+/// Base -> reservation length for anonymous `VirtualAlloc` regions, so
+/// `VirtualFree(base, 0, MEM_RELEASE)` - which carries no size - can free the
+/// whole reservation. CPython's obmalloc releases its arenas exactly this way.
+static VALLOCS: SpinLock<BTreeMap<usize, usize>> = SpinLock::new(BTreeMap::new());
+
+/// `dwFreeType` values for `VirtualFree` (`memoryapi.h`).
+const MEM_DECOMMIT: u32 = 0x4000;
+const MEM_RELEASE: u32 = 0x8000;
+
 /// VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect), as
 /// NtAllocateVirtualMemory serves it.
 fn virtual_alloc(c: &mut Call<'_>) -> Dispatch {
@@ -1544,8 +1592,42 @@ fn virtual_alloc(c: &mut Call<'_>) -> Dispatch {
         source: MapSource::Anonymous,
     };
     match mem.map(&request) {
-        Ok(va) => c.finish(va as usize),
+        Ok(va) => {
+            let mut map = VALLOCS.lock();
+            let slot = map.entry(va as usize).or_insert(0);
+            *slot = (*slot).max(len);
+            drop(map);
+            c.finish(va as usize)
+        }
         Err(errno) => c.fail_status(nt::status_from_errno(errno), 0),
+    }
+}
+
+/// VirtualFree(lpAddress, dwSize, dwFreeType). MEM_RELEASE frees the whole
+/// reservation VirtualAlloc placed (dwSize must be 0), recovered from what the
+/// allocation recorded; MEM_DECOMMIT drops the pages but keeps the reservation,
+/// which this host models by leaving the mapping in place.
+fn virtual_free(c: &mut Call<'_>) -> Dispatch {
+    let Some(mem) = c.host.mem() else {
+        return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    let (at, size, free_type) = (c.arg(0), c.arg(1), c.arg(2) as u32);
+    let base = at & !0xFFF;
+    match free_type {
+        MEM_RELEASE => {
+            if size != 0 {
+                return c.fail(ERROR_INVALID_PARAMETER, FALSE);
+            }
+            let Some(len) = VALLOCS.lock().remove(&base) else {
+                return c.finish(TRUE);
+            };
+            match mem.unmap(base, len) {
+                Ok(_) => c.finish(TRUE),
+                Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+            }
+        }
+        MEM_DECOMMIT => c.finish(TRUE),
+        _ => c.fail(ERROR_INVALID_PARAMETER, FALSE),
     }
 }
 
@@ -1883,7 +1965,7 @@ mod tests {
             "WriteConsoleW",
             "WriteFile",
         ];
-        assert_eq!(CRT_START.len(), 144);
+        assert_eq!(CRT_START.len(), 145);
         for name in CRT_START {
             assert!(Win32Call::named(name).is_some(), "{name} is not bound");
         }

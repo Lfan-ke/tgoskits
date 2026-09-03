@@ -1,6 +1,6 @@
 args = [
     "-nographic",
-    "-m", "512M",
+    "-m", "1024M",
     "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
     "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
     "-device", "virtio-net-pci,netdev=net0",
@@ -9,12 +9,15 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/python/python.exe -c \"print('WIN-PY-OK')\""
-success_regex = ['(?m)^WIN-PY-OK\s*$']
+shell_init_cmd = "/python/python.exe /python/probe.py"
+success_regex = ['(?m)^IMPORT-OK [0-9]']
 fail_regex = [
-    '(?i)\bpanic(?:ked)?\b',
+    '(?i)panic(?:ked)?',
     '(?i)not (?:yet )?runnable',
     '(?i)invalid executable',
     '(?i)exec format error',
+    '(?i)Traceback \(most recent call last\)',
+    'MemoryError',
+    '(?i)Fatal Python error',
 ]
 timeout = 2400
