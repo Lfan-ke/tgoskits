@@ -200,7 +200,6 @@ flatten_objects = "0.2.4"
 hashbrown = "0.16"
 indoc = "2"
 inherit-methods-macro = "0.1.0"
-kernel-elf-parser = "0.3.4"
 linux-raw-sys = { version = "0.12", default-features = false, features = [
     "no_std",
     "general",
@@ -229,7 +228,6 @@ syscalls.workspace = true
 thiserror.workspace = true
 uluru = "3.1.0"
 weak-map = "0.1.1"
-xmas-elf = "0.9"
 zerocopy = { version = "0.8", features = ["derive"] }
 ax-ipi = { workspace = true }
 static-keys = "0.8"
