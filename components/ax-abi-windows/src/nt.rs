@@ -2076,11 +2076,11 @@ mod tests {
         win32::dispatch(&mut gone, &host);
         assert_eq!(gone.result, Some(usize::MAX), "a freed block has no size");
 
-        // Past the arena's end the heap says so rather than hand out memory
-        // it does not have.
+        // Past the first arena's end the heap grows: another arena is mapped
+        // and the block comes from it rather than being refused.
         let mut huge = call("HeapAlloc", [arena, 0, 0x2000, 0, 0, 0], teb);
         win32::dispatch(&mut huge, &host);
-        assert_eq!(huge.result, Some(0));
+        assert!(huge.result.is_some_and(|block| block != 0));
     }
 
     #[test]

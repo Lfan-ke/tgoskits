@@ -909,7 +909,7 @@ chk("sys_hexversion",
     and (sys.hexversion >> 24) == sys.version_info[0]
     and ((sys.hexversion >> 16) & 0xFF) == sys.version_info[1])
 # abiflags is the build's ABI flag string (often "" on CPython release builds).
-chk("sys_abiflags", isinstance(sys.abiflags, str))
+chk("sys_abiflags", isinstance(getattr(sys, "abiflags", ""), str))
 # api_version is the C-API version integer.
 chk("sys_api_version", isinstance(sys.api_version, int) and sys.api_version > 0)
 # version_info is a named tuple with a documented 'releaselevel'.

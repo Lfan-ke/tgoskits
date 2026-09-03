@@ -23,13 +23,66 @@ use crate::win32::{self, Win32Call};
 /// program that asks the loader about the module - `GetModuleHandleW` then
 /// `GetProcAddress` - to be answered out of an export directory, the way it
 /// would be by the real library. The stubs follow it, so every export's RVA is
-/// small and positive. Two pages: the names of every entry do not fit in one.
-pub const MODULE_HEADER: usize = 0x2000;
+/// small and positive. Four pages: the names of every entry do not fit in two.
+pub const MODULE_HEADER: usize = 0x4000;
 
 /// How much address space library `lib` takes: its header, then a stub per
 /// entry, rounded to a page so the next library starts on one.
 pub fn system_size(lib: usize) -> usize {
-    (MODULE_HEADER + win32::LIBRARIES[lib].exports.len() * STUB_LEN).next_multiple_of(0x1000)
+    let trampoline = if lib == 0 { ATTACH_LEN } else { 0 };
+    (MODULE_HEADER + win32::LIBRARIES[lib].exports.len() * STUB_LEN + trampoline)
+        .next_multiple_of(0x1000)
+}
+
+/// The room the attach trampoline takes past kernel32's last stub.
+pub const ATTACH_LEN: usize = 0x80;
+
+/// The code a `LoadLibrary` stub jumps to instead of returning: with the
+/// result in `rax` and the caller's `rsi`/`rdi` still pushed, it takes the
+/// list the host left in the PEB (see `PEB_PENDING_ATTACH`) and calls each
+/// entry point as `DllMain(base, DLL_PROCESS_ATTACH, NULL)`, then clears the
+/// slot and returns the way the stub would have. The stack is kept
+/// sixteen-byte aligned at the call with a shadow space in place.
+pub fn attach_trampoline() -> [u8; ATTACH_LEN] {
+    let mut out = [0xCC_u8; ATTACH_LEN];
+    let slot = (win32::PEB_PENDING_ATTACH as u32).to_le_bytes();
+    let code: &[&[u8]] = &[
+        &[0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00], // mov rcx, gs:[0x60]
+        &[0x48, 0x8B, 0x89, slot[0], slot[1], slot[2], slot[3]], // mov rcx, [rcx+slot]
+        &[0x48, 0x85, 0xC9],                                     // test rcx, rcx
+        &[0x74, 0x49],                                           // jz done
+        &[0x53],                                                 // push rbx
+        &[0x41, 0x54],                                           // push r12
+        &[0x48, 0x89, 0xC3],                                     // mov rbx, rax
+        &[0x49, 0x89, 0xCC],                                     // mov r12, rcx
+        &[0x48, 0x83, 0xEC, 0x28],                               // sub rsp, 40
+        &[0x49, 0x8B, 0x04, 0x24],                               // loop: mov rax, [r12]
+        &[0x48, 0x85, 0xC0],                                     // test rax, rax
+        &[0x74, 0x15],                                           // jz end
+        &[0x49, 0x8B, 0x4C, 0x24, 0x08],                         // mov rcx, [r12+8]
+        &[0xBA, 0x01, 0x00, 0x00, 0x00],                         // mov edx, 1
+        &[0x45, 0x31, 0xC0],                                     // xor r8d, r8d
+        &[0xFF, 0xD0],                                           // call rax
+        &[0x49, 0x83, 0xC4, 0x10],                               // add r12, 16
+        &[0xEB, 0xE2],                                           // jmp loop
+        &[0x48, 0x83, 0xC4, 0x28],                               // end: add rsp, 40
+        &[0x48, 0x89, 0xD8],                                     // mov rax, rbx
+        &[0x41, 0x5C],                                           // pop r12
+        &[0x5B],                                                 // pop rbx
+        &[0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00], // mov rcx, gs:[0x60]
+        &[
+            0x48, 0xC7, 0x81, slot[0], slot[1], slot[2], slot[3], 0, 0, 0, 0,
+        ], // mov [rcx+slot], 0
+        &[0x5E],                                                 // done: pop rsi
+        &[0x5F],                                                 // pop rdi
+        &[0xC3],                                                 // ret
+    ];
+    let mut at = 0;
+    for part in code {
+        out[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    out
 }
 
 /// How much address space every synthesized library takes together.
@@ -156,6 +209,21 @@ pub fn stub(call: Win32Call) -> [u8; STUB_LEN] {
         out[at..at + part.len()].copy_from_slice(part);
         at += part.len();
     }
+    // A library load returns through the attach trampoline instead, so the
+    // entry points of what it brought in run before the caller goes on.
+    if matches!(
+        call.symbol(),
+        "LoadLibraryExW" | "LoadLibraryW" | "LoadLibraryA" | "LoadLibraryExA"
+    ) {
+        let (lib, index) = call.place();
+        debug_assert_eq!(lib, 0, "the trampoline follows kernel32's stubs");
+        let tail = at - 3;
+        let count = win32::LIBRARIES[0].exports.len();
+        let rel = ((count - index) * STUB_LEN) as i64 - (tail + 5) as i64;
+        out[tail] = 0xE9;
+        out[tail + 1..tail + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+        out[tail + 5..].fill(0xCC);
+    }
     out
 }
 
@@ -232,12 +300,18 @@ mod tests {
         let pe = u32_at(0x3C) as usize;
         let dir = u32_at(pe + 24 + 112) as usize;
         let functions = u32_at(dir + 28) as usize;
+        let highest = win32::LIBRARIES[lib]
+            .exports
+            .iter()
+            .map(|(_, ordinal)| u32::from(*ordinal))
+            .max()
+            .unwrap();
         assert_eq!(
             u32_at(dir + 20),
-            116,
+            highest,
             "the function table spans to the highest ordinal"
         );
-        // Ordinal 111 is WSAGetLastError, the fifth entry: its stub is the fifth.
+        // WSAGetLastError is ordinal 111; its stub is at its table position.
         let at = win32::LIBRARIES[lib]
             .exports
             .iter()
@@ -247,8 +321,15 @@ mod tests {
             u32_at(functions + (111 - 1) * 4),
             (MODULE_HEADER + at * STUB_LEN) as u32
         );
-        // An ordinal nothing is exported under leads nowhere.
-        assert_eq!(u32_at(functions + (4 - 1) * 4), 0);
+        // An ordinal nothing is exported under leads nowhere: the first gap
+        // below the highest.
+        let used: alloc::collections::BTreeSet<u32> = win32::LIBRARIES[lib]
+            .exports
+            .iter()
+            .map(|(_, ordinal)| u32::from(*ordinal))
+            .collect();
+        let hole = (1..=highest).find(|o| !used.contains(o)).unwrap();
+        assert_eq!(u32_at(functions + (hole as usize - 1) * 4), 0);
     }
 
     #[test]

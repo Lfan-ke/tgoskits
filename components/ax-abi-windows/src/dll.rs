@@ -84,11 +84,18 @@ pub struct SystemModule {
 }
 
 /// The lowered name of synthesized library `lib`.
-pub(crate) const SYSTEM_NAMES: [&str; 5] = [
+pub(crate) const SYSTEM_NAMES: [&str; 12] = [
     "kernel32.dll",
     "advapi32.dll",
     "version.dll",
     "bcrypt.dll",
+    "crypt32.dll",
+    "user32.dll",
+    "iphlpapi.dll",
+    "rpcrt4.dll",
+    "ole32.dll",
+    "propsys.dll",
+    "winmm.dll",
     "ws2_32.dll",
 ];
 
@@ -201,6 +208,9 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         for i in 0..crate::win32::LIBRARIES[lib].exports.len() {
             let call = Win32Call::from_nr(first.nr() + i as u32).expect("in the table");
             image.extend_from_slice(&thunk::stub(call));
+        }
+        if lib == 0 {
+            image.extend_from_slice(&thunk::attach_trampoline());
         }
         image.resize(module.len as usize, 0xCC);
         stubs.extend_from_slice(&image);

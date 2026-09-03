@@ -122,6 +122,34 @@ pub const LIBRARIES: &[Library] = &[
         name: "bcrypt.dll",
         exports: BCRYPT,
     },
+    Library {
+        name: "CRYPT32.dll",
+        exports: CRYPT32,
+    },
+    Library {
+        name: "USER32.dll",
+        exports: USER32,
+    },
+    Library {
+        name: "IPHLPAPI.DLL",
+        exports: IPHLPAPI,
+    },
+    Library {
+        name: "RPCRT4.dll",
+        exports: RPCRT4,
+    },
+    Library {
+        name: "ole32.dll",
+        exports: OLE32,
+    },
+    Library {
+        name: "PROPSYS.dll",
+        exports: PROPSYS,
+    },
+    Library {
+        name: "WINMM.dll",
+        exports: WINMM,
+    },
     // Imported by ordinal, so the ordinals are the real library's, read out
     // of its export table.
     Library {
@@ -384,6 +412,47 @@ const KERNEL32: &[(&str, u16)] = &[
     ("WaitNamedPipeW", 0),
     ("WakeConditionVariable", 0),
     ("WriteConsoleA", 0),
+    ("AcquireSRWLockShared", 0),
+    ("AreFileApisANSI", 0),
+    ("ConvertFiberToThread", 0),
+    ("ConvertThreadToFiberEx", 0),
+    ("CreateFiberEx", 0),
+    ("CreateFileA", 0),
+    ("CreateIoCompletionPort", 0),
+    ("DeleteFiber", 0),
+    ("DeleteFileA", 0),
+    ("FormatMessageA", 0),
+    ("GetComputerNameExW", 0),
+    ("GetDiskFreeSpaceA", 0),
+    ("GetEnvironmentVariableW", 0),
+    ("GetFileAttributesA", 0),
+    ("GetFullPathNameA", 0),
+    ("GetQueuedCompletionStatus", 0),
+    ("GetSystemDirectoryA", 0),
+    ("GetSystemTime", 0),
+    ("GetTempPathA", 0),
+    ("GetTickCount", 0),
+    ("HeapCreate", 0),
+    ("HeapDestroy", 0),
+    ("InitializeCriticalSection", 0),
+    ("LoadLibraryExA", 0),
+    ("LockFile", 0),
+    ("OutputDebugStringA", 0),
+    ("PostQueuedCompletionStatus", 0),
+    ("ReadConsoleA", 0),
+    ("RegisterWaitForSingleObject", 0),
+    ("ReleaseSRWLockShared", 0),
+    ("SetFilePointer", 0),
+    ("SleepConditionVariableCS", 0),
+    ("SwitchToFiber", 0),
+    ("TryEnterCriticalSection", 0),
+    ("UnlockFile", 0),
+    ("UnregisterWait", 0),
+    ("UnregisterWaitEx", 0),
+    ("VerifyVersionInfoA", 0),
+    ("VirtualLock", 0),
+    ("WaitForMultipleObjectsEx", 0),
+    ("WakeAllConditionVariable", 0),
 ];
 
 const ADVAPI32: &[(&str, u16)] = &[
@@ -409,6 +478,12 @@ const ADVAPI32: &[(&str, u16)] = &[
     ("RegQueryValueExW", 0),
     ("RegSaveKeyW", 0),
     ("RegSetValueExW", 0),
+    ("CryptAcquireContextW", 0),
+    ("CryptGenRandom", 0),
+    ("CryptReleaseContext", 0),
+    ("DeregisterEventSource", 0),
+    ("RegisterEventSourceW", 0),
+    ("ReportEventW", 0),
 ];
 
 const VERSION: &[(&str, u16)] = &[
@@ -427,7 +502,89 @@ const WS2_32: &[(&str, u16)] = &[
     ("WSAGetLastError", 111),
     ("WSAStartup", 115),
     ("WSACleanup", 116),
+    ("WSAConnect", 33),
+    ("WSADuplicateSocketW", 39),
+    ("WSAIoctl", 59),
+    ("WSARecv", 73),
+    ("WSARecvFrom", 75),
+    ("WSASend", 78),
+    ("WSASendTo", 81),
+    ("WSASetLastError", 112),
+    ("WSASocketA", 87),
+    ("WSASocketW", 88),
+    ("WSAStringToAddressW", 91),
+    ("accept", 1),
+    ("bind", 2),
+    ("connect", 4),
+    ("freeaddrinfo", 165),
+    ("getaddrinfo", 166),
+    ("gethostbyaddr", 51),
+    ("gethostbyname", 52),
+    ("gethostname", 57),
+    ("getnameinfo", 170),
+    ("getpeername", 5),
+    ("getprotobyname", 53),
+    ("getprotobynumber", 54),
+    ("getservbyname", 55),
+    ("getservbyport", 56),
+    ("getsockname", 6),
+    ("htonl", 8),
+    ("htons", 9),
+    ("inet_addr", 11),
+    ("inet_ntoa", 12),
+    ("inet_ntop", 182),
+    ("inet_pton", 183),
+    ("ioctlsocket", 10),
+    ("listen", 13),
+    ("ntohl", 14),
+    ("ntohs", 15),
+    ("recv", 16),
+    ("recvfrom", 17),
+    ("select", 18),
+    ("sendto", 20),
+    ("setsockopt", 21),
+    ("shutdown", 22),
+    ("__WSAFDIsSet", 151),
 ];
+
+// What OpenSSL and the extension modules take from these; none does its
+// work here yet, so each entry links and fails honestly when reached.
+const CRYPT32: &[(&str, u16)] = &[
+    ("CertCloseStore", 0),
+    ("CertFindCertificateInStore", 0),
+    ("CertFreeCertificateContext", 0),
+    ("CertOpenSystemStoreW", 0),
+    ("CertAddStoreToCollection", 0),
+    ("CertEnumCRLsInStore", 0),
+    ("CertEnumCertificatesInStore", 0),
+    ("CertFreeCRLContext", 0),
+    ("CertGetEnhancedKeyUsage", 0),
+    ("CertOpenStore", 0),
+];
+const USER32: &[(&str, u16)] = &[
+    ("GetProcessWindowStation", 0),
+    ("GetUserObjectInformationW", 0),
+    ("MessageBoxW", 0),
+];
+const IPHLPAPI: &[(&str, u16)] = &[
+    ("ConvertInterfaceLuidToNameW", 0),
+    ("FreeMibTable", 0),
+    ("GetIfTable2Ex", 0),
+    ("if_indextoname", 0),
+    ("if_nametoindex", 0),
+];
+// The rest of what the extension modules link from the system: UUIDs for
+// the socket and uuid modules, and one entry each for ctypes, wmi and
+// winsound, so every module binds even where it will not do its work.
+const RPCRT4: &[(&str, u16)] = &[
+    ("RpcStringFreeW", 0),
+    ("UuidCreateSequential", 0),
+    ("UuidFromStringW", 0),
+    ("UuidToStringW", 0),
+];
+const OLE32: &[(&str, u16)] = &[("ProgIDFromCLSID", 0)];
+const PROPSYS: &[(&str, u16)] = &[("VariantToString", 0)];
+const WINMM: &[(&str, u16)] = &[("PlaySoundW", 0)];
 
 /// A Win32 entry point this package binds: a position across [`LIBRARIES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,7 +905,80 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         // The pseudo-handles, as `NtCurrentProcess()` and `NtCurrentThread()`.
         "GetCurrentProcess" => c.finish(Handle::CURRENT_PROCESS.0 as usize),
         "GetCurrentThread" => c.finish(Handle::CURRENT_THREAD.0 as usize),
-        "GetSystemTimeAsFileTime" => {
+        "GetTickCount" | "GetTickCount64" => {
+            let ms = host.clock().map_or(0, |clock| clock.wall_ns() / 1_000_000);
+            c.finish(ms as usize)
+        }
+        // SYSTEMTIME from the wall clock; local time is UTC here.
+        "GetSystemTime" | "GetLocalTime" => {
+            let Some(clock) = host.clock() else {
+                return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+            };
+            if !write_system_time(&c, c.arg(0), clock.wall_ns()) {
+                return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+            }
+            c.finish(0)
+        }
+        // Console control handlers and event objects: nothing is delivered
+        // and nothing waits, so registering and signalling both succeed.
+        "SetConsoleCtrlHandler" | "SetEvent" | "ResetEvent" => c.finish(TRUE),
+        // Semaphores and mutexes: with one thread nothing ever waits on them,
+        // so each is a sentinel handle that every release accepts.
+        "CreateSemaphoreA" | "CreateSemaphoreW" | "CreateMutexA" | "CreateMutexW" => {
+            c.set_last_error(0);
+            c.finish(0x1000_0008)
+        }
+        "ReleaseSemaphore" => {
+            let previous = c.arg(2);
+            if previous != 0 {
+                c.write_u32(previous, 0);
+            }
+            c.finish(TRUE)
+        }
+        "ReleaseMutex" | "VirtualLock" | "VirtualUnlock" => c.finish(TRUE),
+        // SystemTimeToFileTime(lpSystemTime, lpFileTime): the inverse of the
+        // SYSTEMTIME the clock is written as.
+        "SystemTimeToFileTime" => {
+            let (st, out) = (c.arg(0), c.arg(1));
+            let mut f = [0u16; 8];
+            for (i, field) in f.iter_mut().enumerate() {
+                let Some(b) = c.read::<2>(st + i * 2) else {
+                    return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+                };
+                *field = u16::from_le_bytes(b);
+            }
+            let (y, m, d) = (i64::from(f[0]), i64::from(f[1]), i64::from(f[3]));
+            let y = if m <= 2 { y - 1 } else { y };
+            let era = y.div_euclid(400);
+            let yoe = y - era * 400;
+            let mp = if m > 2 { m - 3 } else { m + 9 };
+            let doy = (153 * mp + 2) / 5 + d - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            let days = era * 146_097 + doe - 719_468;
+            let secs =
+                days * 86_400 + i64::from(f[4]) * 3600 + i64::from(f[5]) * 60 + i64::from(f[6]);
+            let ticks = (secs as u64) * 10_000_000 + u64::from(f[7]) * 10_000 + TICKS_1601_TO_1970;
+            if !c.write_u64(out, ticks) {
+                return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+            }
+            c.finish(TRUE)
+        }
+        "CreatePipe" => file::create_pipe(&mut c),
+        "GetProcessTimes" | "GetThreadTimes" => {
+            let Some(clock) = host.clock() else {
+                return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+            };
+            // Creation is now, there is no exit, and no CPU time is accounted.
+            let now = clock.wall_ns() / 100 + TICKS_1601_TO_1970;
+            for (i, ticks) in [(1, now), (2, 0), (3, 0), (4, 0)] {
+                let at = c.arg(i);
+                if at != 0 && !c.write_u64(at, ticks) {
+                    return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+                }
+            }
+            c.finish(TRUE)
+        }
+        "GetSystemTimeAsFileTime" | "GetSystemTimePreciseAsFileTime" => {
             let Some(clock) = host.clock() else {
                 return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
             };
@@ -841,6 +1071,30 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             c.finish(TRUE)
         }
         "TlsFree" => tls_free(&mut c),
+        // ConvertStringSecurityDescriptorToSecurityDescriptorW(str, rev, ppSD,
+        // pSize): the descriptor is never enforced here, so a minimal
+        // self-relative one from the process heap stands in for it.
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW" => {
+            let (out, size_out) = (c.arg(2), c.arg(3));
+            let heap = c
+                .peb()
+                .and_then(|peb| c.read_u64(peb + PEB_PROCESS_HEAP))
+                .unwrap_or(0) as usize;
+            let Some(block) = heap::alloc(&c, heap, 20) else {
+                return c.fail(ERROR_NOT_ENOUGH_MEMORY, FALSE);
+            };
+            // Revision 1, SE_SELF_RELATIVE, and no owner, group, SACL or DACL.
+            let mut sd = [0u8; 20];
+            sd[0] = 1;
+            sd[2..4].copy_from_slice(&0x8000u16.to_le_bytes());
+            if !c.write(block, &sd) || (out != 0 && !c.write_u64(out, block as u64)) {
+                return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+            }
+            if size_out != 0 {
+                c.write_u32(size_out, 20);
+            }
+            c.finish(TRUE)
+        }
         "GetProcessHeap" => {
             let heap = c
                 .peb()
@@ -868,10 +1122,11 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             heap::mark_free(&c, heap, block);
             c.finish(TRUE)
         }
-        "InitializeCriticalSectionAndSpinCount" | "InitializeCriticalSectionEx" => {
-            init_critical_section(&mut c)
-        }
+        "InitializeCriticalSectionAndSpinCount"
+        | "InitializeCriticalSectionEx"
+        | "InitializeCriticalSection" => init_critical_section(&mut c),
         "EnterCriticalSection" => enter_critical_section(&mut c),
+        "TryEnterCriticalSection" => try_enter_critical_section(&mut c),
         "LeaveCriticalSection" => leave_critical_section(&mut c),
         "DeleteCriticalSection" => {
             let at = c.arg(0);
@@ -961,6 +1216,9 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         }
         "GetUserDefaultLCID" => c.finish(locale::USER_LCID as usize),
         "IsValidLocale" => locale::is_valid_locale(&mut c),
+        "CreateDirectoryW" => file::create_directory(&mut c),
+        "DeleteFileW" => file::delete_file(&mut c),
+        "RemoveDirectoryW" => file::remove_directory(&mut c),
         "CreateFileW" => file::create_file(&mut c),
         "ReadFile" => file::read_file(&mut c),
         "GetFileType" => file::get_file_type(&mut c),
@@ -991,6 +1249,9 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             runtime::wake_condition_variable(&mut c)
         }
         "SleepConditionVariableSRW" => runtime::sleep_condition_variable_srw(&mut c),
+        // A spurious wake with the critical section still held, which the
+        // caller handles by rechecking its predicate.
+        "SleepConditionVariableCS" => c.finish(TRUE),
         "OutputDebugStringW" | "OutputDebugStringA" => runtime::output_debug_string(&mut c),
         "GetEnvironmentVariableA" => runtime::get_environment_variable_a(&mut c),
         "GetEnvironmentVariableW" => runtime::get_environment_variable_w(&mut c),
@@ -1005,6 +1266,21 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "SetHandleInformation" => file::set_handle_information(&mut c),
         "GetTimeZoneInformation" => runtime::get_time_zone_information(&mut c),
         "CreateWaitableTimerExW" => runtime::create_waitable_timer(&mut c),
+        // The only timer here is the one a sleep sets, so the wait is done
+        // now: a relative due time (negative, in hundred-nanosecond ticks)
+        // is slept out, and the wait that follows finds it signalled.
+        "SetWaitableTimerEx" => {
+            let due = c.read_u64(c.arg(1)).unwrap_or(0) as i64;
+            if due < 0 {
+                if let Some(clock) = host.clock() {
+                    let _ = clock.sleep_ns(due.unsigned_abs() * 100);
+                }
+            }
+            c.finish(TRUE)
+        }
+        // Nothing here blocks another thread yet, so every object is taken
+        // as signalled: WAIT_OBJECT_0.
+        "WaitForSingleObject" | "WaitForSingleObjectEx" | "WaitForMultipleObjects" => c.finish(0),
         "LoadLibraryW" => runtime::load_library_ex_w(&mut c),
         "LCMapStringEx" => locale::lc_map_string_ex(&mut c),
         "GetLocaleInfoW" => locale::get_locale_info_w(&mut c),
@@ -1181,6 +1457,10 @@ fn process_cookie(c: &Call<'_>) -> u32 {
 
 /// Where the cookie is kept: another reserved word of the PEB.
 const PEB_COOKIE: usize = 0x3F0;
+/// Where a run-time load leaves the entry points still to be called with
+/// `DLL_PROCESS_ATTACH`: a word of the PEB's reserved area holding the
+/// address of a `(entry, base)` list ending in a zero pair, or zero.
+pub(crate) const PEB_PENDING_ATTACH: usize = 0x3E8;
 
 /// TlsAlloc: the first clear bit of the PEB's TLS bitmap, set, with the slot
 /// cleared in this thread's TEB.
@@ -1224,15 +1504,26 @@ fn tls_free(c: &mut Call<'_>) -> Dispatch {
 /// reused, which is a limit to lift, not a lie: nothing is ever handed out
 /// twice.
 pub mod heap {
+    use ax_abi_port::{MapRequest, MapSource, Prot};
+
     use super::Call;
 
-    /// The arena's header: a magic word, its end, and where the next block goes.
+    /// The arena's header: a magic word, its end, where the next block goes,
+    /// the head of the free list, and the arena that follows this one.
     pub const MAGIC: u64 = 0x5041_4548_5859_4152; // "RAXYHEAP"
     pub const LIMIT: usize = 8;
     pub const NEXT: usize = 16;
     /// Head of the free list: header address of the first freed block, or 0.
+    /// Kept in the first arena for the whole heap.
     pub const FREE_HEAD: usize = 24;
-    pub const HEADER: usize = 32;
+    /// The next arena of the heap, or 0 for the last. A heap grows by mapping
+    /// another arena and chaining it here, the way Windows reserves more.
+    pub const ARENA_NEXT: usize = 32;
+    pub const HEADER: usize = 48;
+
+    /// How much each further arena maps; the memory port pages it in as it is
+    /// touched, so a large one costs only what is used.
+    const GROW: usize = 64 << 20;
 
     /// Each block is preceded by its size and a state word.
     const BLOCK_HEADER: usize = 16;
@@ -1248,11 +1539,10 @@ pub mod heap {
         header
     }
 
-    /// Carve `size` bytes from the arena at `heap`, sixteen-byte aligned. A
-    /// freed block big enough is taken off the free list before the frontier
-    /// is bumped, so a C runtime's constant malloc/free churn reuses memory
-    /// instead of marching the frontier to the limit. The scan walks only the
-    /// free list (freed blocks), not every block ever allocated.
+    /// Carve `size` bytes, sixteen-byte aligned. A freed block big enough is
+    /// taken off the free list before any frontier is bumped, so a C runtime's
+    /// constant malloc/free churn reuses memory; the scan walks only the free
+    /// list. With every arena full, another is mapped and chained on.
     pub(super) fn alloc(c: &Call<'_>, heap: usize, size: usize) -> Option<usize> {
         if c.read_u64(heap)? != MAGIC {
             return None;
@@ -1276,17 +1566,50 @@ pub mod heap {
             prev = cur;
             cur = next;
         }
-        let limit = c.read_u64(heap + LIMIT)? as usize;
-        let bump = c.read_u64(heap + NEXT)? as usize;
-        let block = bump + BLOCK_HEADER;
-        let end = block.checked_add(want)?.next_multiple_of(16);
-        if end > limit {
+        let mut arena = heap;
+        loop {
+            let limit = c.read_u64(arena + LIMIT)? as usize;
+            let bump = c.read_u64(arena + NEXT)? as usize;
+            let block = bump + BLOCK_HEADER;
+            let end = block.checked_add(want)?.next_multiple_of(16);
+            if end <= limit {
+                c.write_u64(bump, size as u64).then_some(())?;
+                c.write_u64(bump + 8, IN_USE).then_some(())?;
+                c.write_u64(arena + NEXT, end as u64).then_some(())?;
+                return Some(block);
+            }
+            let next = c.read_u64(arena + ARENA_NEXT)? as usize;
+            arena = if next != 0 {
+                next
+            } else {
+                grow(c, arena, want)?
+            };
+        }
+    }
+
+    /// Map another arena, big enough for `want` at the least, and chain it
+    /// after `last`.
+    fn grow(c: &Call<'_>, last: usize, want: usize) -> Option<usize> {
+        let len = (want + HEADER + BLOCK_HEADER + 16)
+            .max(GROW)
+            .next_multiple_of(0x1000);
+        let at = c
+            .host
+            .mem()?
+            .map(&MapRequest {
+                addr: 0,
+                len,
+                prot: Prot::READ | Prot::WRITE,
+                fixed: false,
+                shared: false,
+                source: MapSource::Anonymous,
+            })
+            .ok()? as usize;
+        if !c.write(at, &arena(at as u64, len as u64)) {
             return None;
         }
-        c.write_u64(bump, size as u64).then_some(())?;
-        c.write_u64(bump + 8, IN_USE).then_some(())?;
-        c.write_u64(heap + NEXT, end as u64).then_some(())?;
-        Some(block)
+        c.write_u64(last + ARENA_NEXT, at as u64).then_some(())?;
+        Some(at)
     }
 
     /// The size a block was allocated with, if `block` is one that is in use.
@@ -1385,6 +1708,58 @@ fn init_critical_section(c: &mut Call<'_>) -> Dispatch {
 /// RtlEnterCriticalSection on a process with one thread: take it, or recurse
 /// if this thread already owns it. Contention cannot arise until a second
 /// thread exists, and then a wait will be needed here.
+/// TryEnterCriticalSection: as EnterCriticalSection, which never waits here,
+/// reporting the section taken.
+fn try_enter_critical_section(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    let tid = c.host.tasks().map_or(1, |t| u64::from(t.gettid()));
+    let lock = c.read_u32(at + 8).unwrap_or(-1i32 as u32) as i32;
+    let owner = c.read_u64(at + 16).unwrap_or(0);
+    let depth = if lock >= 0 && owner == tid {
+        c.read_u32(at + 12).unwrap_or(0) + 1
+    } else {
+        c.write_u64(at + 16, tid);
+        1
+    };
+    c.write_u32(at + 12, depth);
+    c.write_u32(at + 8, (lock + 1) as u32);
+    c.finish(TRUE)
+}
+
+/// Write a SYSTEMTIME for `ns` since the Unix epoch at `at`: year, month,
+/// weekday, day, hour, minute, second, millisecond, each a WORD. The civil
+/// date comes from the days count by Howard Hinnant's algorithm.
+fn write_system_time(c: &Call<'_>, at: usize, ns: u64) -> bool {
+    let secs = ns / 1_000_000_000;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let weekday = (days + 4).rem_euclid(7);
+    let fields = [
+        year as u16,
+        month as u16,
+        weekday as u16,
+        day as u16,
+        (rem / 3600) as u16,
+        ((rem % 3600) / 60) as u16,
+        (rem % 60) as u16,
+        ((ns / 1_000_000) % 1000) as u16,
+    ];
+    let mut bytes = [0u8; 16];
+    for (i, f) in fields.iter().enumerate() {
+        bytes[i * 2..i * 2 + 2].copy_from_slice(&f.to_le_bytes());
+    }
+    c.write(at, &bytes)
+}
+
 fn enter_critical_section(c: &mut Call<'_>) -> Dispatch {
     let at = c.arg(0);
     let tid = c.host.tasks().map_or(1, |t| u64::from(t.gettid()));
@@ -1722,7 +2097,34 @@ mod mapped {
         })
     }
 
+    /// The export named `wanted`. The name table is sorted, as the format
+    /// requires, so this is a binary search: a library like OpenSSL exports
+    /// thousands of names and is bound against hundreds of times.
     pub fn by_name(c: &Call<'_>, base: usize, x: &Exports, wanted: &[u8]) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, x.names.1 as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let name_rva = c.read_u32(x.names.0 + mid * 4)? as usize;
+            let mut buf = [0u8; 256];
+            if c.host
+                .platform()
+                .read_user_cstr(base + name_rva, &mut buf)
+                .is_err()
+            {
+                return None;
+            }
+            let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+            match buf[..end].cmp(wanted) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    let slot = u16::from_le_bytes(c.read::<2>(x.ordinals + mid * 2)?) as usize;
+                    return target(c, base, x, slot);
+                }
+            }
+        }
+        // A synthesized library lists its names in table order, not sorted;
+        // for those the walk below is what finds the entry.
         for i in 0..x.names.1 as usize {
             let name_rva = c.read_u32(x.names.0 + i * 4)? as usize;
             let mut buf = [0u8; 256];

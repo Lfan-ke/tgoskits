@@ -1,9 +1,10 @@
 import sys
-import json, re, collections, textwrap, unicodedata
+import json, re, collections, textwrap, unicodedata, hashlib
 
 d = [{'k': i} for i in range(2000)]
 s = json.dumps(d)
 assert re.match(r'^\[', s) and len(d) == 2000
 assert unicodedata.category('A') == 'Lu'
+assert hashlib.sha256(b'abc').hexdigest().startswith('ba7816bf')
 print('IMPORT-OK', len(s))
 sys.stdout.flush()
