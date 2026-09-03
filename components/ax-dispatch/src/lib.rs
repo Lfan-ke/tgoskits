@@ -74,6 +74,26 @@ pub trait TrapEnv {
     /// calls it.
     fn set_error(&mut self, _failed: bool) {}
 
+    /// Fork the calling task. The child starts at `entry` with `arg` in its
+    /// first argument register, on a copy of the caller's stack; the caller
+    /// gets the child's pid. A host without processes reports failure.
+    fn spawn(&mut self, _entry: usize, _arg: usize) -> Result<u32, i32> {
+        Err(38)
+    }
+    /// Make `stdio` the calling task's descriptors 0 to 2 (a negative one is
+    /// left as it is), then replace its image with the program at `path` - a
+    /// NUL-terminated string in user memory - given `argv` and `envp`,
+    /// NULL-terminated arrays of such. On success the call never returns to
+    /// the old image.
+    fn exec_with_stdio(
+        &mut self,
+        _stdio: [i32; 3],
+        _path: usize,
+        _argv: usize,
+        _envp: usize,
+    ) -> Result<(), i32> {
+        Err(38)
+    }
     /// Where the caller thread's control block lives in its own address space,
     /// or zero from a host that cannot say. A domain keeping per-thread state
     /// where the thread itself reads it - a Windows TEB, a Linux TCB - needs

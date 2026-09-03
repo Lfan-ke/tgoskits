@@ -2958,7 +2958,18 @@ mod tests {
 
         // cFileName sits at offset 0x2C in WIN32_FIND_DATAW.
         let name_of = |at: usize| wide_at(&host, at + 0x2C);
-        assert_eq!(name_of(0x7200), "__init__.py");
+        // A whole-directory search lists "." and ".." first, as directories.
+        assert_eq!(name_of(0x7200), ".");
+        assert_eq!(
+            u32::from_le_bytes(host.mem.borrow()[0x7200..0x7204].try_into().unwrap()),
+            0x10
+        );
+        for name in ["..", "__init__.py"] {
+            let mut next = call("FindNextFileW", [handle, 0x7200, 0, 0, 0, 0], teb);
+            win32::dispatch(&mut next, &host);
+            assert_eq!(next.result, Some(1));
+            assert_eq!(name_of(0x7200), name);
+        }
         // FILE_ATTRIBUTE_NORMAL on a file.
         assert_eq!(
             u32::from_le_bytes(host.mem.borrow()[0x7200..0x7204].try_into().unwrap()),
@@ -2972,7 +2983,7 @@ mod tests {
         let mut next = call("FindNextFileW", [handle, 0x7200, 0, 0, 0, 0], teb);
         win32::dispatch(&mut next, &host);
         assert_eq!(name_of(0x7200), "cp437.py");
-        // The fourth advance is past the end.
+        // The next advance is past the end.
         let mut done = call("FindNextFileW", [handle, 0x7200, 0, 0, 0, 0], teb);
         win32::dispatch(&mut done, &host);
         assert_eq!(done.result, Some(0));

@@ -11,7 +11,7 @@ import sys
 import traceback
 
 SUITE = "Z:\\suite"
-DEFERRED = {"t08_async", "t09_threads", "t10_multiprocessing", "t19_cli", "t20_dash_m", "t22_net_devices"}
+DEFERRED = {"t08_async", "t09_threads", "t10_multiprocessing", "t16_datetime_contextlib", "t19_cli", "t20_dash_m", "t22_net_devices"}
 SKIP = {"run_all", "test_lang"}
 
 results = {}

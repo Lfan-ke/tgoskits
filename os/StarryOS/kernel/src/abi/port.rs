@@ -110,6 +110,14 @@ impl Tasks for KernelHost {
         Ok(0)
     }
 
+    fn wait(&self, pid: u32, status_out: usize, nohang: bool) -> Result<u32, i32> {
+        const WNOHANG: u32 = 1;
+        let options = if nohang { WNOHANG } else { 0 };
+        crate::syscall::sys_waitpid(pid as i32, status_out as *mut i32, options)
+            .map(|reaped| reaped as u32)
+            .map_err(errno)
+    }
+
     fn exit_group(&self, status: i32) -> SysResult {
         do_exit(status, true);
         Ok(0)
@@ -160,6 +168,21 @@ impl Paths for KernelHost {
             Ok(())
         })
         .map_err(errno)
+    }
+
+    fn rename(&self, at: At, old: &str, new: &str) -> Result<(), i32> {
+        use axfs_ng_vfs::path::Path;
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let (old_dir, old_name) =
+            with_fs(dirfd, |fs| Ok(fs.resolve_parent(Path::new(old))?)).map_err(errno)?;
+        let (new_dir, new_name) =
+            with_fs(dirfd, |fs| Ok(fs.resolve_parent(Path::new(new))?)).map_err(errno)?;
+        old_dir
+            .rename(&old_name, &new_dir, &new_name)
+            .map_err(|err| errno(StarryError::from(err)))
     }
 
     fn rmdir(&self, at: At, path: &str) -> Result<(), i32> {

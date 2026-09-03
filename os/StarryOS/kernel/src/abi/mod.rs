@@ -23,6 +23,8 @@ use ax_crate_interface::call_interface;
 use ax_runtime::hal::cpu::uspace::UserContext;
 
 use ax_task::current;
+use ax_memory_addr::VirtAddr;
+use core::ffi::c_char;
 
 use crate::{StarryError, StarryResult, task::AsThread};
 
@@ -72,6 +74,39 @@ impl TrapEnv for TrapCtx<'_> {
 
     fn stack_pointer(&self) -> usize {
         self.uctx.sp()
+    }
+
+    fn spawn(&mut self, entry: usize, arg: usize) -> Result<u32, i32> {
+        // A fork of the caller whose first instruction is `entry` with `arg`
+        // in the first argument register, on the caller's stack: the clone
+        // takes this as the child's frame.
+        const SIGCHLD: u32 = 17;
+        let child = UserContext::new(entry, VirtAddr::from_usize(self.uctx.sp()), arg);
+        crate::syscall::sys_clone(&child, SIGCHLD, 0, 0, 0, 0)
+            .map(|pid| pid as u32)
+            .map_err(errno)
+    }
+
+    fn exec_with_stdio(
+        &mut self,
+        stdio: [i32; 3],
+        path: usize,
+        argv: usize,
+        envp: usize,
+    ) -> Result<(), i32> {
+        for (target, fd) in stdio.iter().enumerate() {
+            if *fd >= 0 && *fd as usize != target {
+                crate::syscall::sys_dup3(*fd, target as i32, 0).map_err(errno)?;
+            }
+        }
+        crate::syscall::sys_execve(
+            self.uctx,
+            path as *const c_char,
+            argv as *const *const c_char,
+            envp as *const *const c_char,
+        )
+        .map(|_| ())
+        .map_err(errno)
     }
 
     fn slot(&self) -> Option<usize> {

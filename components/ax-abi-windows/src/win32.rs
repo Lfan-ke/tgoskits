@@ -453,6 +453,8 @@ const KERNEL32: &[(&str, u16)] = &[
     ("VirtualLock", 0),
     ("WaitForMultipleObjectsEx", 0),
     ("WakeAllConditionVariable", 0),
+    // The child of a spawn starts in this entry's stub; nothing imports it.
+    ("_StarrySpawnExec", 0),
 ];
 
 const ADVAPI32: &[(&str, u16)] = &[
@@ -964,6 +966,12 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             c.finish(TRUE)
         }
         "CreatePipe" => file::create_pipe(&mut c),
+        "CreateProcessW" => process::create_process(&mut c),
+        "_StarrySpawnExec" => process::spawn_exec(&mut c),
+        "GetExitCodeProcess" => process::get_exit_code_process(&mut c),
+        "InitializeProcThreadAttributeList" => process::init_proc_thread_attribute_list(&mut c),
+        "UpdateProcThreadAttribute" => c.finish(TRUE),
+        "DeleteProcThreadAttributeList" => c.finish(0),
         "GetProcessTimes" | "GetThreadTimes" => {
             let Some(clock) = host.clock() else {
                 return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
@@ -1219,6 +1227,8 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "CreateDirectoryW" => file::create_directory(&mut c),
         "DeleteFileW" => file::delete_file(&mut c),
         "RemoveDirectoryW" => file::remove_directory(&mut c),
+        "MoveFileExW" | "MoveFileW" => file::move_file(&mut c),
+        "GetActiveProcessorCount" => c.finish(1),
         "CreateFileW" => file::create_file(&mut c),
         "ReadFile" => file::read_file(&mut c),
         "GetFileType" => file::get_file_type(&mut c),
@@ -1255,6 +1265,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "OutputDebugStringW" | "OutputDebugStringA" => runtime::output_debug_string(&mut c),
         "GetEnvironmentVariableA" => runtime::get_environment_variable_a(&mut c),
         "GetEnvironmentVariableW" => runtime::get_environment_variable_w(&mut c),
+        "SetEnvironmentVariableW" => runtime::set_environment_variable_w(&mut c),
         "PathCchSkipRoot" => file::path_cch_skip_root(&mut c),
         "PathCchCombineEx" => file::path_cch_combine_ex(&mut c),
         "GetFileAttributesW" => file::get_file_attributes_w(&mut c),
@@ -1280,7 +1291,11 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         }
         // Nothing here blocks another thread yet, so every object is taken
         // as signalled: WAIT_OBJECT_0.
-        "WaitForSingleObject" | "WaitForSingleObjectEx" | "WaitForMultipleObjects" => c.finish(0),
+        "WaitForSingleObject" | "WaitForSingleObjectEx" => match process::pid_of(c.arg(0)) {
+            Some(pid) => process::wait_process(&mut c, pid),
+            None => c.finish(0),
+        },
+        "WaitForMultipleObjects" => c.finish(0),
         "LoadLibraryW" => runtime::load_library_ex_w(&mut c),
         "LCMapStringEx" => locale::lc_map_string_ex(&mut c),
         "GetLocaleInfoW" => locale::get_locale_info_w(&mut c),
@@ -1301,6 +1316,10 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         // No thread here was converted to a fiber.
         "IsThreadAFiber" => c.finish(FALSE),
         "CloseHandle" => {
+            // A process or thread pseudo-handle holds nothing to close.
+            if process::pid_of(c.arg(0)).is_some() {
+                return c.finish(TRUE);
+            }
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
             };
@@ -1361,6 +1380,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
 
 mod file;
 mod locale;
+mod process;
 mod pyd;
 mod runtime;
 

@@ -174,6 +174,9 @@ pub fn system_header(base: u64, lib: usize) -> Vec<u8> {
 /// Bytes reserved for each stub. The instructions are shorter; a fixed stride
 /// makes the address of a stub its index times this.
 pub const STUB_LEN: usize = 48;
+/// Where in a stub the `mov eax, <trap number>` sits: a task started here,
+/// with its first argument already in `rdi`, makes the call directly.
+pub const STUB_TRAP_OFFSET: usize = 24;
 
 /// The instructions that stand in for one imported function.
 ///
@@ -330,6 +333,16 @@ mod tests {
             .collect();
         let hole = (1..=highest).find(|o| !used.contains(o)).unwrap();
         assert_eq!(u32_at(functions + (hole as usize - 1) * 4), 0);
+    }
+
+    #[test]
+    fn the_trap_offset_lands_on_the_number_load() {
+        let bytes = stub(Win32Call::WRITE_FILE);
+        assert_eq!(bytes[STUB_TRAP_OFFSET], 0xB8, "mov eax, imm32");
+        assert_eq!(
+            &bytes[STUB_TRAP_OFFSET + 5..STUB_TRAP_OFFSET + 7],
+            &[0x0F, 0x05]
+        );
     }
 
     #[test]

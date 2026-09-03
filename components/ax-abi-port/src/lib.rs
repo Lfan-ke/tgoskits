@@ -148,6 +148,12 @@ pub trait Tasks: Sync {
     fn exit(&self, code: i32) -> SysResult;
     /// Terminate every thread in the process.
     fn exit_group(&self, code: i32) -> SysResult;
+    /// Wait for child `pid` to end, writing its wait status to user memory
+    /// at `status_out`; `nohang` asks not to wait. The pid reaped, or zero
+    /// when nothing was.
+    fn wait(&self, _pid: u32, _status_out: usize, _nohang: bool) -> Result<u32, i32> {
+        Err(38)
+    }
 }
 
 /// What a program says it will do with a range, so the host can act on it.
@@ -367,6 +373,10 @@ pub trait Paths: Sync {
     }
     /// Make a directory at `path` with `mode`.
     fn mkdir(&self, _at: At, _path: &str, _mode: u32) -> Result<(), i32> {
+        Err(38)
+    }
+    /// Move `old` to `new`, replacing what is there.
+    fn rename(&self, _at: At, _old: &str, _new: &str) -> Result<(), i32> {
         Err(38)
     }
     /// Remove the empty directory `path` names.

@@ -139,7 +139,7 @@ fn name_at(c: &Call<'_>, at: usize) -> Option<String> {
 
 /// The descriptor a handle names, with the three standard pseudo-handles
 /// resolved to the streams they stand for, as `GetStdHandle` would.
-fn descriptor(handle: usize) -> Result<i32, Ntstatus> {
+pub(super) fn descriptor(handle: usize) -> Result<i32, Ntstatus> {
     let handle = match handle {
         STD_INPUT_HANDLE => Handle::from_slot(0).0 as usize,
         STD_OUTPUT_HANDLE => Handle::from_slot(1).0 as usize,
@@ -759,8 +759,14 @@ pub fn find_first_file(c: &mut Call<'_>) -> Dispatch {
         Ok(fd) => fd as i32,
         Err(errno) => return c.fail_status(nt::status_from_errno(errno), INVALID_HANDLE_VALUE),
     };
-    // Collect the matching names and kinds.
+    // Collect the matching names and kinds. A whole-directory search lists
+    // "." and ".." first, as Windows does even for an empty directory - a
+    // caller takes an empty answer for a missing directory otherwise.
     let mut entries: Vec<(String, bool)> = Vec::new();
+    if all {
+        entries.push((String::from("."), true));
+        entries.push((String::from(".."), true));
+    }
     let mut overflow = false;
     let _ = paths.read_dir(dir_fd, &mut |name, kind| {
         if entries.len() >= 4096 {
@@ -860,6 +866,24 @@ pub fn create_directory(c: &mut Call<'_>) -> Dispatch {
 /// DeleteFileW(lpFileName).
 pub fn delete_file(c: &mut Call<'_>) -> Dispatch {
     path_op(c, |paths, host| paths.unlink(At::Cwd, host))
+}
+
+/// MoveFileExW(lpExistingFileName, lpNewFileName, dwFlags) and MoveFileW: the
+/// flags (replace-existing, copy-allowed) are all how the host renames anyway.
+pub fn move_file(c: &mut Call<'_>) -> Dispatch {
+    let (Some(old), Some(new)) = (name_at(c, c.arg(0)), name_at(c, c.arg(1))) else {
+        return c.fail(super::ERROR_INVALID_PARAMETER, FALSE);
+    };
+    let (Some(old), Some(new)) = (host_path(c, &old), host_path(c, &new)) else {
+        return c.fail(ERROR_FILE_NOT_FOUND, FALSE);
+    };
+    let Some(paths) = c.host.paths() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    match paths.rename(At::Cwd, &old, &new) {
+        Ok(()) => c.finish(TRUE),
+        Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+    }
 }
 
 /// RemoveDirectoryW(lpPathName).
