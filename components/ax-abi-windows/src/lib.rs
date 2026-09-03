@@ -201,7 +201,7 @@ fn attach_steps(modules: &[dll::Module]) -> Vec<start::Step> {
 /// more address space; growing this one is a limit to lift once a program
 /// reaches it, and it fails honestly there rather than hand out memory it
 /// does not have.
-const HEAP_LEN: u64 = 8 << 20;
+const HEAP_LEN: u64 = 64 << 20;
 
 /// What the process was started with, as `PEB.ProcessParameters` records it:
 /// the program's path and directory as Windows spells them, the command line

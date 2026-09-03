@@ -709,8 +709,11 @@ fn write_find_data(c: &Call<'_>, out: usize, rec: usize) -> bool {
     let mut data = [0u8; 592];
     data[..4].copy_from_slice(&attr.to_le_bytes());
     // cFileName is at offset 0x2C; copy the stored name and its terminator.
-    let name_bytes = (usize::from(len) + 1) * 2;
-    let mut name = alloc::vec![0u8; name_bytes.min(FIND_NAME * 2)];
+    // Copy exactly the stored name; the zero-filled buffer supplies the NUL
+    // terminator, so this never reads past the name into whatever the snapshot
+    // block held before (HeapAlloc does not hand back zeroed memory).
+    let name_bytes = (usize::from(len) * 2).min(FIND_NAME * 2 - 2);
+    let mut name = alloc::vec![0u8; name_bytes];
     if c.host.platform().read_user(rec + 8, &mut name).is_err() {
         return false;
     }
@@ -834,7 +837,11 @@ pub fn find_next_file(c: &mut Call<'_>) -> Dispatch {
 pub fn find_close(c: &mut Call<'_>) -> Dispatch {
     let block = c.arg(0);
     if c.read_u64(block) == Some(FIND_MAGIC) {
-        super::heap::mark_free(c, block);
+        let heap = c
+            .peb()
+            .and_then(|peb| c.read_u64(peb + crate::teb_peb::PEB_PROCESS_HEAP))
+            .unwrap_or(0) as usize;
+        super::heap::mark_free(c, heap, block);
     }
     c.finish(TRUE)
 }
