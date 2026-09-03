@@ -166,6 +166,17 @@ const KERNEL32: &[(&str, u16)] = &[
     ("TerminateProcess", 0),
     ("CloseHandle", 0),
     ("Sleep", 0),
+    ("SleepEx", 0),
+    ("CreateFileMappingA", 0),
+    ("CreateToolhelp32Snapshot", 0),
+    ("FlushInstructionCache", 0),
+    ("GetCurrentThreadStackLimits", 0),
+    ("Module32FirstW", 0),
+    ("Module32NextW", 0),
+    ("OpenThread", 0),
+    ("ReadProcessMemory", 0),
+    ("SetThreadStackGuarantee", 0),
+    ("WriteProcessMemory", 0),
     ("VirtualAlloc", 0),
     ("VirtualProtect", 0),
     ("Beep", 0),
@@ -931,6 +942,15 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "GetStringTypeW" => locale::get_string_type(&mut c),
         "LCMapStringW" => locale::lc_map_string(&mut c),
         "CompareStringW" => locale::compare_string(&mut c),
+        "CompareStringOrdinal" => locale::compare_string_ordinal(&mut c),
+        "CreateEventA" | "CreateEventW" => {
+            // Minimal event: CPython's SIGINT event only needs a valid,
+            // non-NULL handle at startup (it is set/waited only on Ctrl+C,
+            // which never happens in a batch run). Hand back a reserved
+            // sentinel handle rather than a real waitable object.
+            c.set_last_error(0);
+            c.finish(0x1000_0004)
+        }
         "GetUserDefaultLCID" => c.finish(locale::USER_LCID as usize),
         "IsValidLocale" => locale::is_valid_locale(&mut c),
         "CreateFileW" => file::create_file(&mut c),
@@ -1006,6 +1026,14 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             }
         }
         "Sleep" => {
+            if let Some(clock) = host.clock() {
+                let _ = clock.sleep_ns(c.arg(0) as u64 * 1_000_000);
+            }
+            c.finish(0)
+        }
+        "SleepEx" => {
+            // SleepEx(dwMilliseconds, bAlertable): no APC delivery here, so
+            // it behaves as Sleep and returns 0 (never WAIT_IO_COMPLETION).
             if let Some(clock) = host.clock() {
                 let _ = clock.sleep_ns(c.arg(0) as u64 * 1_000_000);
             }
@@ -1834,6 +1862,7 @@ mod tests {
             "SetStdHandle",
             "SetUnhandledExceptionFilter",
             "Sleep",
+            "SleepEx",
             "SystemTimeToFileTime",
             "SystemTimeToTzSpecificLocalTime",
             "TerminateProcess",
