@@ -318,7 +318,7 @@ pub fn verify_version_info(c: &mut Call<'_>) -> Dispatch {
 
 /// The base of the module `name` means, out of the loader list, with the
 /// system library answering for every name that folds into it.
-fn module_named(c: &Call<'_>, name: &str) -> Option<usize> {
+pub(super) fn module_named(c: &Call<'_>, name: &str) -> Option<usize> {
     let peb = c.peb()?;
     // A synthesized library is in the list under its own name, as is a file.
     let canonical = dll::canonical(name);
@@ -347,11 +347,19 @@ pub fn load_library_ex(c: &mut Call<'_>) -> Dispatch {
         .collect();
     let text = text.trim_end_matches(' ');
     let stem = text.rsplit(['\\', '/']).next().unwrap_or(text);
-    match module_named(c, stem) {
-        Some(base) => c.finish(base),
+    if let Some(base) = module_named(c, stem) {
+        return c.finish(base);
+    }
+    // Not in the process yet: bring the file in, as the loader does.
+    let text = alloc::string::String::from(text);
+    match super::pyd::load_library(c, &text) {
+        Some(base) => {
+            c.set_last_error(0);
+            c.finish(base)
+        }
         None => {
             c.host.platform().trace(&alloc::format!(
-                "LoadLibraryExW: {text} is not loaded and cannot be loaded here"
+                "LoadLibraryExW: {text} could not be loaded"
             ));
             c.fail(ERROR_MOD_NOT_FOUND, 0)
         }
