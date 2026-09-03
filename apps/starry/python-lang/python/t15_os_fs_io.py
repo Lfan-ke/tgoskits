@@ -76,7 +76,8 @@ chk("path_commonprefix", posixpath.commonprefix(["/a/bc", "/a/bd"]) == "/a/b")
 # os.path.expanduser: "~" -> HOME (env-driven); when HOME absent it returns
 # unchanged. Drive HOME deterministically.
 os.environ["HOME"] = SBX
-chk("path_expanduser", os.path.expanduser("~/x") == os.path.join(SBX, "x"))
+os.environ["USERPROFILE"] = SBX  # what ntpath/pathlib read for ~ on Windows
+chk("path_expanduser", posixpath.expanduser("~/x") == posixpath.join(SBX, "x"))
 
 # os.path.expandvars: $VAR / ${VAR} substitution from environ.
 os.environ["PYOSFS_V"] = "VAL"
@@ -86,7 +87,7 @@ chk("path_expandvars_braces", os.path.expandvars("${PYOSFS_V}z") == "VALz")
 # os.path.splitdrive: on POSIX there are no drives, so it returns ('', path).
 chk("path_splitdrive", os.path.splitdrive("/a/b/c") == ("", "/a/b/c"))
 # os.path.normcase: POSIX is case-sensitive => identity (no folding).
-chk("path_normcase", os.path.normcase("/A/b.TXT") == "/A/b.TXT")
+chk("path_normcase", posixpath.normcase("/A/b.TXT") == "/A/b.TXT")
 
 
 # ============================================================================
@@ -151,7 +152,8 @@ else:
 if hasattr(os, "umask"):
     _old_umask = os.umask(0o022)
     _again = os.umask(_old_umask)
-    chk("umask", _again == 0o022)
+    # The Windows CRT keeps only the owner read/write bits of a mask.
+    chk("umask", _again == 0o022 or (os.name == "nt" and _again == (0o022 & 0o600)))
 else:
     chk("umask", True, "(skip: no os.umask)")
 

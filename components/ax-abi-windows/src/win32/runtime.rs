@@ -588,6 +588,79 @@ pub fn get_environment_variable_w(c: &mut Call<'_>) -> Dispatch {
     c.finish(value.len())
 }
 
+/// SetEnvironmentVariableW(lpName, lpValue): the block in the process
+/// parameters is rebuilt without the name and, unless the value is NULL,
+/// with the new entry at the end, in a fresh block from the process heap.
+/// Names compare without regard to ASCII case, as Windows compares them.
+pub fn set_environment_variable_w(c: &mut Call<'_>) -> Dispatch {
+    use crate::teb_peb::{PARAMS_ENVIRONMENT, PARAMS_ENVIRONMENT_SIZE, PEB_PROCESS_HEAP};
+    let (name_ptr, value_ptr) = (c.arg(0), c.arg(1));
+    let Some(name) = c.read_wstr(name_ptr) else {
+        return c.fail(ERROR_INVALID_PARAMETER, FALSE);
+    };
+    // A leading '=' names one of the per-drive working-directory variables
+    // (), which Windows lets through; '=' anywhere else is refused.
+    if name.is_empty() || name[1..].contains(&u16::from(b'=')) {
+        return c.fail(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let value = if value_ptr == 0 {
+        None
+    } else {
+        match c.read_wstr(value_ptr) {
+            Some(v) => Some(v),
+            None => return c.fail(ERROR_INVALID_PARAMETER, FALSE),
+        }
+    };
+    let Some(params) = c.params() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    let same = |a: &[u16], b: &[u16]| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x == y || (*x < 128 && *y < 128 && (*x as u8).eq_ignore_ascii_case(&(*y as u8)))
+            })
+    };
+    let mut entries: alloc::vec::Vec<alloc::vec::Vec<u16>> = alloc::vec::Vec::new();
+    let mut at = c.read_u64(params + PARAMS_ENVIRONMENT).unwrap_or(0) as usize;
+    while at != 0 {
+        let Some(units) = c.read_wstr(at) else { break };
+        if units.is_empty() {
+            break;
+        }
+        at += (units.len() + 1) * 2;
+        let key = units.split(|u| *u == u16::from(b'=')).next().unwrap_or(&[]);
+        if !same(key, &name) {
+            entries.push(units);
+        }
+    }
+    if let Some(v) = value {
+        let mut entry = name.clone();
+        entry.push(u16::from(b'='));
+        entry.extend(v);
+        entries.push(entry);
+    }
+    let mut block: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    for entry in &entries {
+        block.extend(entry.iter().chain([&0]).flat_map(|u| u.to_le_bytes()));
+    }
+    block.extend_from_slice(&[0, 0]);
+    let heap = c
+        .peb()
+        .and_then(|peb| c.read_u64(peb + PEB_PROCESS_HEAP))
+        .unwrap_or(0) as usize;
+    let Some(fresh) = super::heap::alloc(c, heap, block.len()) else {
+        return c.fail(super::ERROR_NOT_ENOUGH_MEMORY, FALSE);
+    };
+    if !c.write(fresh, &block)
+        || !c.write_u64(params + PARAMS_ENVIRONMENT, fresh as u64)
+        || !c.write_u64(params + PARAMS_ENVIRONMENT_SIZE, block.len() as u64)
+    {
+        return c.fail_status(crate::nt::Ntstatus::ACCESS_VIOLATION, FALSE);
+    }
+    c.set_last_error(0);
+    c.finish(TRUE)
+}
+
 pub fn get_environment_variable_a(c: &mut Call<'_>) -> Dispatch {
     use crate::teb_peb::PARAMS_ENVIRONMENT;
     const ERROR_ENVVAR_NOT_FOUND: u32 = 203;

@@ -436,6 +436,12 @@ impl CloneArgs {
                     vm_aspace_shared: flags.contains(CloneFlags::VM),
                 },
             );
+            // A fork keeps its parent's personality until it execs; the default
+            // is the kernel's own, meant for an image the loader claims afresh.
+            proc_data.abi_slot.store(
+                old_proc_data.abi_slot.load(core::sync::atomic::Ordering::Relaxed),
+                core::sync::atomic::Ordering::Relaxed,
+            );
             proc_data.set_umask(old_proc_data.umask());
             proc_data.set_nice(old_proc_data.nice());
             *proc_data.cgroup.write() = child_cgroup.clone();
