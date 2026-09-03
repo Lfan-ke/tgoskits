@@ -59,3 +59,10 @@ done
 # A small import smoke: exercises the C-runtime heap and directory
 # enumeration by importing real stdlib modules, then prints IMPORT-OK.
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe.py" "$overlay_dir/python/probe.py"
+
+# The C extension modules shipped beside the interpreter (unicodedata,
+# _socket, _decimal, ...): LoadLibraryExW brings each in on first import.
+for f in "$dll_dir"/*.pyd; do
+    [[ -f "$f" ]] || continue
+    install -m 0644 "$f" "$overlay_dir/python/$(basename "$f")"
+done

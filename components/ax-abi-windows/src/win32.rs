@@ -190,6 +190,7 @@ const KERNEL32: &[(&str, u16)] = &[
     ("CreateProcessW", 0),
     ("CreateThread", 0),
     ("DeleteFileW", 0),
+    ("DisableThreadLibraryCalls", 0),
     ("DuplicateHandle", 0),
     ("EnumSystemLocalesW", 0),
     ("ExitThread", 0),
@@ -1046,6 +1047,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             }
             c.finish(0)
         }
+        "DisableThreadLibraryCalls" => c.finish(TRUE),
         "VirtualAlloc" => virtual_alloc(&mut c),
         "VirtualFree" => virtual_free(&mut c),
         "VirtualProtect" => {
@@ -1083,6 +1085,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
 
 mod file;
 mod locale;
+mod pyd;
 mod runtime;
 
 /// Where the top-level exception filter is kept: a word of the PEB's reserved

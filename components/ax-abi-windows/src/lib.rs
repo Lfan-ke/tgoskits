@@ -147,7 +147,7 @@ fn map_image(
 /// Write the bound addresses and words that fall inside `sec` into its page
 /// buffer, before it is mapped. An address is an eight-byte address table
 /// entry in a PE32+ image; a word is the `DWORD` a TLS index occupies.
-fn bind_section(
+pub(crate) fn bind_section(
     page: &mut [u8],
     sec: &Section,
     binds: &[(u32, u64)],
@@ -346,7 +346,12 @@ pub(crate) fn page_up(at: u64) -> u64 {
 /// Apply the relocations that fall inside `sec` to its freshly-built page buffer,
 /// before it is mapped. Only `REL_DIR64` (PE32+) is expected; anything else is
 /// rejected rather than silently skipped.
-fn relocate_section(page: &mut [u8], sec: &Section, relocs: &[Reloc], delta: u64) -> AbiResult<()> {
+pub(crate) fn relocate_section(
+    page: &mut [u8],
+    sec: &Section,
+    relocs: &[Reloc],
+    delta: u64,
+) -> AbiResult<()> {
     let range = sec.rva..sec.rva + sec.vsize;
     for reloc in relocs.iter().filter(|r| range.contains(&r.rva)) {
         let at = (reloc.rva - sec.rva) as usize;
@@ -363,7 +368,7 @@ fn relocate_section(page: &mut [u8], sec: &Section, relocs: &[Reloc], delta: u64
 }
 
 /// Translate a section's `Characteristics` into a mapping protection.
-fn section_prot(sec: &Section) -> Prot {
+pub(crate) fn section_prot(sec: &Section) -> Prot {
     let mut prot = Prot::empty();
     prot.set(Prot::READ, sec.readable());
     prot.set(Prot::WRITE, sec.writable());

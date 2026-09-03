@@ -117,7 +117,7 @@ fn full_windows_path(c: &Call<'_>, name: &str) -> Option<String> {
 
 /// The host path a Windows name means: the full path with its drive dropped,
 /// since one tree is all there is, and separators the host resolves.
-fn host_path(c: &Call<'_>, name: &str) -> Option<String> {
+pub(super) fn host_path(c: &Call<'_>, name: &str) -> Option<String> {
     let full = full_windows_path(c, name)?;
     let path: String = full[2..]
         .chars()
