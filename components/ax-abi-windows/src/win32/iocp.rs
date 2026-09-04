@@ -368,7 +368,9 @@ fn attempt(c: &mut Call<'_>, op: usize) -> bool {
                     match moved {
                         Ok(_) => {
                             let local = sockets.local(fd).ok();
-                            put_accept_addresses(c, op, local.as_ref(), &remote);
+                            if let Some(remote) = remote {
+                                put_accept_addresses(c, op, local.as_ref(), &remote);
+                            }
                             Ok(0)
                         }
                         Err(errno) => Err(errno),
@@ -489,8 +491,21 @@ pub(super) fn start(
         address,
         address_len,
     ) else {
-        // A descriptor that reports to no port cannot be waited on this way.
-        return c.fail(super::ERROR_INVALID_PARAMETER, bad);
+        // Nothing to report a completion to: the caller waits on the event
+        // its OVERLAPPED carries instead, which is what a named pipe is read
+        // this way. Windows is free to finish an overlapped call before it
+        // returns, and here it always does - the descriptor itself waits.
+        return inline(
+            c,
+            kind,
+            fd,
+            buffer,
+            length,
+            overlapped,
+            transferred_out,
+            ok,
+            bad,
+        );
     };
     if !attempt(c, op) {
         // WSA_IO_PENDING and ERROR_IO_PENDING are the same number.
@@ -510,6 +525,114 @@ pub(super) fn start(
     }
     c.set_last_error(0);
     c.finish(ok)
+}
+
+/// Carry a transfer out here and now, reporting it in the caller's
+/// `OVERLAPPED` as a completed one.
+#[allow(clippy::too_many_arguments)]
+fn inline(
+    c: &mut Call<'_>,
+    kind: u32,
+    fd: i32,
+    buffer: usize,
+    length: usize,
+    overlapped: usize,
+    transferred_out: usize,
+    ok: usize,
+    bad: usize,
+) -> Dispatch {
+    // A pipe keeps message boundaries, and says so when a message did not
+    // fit; every other descriptor is a plain read.
+    if kind == READ && sock::is_pipe(c, fd) {
+        return match super::pipe::read(c, fd, buffer, length) {
+            Ok((moved, whole)) => {
+                if overlapped != 0 {
+                    let status = if whole {
+                        0
+                    } else {
+                        u64::from(super::pipe::ERROR_MORE_DATA)
+                    };
+                    c.write_u64(overlapped + OVERLAPPED_INTERNAL, status);
+                    c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, moved as u64);
+                    wake(c, overlapped);
+                }
+                if transferred_out != 0 {
+                    c.write_u32(transferred_out, moved as u32);
+                }
+                if whole {
+                    c.set_last_error(0);
+                    c.finish(ok)
+                } else {
+                    c.fail(super::pipe::ERROR_MORE_DATA, bad)
+                }
+            }
+            Err(errno) => {
+                let error = super::nt::status_from_errno(errno).dos_error();
+                if overlapped != 0 {
+                    c.write_u64(overlapped + OVERLAPPED_INTERNAL, u64::from(error));
+                    c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, 0);
+                    wake(c, overlapped);
+                }
+                c.fail(error, bad)
+            }
+        };
+    }
+    let moved = match kind {
+        READ => c.host.files().map(|files| files.read(fd, buffer, length)),
+        WRITE => c.host.files().map(|files| files.write(fd, buffer, length)),
+        RECV => c.host.sockets().map(|sockets| {
+            sockets
+                .recv(fd, buffer, length, false)
+                .map(|(n, _)| n as isize)
+        }),
+        SEND => c
+            .host
+            .sockets()
+            .map(|sockets| sockets.send(fd, buffer, length, None)),
+        _ => None,
+    };
+    let moved = match moved {
+        Some(Ok(moved)) => moved as usize,
+        Some(Err(errno)) => {
+            let error = if winsock_kind(kind) {
+                sock::error_of(errno)
+            } else {
+                super::nt::status_from_errno(errno).dos_error()
+            };
+            if overlapped != 0 {
+                c.write_u64(overlapped + OVERLAPPED_INTERNAL, u64::from(error));
+                c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, 0);
+                wake(c, overlapped);
+            }
+            return c.fail(error, bad);
+        }
+        None => return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, bad),
+    };
+    if overlapped != 0 {
+        c.write_u64(overlapped + OVERLAPPED_INTERNAL, 0);
+        c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, moved as u64);
+        wake(c, overlapped);
+    }
+    if transferred_out != 0 {
+        c.write_u32(transferred_out, moved as u32);
+    }
+    c.set_last_error(0);
+    c.finish(ok)
+}
+
+/// Whether a kind is one of the Winsock calls, whose failures are numbered
+/// the Winsock way.
+fn winsock_kind(kind: u32) -> bool {
+    matches!(kind, RECV | SEND | RECV_FROM | SEND_TO | ACCEPT | CONNECT)
+}
+
+/// Signal the event an `OVERLAPPED` carries, which is what a caller with no
+/// completion port waits on.
+fn wake(c: &mut Call<'_>, overlapped: usize) {
+    let event = c.read_u64(overlapped + OVERLAPPED_EVENT).unwrap_or(0) as usize;
+    if event != 0 {
+        sync::signal(c, event);
+    }
 }
 
 /// Take an operation off its port and give its block back.

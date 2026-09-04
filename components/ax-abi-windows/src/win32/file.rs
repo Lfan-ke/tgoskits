@@ -156,6 +156,10 @@ pub(super) fn host_path(c: &Call<'_>, name: &str) -> Option<String> {
     })
 }
 
+pub(super) fn name_at_arg(c: &Call<'_>, at: usize) -> Option<String> {
+    name_at(c, at)
+}
+
 fn name_at(c: &Call<'_>, at: usize) -> Option<String> {
     if at == 0 {
         return None;
@@ -192,6 +196,11 @@ pub fn create_file(c: &mut Call<'_>) -> Dispatch {
     let Some(name) = name_at(c, name).filter(|n| !n.is_empty()) else {
         return c.fail(ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE);
     };
+    // A pipe is opened by its name rather than out of the file system, so it
+    // is answered before any of this becomes a path.
+    if super::pipe::name_of(&name).is_some() {
+        return super::pipe::open_client(c, &name);
+    }
     if !(CREATE_NEW..=TRUNCATE_EXISTING).contains(&creation) {
         return c.fail(ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE);
     }
@@ -270,6 +279,24 @@ pub fn read_file(c: &mut Call<'_>) -> Dispatch {
             read,
             false,
         );
+    }
+    // A pipe read keeps message boundaries and says when a message did not
+    // fit, which a plain read of a descriptor cannot.
+    if super::pipe::is_pipe(c, fd) {
+        return match super::pipe::read(c, fd, buffer, length) {
+            Ok((moved, whole)) => {
+                if read != 0 && !c.write_u32(read, moved as u32) {
+                    return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+                }
+                if whole {
+                    c.set_last_error(0);
+                    c.finish(TRUE)
+                } else {
+                    c.fail(super::pipe::ERROR_MORE_DATA, FALSE)
+                }
+            }
+            Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+        };
     }
     let handle = Handle::from_slot(fd as usize).0 as usize;
     let (status, information) =
@@ -441,6 +468,13 @@ pub fn get_file_information_by_handle(c: &mut Call<'_>) -> Dispatch {
 pub fn duplicate_handle(c: &mut Call<'_>) -> Dispatch {
     let (source, target_out) = (c.arg(1), c.arg(3));
     let (Ok(fd), Some(files)) = (descriptor(source), c.host.files()) else {
+        // Only a descriptor can be duplicated: it is the child's too, since
+        // a child here starts with the descriptors its parent had. A block
+        // of this process's own memory - an event, a semaphore - is not
+        // something another process can be given.
+        c.host.platform().trace(&alloc::format!(
+            "DuplicateHandle: {source:#x} is not a descriptor and cannot cross to another process"
+        ));
         return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
     };
     match files.dup(fd) {

@@ -1188,11 +1188,15 @@ mod tests {
     }
 
     impl ax_abi_port::Sockets for MockHost {
-        fn open(&self, kind: ax_abi_port::SocketKind, v6: bool) -> Result<i32, i32> {
+        fn open(
+            &self,
+            domain: ax_abi_port::Domain,
+            kind: ax_abi_port::SocketKind,
+        ) -> Result<i32, i32> {
             let mut table = self.sockets.borrow_mut();
             table.push(MockSocket {
                 kind: Some(kind),
-                v6,
+                v6: domain == ax_abi_port::Domain::Inet6,
                 blocking: true,
                 ..MockSocket::default()
             });
@@ -1212,7 +1216,7 @@ mod tests {
             self.socket(fd)?.listening = true;
             Ok(())
         }
-        fn accept(&self, fd: i32) -> Result<(i32, ax_abi_port::Address), i32> {
+        fn accept(&self, fd: i32) -> Result<(i32, Option<ax_abi_port::Address>), i32> {
             if !self.socket(fd)?.listening {
                 return Err(107); // ENOTCONN
             }
@@ -1223,7 +1227,7 @@ mod tests {
                 blocking: true,
                 ..MockSocket::default()
             });
-            Ok((table.len() as i32 + 2, peer))
+            Ok((table.len() as i32 + 2, Some(peer)))
         }
         fn send(
             &self,
@@ -3702,10 +3706,112 @@ mod tests {
     }
 
     #[test]
+    fn a_named_pipe_is_a_socket_bound_to_the_name_the_path_carries() {
+        use crate::win32;
+        const ERROR_PIPE_CONNECTED: u32 = 535;
+        const INVALID_HANDLE: usize = usize::MAX;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let path = 0x7000usize;
+        put_wide(&host, path, "\\\\.\\pipe\\pyc-42-0\0");
+
+        // CreateNamedPipeW(name, openMode, pipeMode, instances, out, in,
+        // timeout, security).
+        let mut made = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("CreateNamedPipeW").unwrap(),
+            [path, 3, 6, 1, 0x1000, 0x1000],
+            teb,
+            &[0, 0],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut made, &host);
+        let server = made.result.expect("a pipe");
+        assert_ne!(server, INVALID_HANDLE, "the pipe was made");
+
+        // The client end is opened by the same name, which is not a path.
+        let mut opened = call("CreateFileW", [path, 0xC000_0000, 0, 0, 3, 0], teb);
+        win32::dispatch(&mut opened, &host);
+        let client = opened.result.expect("a client end");
+        assert_ne!(client, INVALID_HANDLE);
+        assert!(
+            host.opened.borrow().is_none(),
+            "a pipe name is never looked up in the file system"
+        );
+
+        // Both ends are on the name the path carried, in the machine's own
+        // namespace.
+        let name = ax_abi_port::Address::local(b"pyc-42-0").unwrap();
+        {
+            let sockets = host.sockets.borrow();
+            assert_eq!(sockets[0].bound, Some(name), "the pipe took its name");
+            assert!(sockets[0].listening, "and waits for a client");
+            assert_eq!(sockets[1].peer, Some(name), "the client asked for it");
+            assert_eq!(
+                sockets[0].kind,
+                Some(ax_abi_port::SocketKind::SeqPacket),
+                "a message-mode pipe keeps message boundaries"
+            );
+        }
+
+        // Connecting reports the client that was already there the way
+        // Windows does: as ERROR_PIPE_CONNECTED.
+        let mut connected = call("ConnectNamedPipe", [server, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut connected, &host);
+        assert_eq!(connected.result, Some(0));
+        assert_eq!(last_error(&host, teb), ERROR_PIPE_CONNECTED);
+
+        // Message mode is the mode it is already in; a byte stream is not.
+        let mode = 0x7200usize;
+        put_bytes(&host, mode, &2u32.to_le_bytes());
+        let mut message = call("SetNamedPipeHandleState", [client, mode, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut message, &host);
+        assert_eq!(message.result, Some(1));
+        put_bytes(&host, mode, &0u32.to_le_bytes());
+        let mut stream = call("SetNamedPipeHandleState", [client, mode, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut stream, &host);
+        assert_eq!(stream.result, Some(0), "a byte-mode pipe is not on offer");
+    }
+
+    #[test]
+    fn what_is_waiting_in_a_pipe_is_reported_without_taking_it() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let path = 0x7000usize;
+        put_wide(&host, path, "\\\\.\\pipe\\peek\0");
+        let mut opened = call("CreateFileW", [path, 0xC000_0000, 0, 0, 3, 0], teb);
+        win32::dispatch(&mut opened, &host);
+        let client = opened.result.expect("a client end");
+        host.sockets.borrow_mut()[0]
+            .queued
+            .extend_from_slice(b"a message");
+
+        let (buffer, read, available, left) = (0x7100usize, 0x7200usize, 0x7208, 0x7210);
+        let mut peeked = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("PeekNamedPipe").unwrap(),
+            [client, buffer, 16, read, available, left],
+            teb,
+            &[],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut peeked, &host);
+        assert_eq!(peeked.result, Some(1));
+        assert_eq!(read_u32(&host, read), 9);
+        assert_eq!(read_u32(&host, available), 9);
+        {
+            let mem = host.mem.borrow();
+            assert_eq!(&mem[buffer..buffer + 9], b"a message");
+        }
+        // Peeking leaves it where it was.
+        assert_eq!(host.sockets.borrow()[0].queued.len(), 9);
+    }
+
+    #[test]
     fn a_closed_socket_no_longer_reports_to_its_port() {
         use crate::win32;
-        const SOCKET_ERROR: usize = -1i32 as u32 as usize;
-        const ERROR_INVALID_PARAMETER: u32 = 87;
+        const ERROR_IO_PENDING: u32 = 997;
         let host = MockHost::default();
         let (teb, _) = process(&host);
         let (_port, socket) = ported(&host, teb, 5);
@@ -3716,7 +3822,9 @@ mod tests {
         win32::dispatch(&mut closed, &host);
         assert_eq!(closed.result, Some(0));
 
-        // The number is the host's again; a read on it belongs to no port.
+        // The number is the host's again, so a read on it belongs to no
+        // port: it is answered here and now, never queued to the port the
+        // socket that had the number used to report to.
         let mut started = Win32Trap::with_stack(
             crate::win32::Win32Call::named("WSARecv").unwrap(),
             [socket, buffers, 1, 0, 0x7300, overlapped],
@@ -3726,8 +3834,22 @@ mod tests {
             &host,
         );
         win32::dispatch(&mut started, &host);
-        assert_eq!(started.result, Some(SOCKET_ERROR));
-        assert_eq!(last_error(&host, teb), ERROR_INVALID_PARAMETER);
+        assert_ne!(
+            last_error(&host, teb),
+            ERROR_IO_PENDING,
+            "nothing is outstanding on a port the socket left"
+        );
+        let (bytes, key, out) = (0x7400usize, 0x7408usize, 0x7410usize);
+        let mut got = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("GetQueuedCompletionStatus").unwrap(),
+            [_port, bytes, key, out, 0, 0],
+            teb,
+            &[],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut got, &host);
+        assert_eq!(got.result, Some(0), "and the port has nothing to report");
     }
 
     #[test]

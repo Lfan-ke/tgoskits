@@ -155,6 +155,9 @@ pub(super) fn put_address(c: &Call<'_>, at: usize, len_at: usize, address: &Addr
             out[24..28].copy_from_slice(&scope.to_le_bytes());
             (out, 28)
         }
+        // Winsock has no family for a name on this machine: it is what a
+        // pipe is addressed by, and a pipe is not a socket to a program.
+        Address::Local(..) => return false,
     };
     if room < wrote {
         return false;
@@ -214,7 +217,12 @@ pub fn socket(c: &mut Call<'_>) -> Dispatch {
         AF_INET6 => true,
         _ => return failed(c, 97, INVALID_SOCKET),
     };
-    match sockets.open(kind, v6) {
+    let domain = if v6 {
+        ax_abi_port::Domain::Inet6
+    } else {
+        ax_abi_port::Domain::Inet
+    };
+    match sockets.open(domain, kind) {
         Ok(fd) => {
             c.set_last_error(0);
             c.finish(socket_handle(fd))
@@ -287,7 +295,11 @@ pub fn accept(c: &mut Call<'_>) -> Dispatch {
     };
     match sockets.accept(fd) {
         Ok((taken, peer)) => {
-            if !put_address(c, at, len_at, &peer) {
+            // A peer with no name of its own is reported as no address,
+            // which is what the caller's zero length says.
+            if let Some(peer) = peer
+                && !put_address(c, at, len_at, &peer)
+            {
                 return failed(c, 14, INVALID_SOCKET);
             }
             c.set_last_error(0);
@@ -532,6 +544,10 @@ pub fn inet_pton(c: &mut Call<'_>) -> Dispatch {
             c.write(dst, &bytes);
             c.finish(1)
         }
+        Some(Address::Local(..)) => {
+            c.set_last_error(WSAEAFNOSUPPORT);
+            c.finish(-1i32 as u32 as usize)
+        }
         Some(Address::V6(bytes, ..)) => {
             c.write(dst, &bytes);
             c.finish(1)
@@ -747,7 +763,9 @@ pub fn getaddrinfo(c: &mut Call<'_>) -> Dispatch {
             match found {
                 Some(Address::V4(ip, _)) => Address::V4(ip, port),
                 Some(Address::V6(ip, _, scope)) => Address::V6(ip, port, scope),
-                None => return c.finish(WSAHOST_NOT_FOUND as usize),
+                Some(Address::Local(..)) | None => {
+                    return c.finish(WSAHOST_NOT_FOUND as usize);
+                }
             }
         }
     };
@@ -763,6 +781,8 @@ pub fn getaddrinfo(c: &mut Call<'_>) -> Dispatch {
     let (declared_family, length) = match address {
         Address::V4(..) => (AF_INET, 16u32),
         Address::V6(..) => (AF_INET6, 28u32),
+        // Name resolution only ever answers with a network address.
+        Address::Local(..) => return c.finish(WSAHOST_NOT_FOUND as usize),
     };
     c.write_u32(block, flags);
     c.write_u32(block + AI_FAMILY, declared_family as u32);
@@ -969,6 +989,11 @@ pub fn swap16(c: &mut Call<'_>) -> Dispatch {
 pub fn swap32(c: &mut Call<'_>) -> Dispatch {
     let value = c.arg(0) as u32;
     c.finish(value.swap_bytes() as usize)
+}
+
+/// Whether a descriptor is one end of a named pipe.
+pub(super) fn is_pipe(c: &Call<'_>, fd: i32) -> bool {
+    super::pipe::is_pipe(c, fd)
 }
 
 /// A `WSABUF` array flattened to the one buffer these transfers use: the

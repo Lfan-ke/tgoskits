@@ -337,6 +337,7 @@ const KERNEL32: &[(&str, u16)] = &[
     ("CreateHardLinkW", 0),
     ("CreateMutexW", 0),
     ("CreateNamedPipeW", 0),
+    ("DisconnectNamedPipe", 0),
     ("CreateSemaphoreA", 0),
     ("CreateSymbolicLinkW", 0),
     ("CreateWaitableTimerExW", 0),
@@ -1264,6 +1265,12 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "GetFileSizeEx" => file::get_file_size_ex(&mut c),
         "FlushFileBuffers" => file::flush_file_buffers(&mut c),
         "SetEndOfFile" => file::set_end_of_file(&mut c),
+        "CreateNamedPipeW" => pipe::create_named_pipe(&mut c),
+        "ConnectNamedPipe" => pipe::connect_named_pipe(&mut c),
+        "DisconnectNamedPipe" => pipe::disconnect_named_pipe(&mut c),
+        "SetNamedPipeHandleState" => pipe::set_named_pipe_handle_state(&mut c),
+        "PeekNamedPipe" => pipe::peek_named_pipe(&mut c),
+        "WaitNamedPipeW" => pipe::wait_named_pipe(&mut c),
         "CreateIoCompletionPort" => iocp::create_port(&mut c),
         "GetQueuedCompletionStatus" => iocp::queued(&mut c),
         "PostQueuedCompletionStatus" => iocp::post(&mut c),
@@ -1428,8 +1435,9 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
             };
             // The number goes back to the host here, so nothing may still
-            // think it reports to a completion port.
+            // think it reports to a completion port or is a pipe.
             iocp::unregister(&mut c, fd);
+            pipe::forget(&mut c, fd);
             match files.close(fd) {
                 Ok(_) => c.finish(TRUE),
                 Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
@@ -1500,6 +1508,7 @@ fn arg_n(c: &Call<'_>, n: usize) -> Option<usize> {
 mod file;
 mod iocp;
 mod locale;
+mod pipe;
 mod process;
 mod pyd;
 mod runtime;
@@ -1547,6 +1556,13 @@ fn write_file(c: &mut Call<'_>) -> Dispatch {
     let (status, information) =
         nt::transfer(c.host, true, handle, buffer, length, None).unwrap_or_else(|s| (s, 0));
     if status != Ntstatus::SUCCESS {
+        // A write that does not happen is how output goes missing, and the
+        // caller often has nowhere left to report it - a C runtime flushing
+        // at exit drops the bytes and says nothing.
+        c.host.platform().trace(&alloc::format!(
+            "WriteFile: handle {handle:#x} of {length} bytes failed: {:#x}",
+            status.0
+        ));
         return c.fail_status(status, FALSE);
     }
     if written != 0 && !c.write_u32(written, information as u32) {
@@ -1620,6 +1636,9 @@ fn process_cookie(c: &Call<'_>) -> u32 {
 /// reserved area holding the first of them, or zero.
 pub(crate) const PEB_PORT_FILES: usize = 0x3D0;
 
+/// Where the pipes this process has hang, the same way.
+pub(crate) const PEB_PIPES: usize = 0x3C8;
+
 /// Where the process's error mode is kept: another reserved word of the PEB.
 pub(crate) const PEB_ERROR_MODE: usize = 0x3D8;
 
@@ -1640,7 +1659,13 @@ pub(crate) const PEB_SIGNAL_SEQ: usize = 0x3E0;
 // Each of these words is written for a different reason; sharing one would
 // let a signal rewrite the cookie under an encoded pointer.
 const _: () = assert!(
-    PEB_PORT_FILES != PEB_ERROR_MODE
+    PEB_PIPES != PEB_PORT_FILES
+        && PEB_PIPES != PEB_ERROR_MODE
+        && PEB_PIPES != PEB_SIGNAL_SEQ
+        && PEB_PIPES != PEB_COOKIE
+        && PEB_PIPES != PEB_PENDING_ATTACH
+        && PEB_PIPES != PEB_EXCEPTION_FILTER
+        && PEB_PORT_FILES != PEB_ERROR_MODE
         && PEB_PORT_FILES != PEB_SIGNAL_SEQ
         && PEB_PORT_FILES != PEB_COOKIE
         && PEB_PORT_FILES != PEB_PENDING_ATTACH

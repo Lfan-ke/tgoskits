@@ -12,11 +12,12 @@ use core::{ffi::c_char, mem::align_of, mem::MaybeUninit, time::Duration};
 use ax_abi_port::{
     Access, At, Attributes, NodeKind, OpenHow, Paths,
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
-    Address, Advice, Ready, Segment, Shutdown as PortShutdown, SignalTarget, Signals, Slept,
+    Address, Advice, Domain, Ready, Segment, Shutdown as PortShutdown, SignalTarget, Signals,
+    Slept,
     SocketKind, SocketOption, Sockets, SysResult, System, Tasks, UtsField, Wait,
 };
 use ax_net::{SocketAddrEx, SocketOps};
-use linux_raw_sys::net::{AF_INET, AF_INET6};
+use linux_raw_sys::net::{AF_INET, AF_INET6, AF_UNIX};
 use ax_runtime::hal;
 use ax_runtime::hal::cpu::UserAtomicU32Op;
 use ax_task::current;
@@ -922,6 +923,13 @@ fn endpoint(at: &Address) -> SocketAddrEx {
         Address::V6(bytes, port, scope) => core::net::SocketAddr::V6(
             core::net::SocketAddrV6::new(bytes.into(), port, 0, scope),
         ),
+        // A name on this machine is a unix socket in the abstract namespace:
+        // no file is made for it, which is what a Windows pipe name is like
+        // and what the personality asking for one wants.
+        Address::Local(ref bytes, len) => {
+            let name: alloc::sync::Arc<[u8]> = bytes[..len as usize].into();
+            return SocketAddrEx::Unix(ax_net::unix::UnixSocketAddr::Abstract(name));
+        }
     };
     SocketAddrEx::Ip(addr)
 }
@@ -934,9 +942,11 @@ fn address(from: SocketAddrEx) -> Result<Address, i32> {
         SocketAddrEx::Ip(core::net::SocketAddr::V6(v6)) => {
             Ok(Address::V6(v6.ip().octets(), v6.port(), v6.scope_id()))
         }
-        // A local socket has a name, not an address; a caller that asked for
-        // an address has to be told this one has none rather than given a
-        // made-up one.
+        SocketAddrEx::Unix(ax_net::unix::UnixSocketAddr::Abstract(name)) => {
+            Address::local(&name).ok_or(errno(StarryError::InvalidInput))
+        }
+        // A socket with no name of its own, or one named by a file: neither
+        // is an address a caller can be handed back here.
         _ => Err(errno(StarryError::OperationNotSupported)),
     }
 }
@@ -947,14 +957,37 @@ fn socket_of(fd: i32) -> Result<alloc::sync::Arc<crate::file::Socket>, i32> {
 }
 
 impl Sockets for KernelHost {
-    fn open(&self, kind: SocketKind, v6: bool) -> Result<i32, i32> {
-        use ax_net::{tcp::TcpSocket, udp::UdpSocket};
-        let inner: ax_net::Socket = match kind {
-            SocketKind::Stream => TcpSocket::new().into(),
-            SocketKind::Datagram => UdpSocket::new().into(),
+    fn open(&self, domain: Domain, kind: SocketKind) -> Result<i32, i32> {
+        use ax_net::{
+            tcp::TcpSocket,
+            udp::UdpSocket,
+            unix::{DgramTransport, StreamTransport, UnixSocket},
         };
-        let domain = if v6 { AF_INET6 } else { AF_INET };
-        let socket = crate::file::Socket::new(inner, domain);
+        let credentials = crate::file::Socket::current_unix_credentials();
+        let inner: ax_net::Socket = match (domain, kind) {
+            (Domain::Local, SocketKind::Stream) => {
+                UnixSocket::new(StreamTransport::new(credentials)).into()
+            }
+            (Domain::Local, SocketKind::SeqPacket) => {
+                UnixSocket::new(DgramTransport::new_seqpacket(credentials)).into()
+            }
+            (Domain::Local, SocketKind::Datagram) => {
+                UnixSocket::new(DgramTransport::new(credentials)).into()
+            }
+            (_, SocketKind::Stream) => TcpSocket::new().into(),
+            (_, SocketKind::Datagram) => UdpSocket::new().into(),
+            // Only a local socket keeps message boundaries over a connection
+            // here; a network one that asked would be told it cannot.
+            (_, SocketKind::SeqPacket) => {
+                return Err(errno(StarryError::OperationNotSupported));
+            }
+        };
+        let family = match domain {
+            Domain::Inet => AF_INET,
+            Domain::Inet6 => AF_INET6,
+            Domain::Local => AF_UNIX,
+        };
+        let socket = crate::file::Socket::new(inner, family);
         socket.add_to_fd_table(false).map_err(errno).map(|fd| fd as i32)
     }
 
@@ -974,13 +1007,15 @@ impl Sockets for KernelHost {
             .map_err(|e| errno(e.into()))
     }
 
-    fn accept(&self, fd: i32) -> Result<(i32, Address), i32> {
+    fn accept(&self, fd: i32) -> Result<(i32, Option<Address>), i32> {
         let socket = socket_of(fd)?;
         let taken = socket.accept().map_err(|e| errno(e.into()))?;
-        let peer = taken.peer_addr().map_err(|e| errno(e.into()))?;
+        // A peer that never took a name has no address to report, which is
+        // not a reason to refuse the connection it made.
+        let peer = taken.peer_addr().ok().and_then(|peer| address(peer).ok());
         let file = crate::file::Socket::new(taken, socket.ip_domain());
         let fd = file.add_to_fd_table(false).map_err(errno)? as i32;
-        Ok((fd, address(peer)?))
+        Ok((fd, peer))
     }
 
     fn send(&self, fd: i32, uaddr: usize, len: usize, to: Option<&Address>) -> SysResult {

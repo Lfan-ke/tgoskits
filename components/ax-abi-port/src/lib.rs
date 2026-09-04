@@ -700,6 +700,35 @@ pub enum Address {
     V4([u8; 4], u16),
     /// Sixteen bytes, a port, and the scope a link-local address needs.
     V6([u8; 16], u16, u32),
+    /// A name in the machine's own namespace, and how many bytes of it are
+    /// the name. Nothing outside the machine can reach it, and it is not a
+    /// file: Windows names its pipes this way and Linux calls the same thing
+    /// an abstract socket, so a personality that has one has the other.
+    Local([u8; Address::LOCAL_MAX], u8),
+}
+
+#[cfg(feature = "net")]
+impl Address {
+    /// How long a local name can be: what a `sockaddr_un` has room for.
+    pub const LOCAL_MAX: usize = 108;
+
+    /// A local address for `name`, or nothing if the name does not fit.
+    pub fn local(name: &[u8]) -> Option<Self> {
+        if name.is_empty() || name.len() > Self::LOCAL_MAX {
+            return None;
+        }
+        let mut bytes = [0u8; Self::LOCAL_MAX];
+        bytes[..name.len()].copy_from_slice(name);
+        Some(Self::Local(bytes, name.len() as u8))
+    }
+
+    /// The name a local address carries.
+    pub fn name(&self) -> Option<&[u8]> {
+        match self {
+            Self::Local(bytes, len) => Some(&bytes[..*len as usize]),
+            _ => None,
+        }
+    }
 }
 
 /// What a socket carries: a stream of bytes, or messages that keep their
@@ -709,6 +738,21 @@ pub enum Address {
 pub enum SocketKind {
     Stream,
     Datagram,
+    /// Messages that keep their boundaries over a connection, which is what
+    /// a Windows message-mode pipe and a `SOCK_SEQPACKET` socket both are.
+    SeqPacket,
+}
+
+/// Which namespace a socket's addresses come from.
+#[cfg(feature = "net")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Domain {
+    /// Addresses on the network, version four.
+    Inet,
+    /// The same, version six.
+    Inet6,
+    /// Names on this machine only, as [`Address::Local`] carries them.
+    Local,
 }
 
 /// Which direction of a socket is being closed.
@@ -748,12 +792,15 @@ pub enum SocketOption {
 #[cfg(feature = "net")]
 pub trait Sockets: Sync {
     /// A new socket, as a descriptor the file ports also accept.
-    fn open(&self, kind: SocketKind, v6: bool) -> Result<i32, i32>;
+    fn open(&self, domain: Domain, kind: SocketKind) -> Result<i32, i32>;
     fn bind(&self, fd: i32, at: &Address) -> Result<(), i32>;
     fn connect(&self, fd: i32, to: &Address) -> Result<(), i32>;
     fn listen(&self, fd: i32, backlog: u32) -> Result<(), i32>;
     /// Take the next connection: its descriptor and where it came from.
-    fn accept(&self, fd: i32) -> Result<(i32, Address), i32>;
+    /// Take a waiting connection. The address is the one the other end is
+    /// known by, and there is none when it never took a name - which a local
+    /// socket that only ever connected has not.
+    fn accept(&self, fd: i32) -> Result<(i32, Option<Address>), i32>;
     /// Send from user memory, to `to` for a socket that is not connected.
     fn send(&self, fd: i32, uaddr: usize, len: usize, to: Option<&Address>) -> SysResult;
     /// Receive into user memory; `peek` leaves what it read in place. The
