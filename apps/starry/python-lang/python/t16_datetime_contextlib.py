@@ -902,8 +902,12 @@ chk("sp_timeout_expired_cmd", _toe_cmd)
 # =====================================================================
 co = subprocess.check_output([PY, "-c", "print('grabbed')"], text=True)
 chk("sp_check_output", co == "grabbed\n")
+# Bytes come back as the child wrote them, and a child writing text on
+# Windows writes CRLF (the C runtime translates in text mode); text=True is
+# what turns those back into "\n", which is why the check above sees one.
 co_bytes = subprocess.check_output([PY, "-c", "print('b')"])
-chk("sp_check_output_bytes", co_bytes == b"b\n")
+_eol = b"\r\n" if sys.platform == "win32" else b"\n"
+chk("sp_check_output_bytes", co_bytes == b"b" + _eol, repr(co_bytes))
 
 try:
     subprocess.check_output([PY, "-c", "import sys; print('partial'); sys.exit(2)"], text=True)
