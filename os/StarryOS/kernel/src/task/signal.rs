@@ -149,8 +149,19 @@ fn dump_user_crash_context(uctx: &UserContext) {
     {
         warn!(
             "user register dump:\n  rip={:#018x} rsp={:#018x} rflags={:#018x}\n  rax={:#018x} \
-             rdi={:#018x} rsi={:#018x} rdx={:#018x}",
-            uctx.rip, uctx.rsp, uctx.rflags, uctx.rax, uctx.rdi, uctx.rsi, uctx.rdx,
+             rdi={:#018x} rsi={:#018x} rdx={:#018x}\n  rbx={:#018x} rcx={:#018x} rbp={:#018x} \
+             r11={:#018x}",
+            uctx.rip,
+            uctx.rsp,
+            uctx.rflags,
+            uctx.rax,
+            uctx.rdi,
+            uctx.rsi,
+            uctx.rdx,
+            uctx.rbx,
+            uctx.rcx,
+            uctx.rbp,
+            uctx.r11,
         );
     }
     #[cfg(target_arch = "loongarch64")]
