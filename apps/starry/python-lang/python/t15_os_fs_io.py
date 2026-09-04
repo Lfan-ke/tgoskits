@@ -1012,27 +1012,39 @@ chk("path_slash_op", str(child) == os.path.join(SBX, "pl", "deep.txt"))
 chk("path_joinpath", base.joinpath("pl", "x") == base / "pl" / "x")
 
 # Components: name/stem/suffix/suffixes/parent/parents/parts/anchor.
+# Path is the platform's own flavour, so what a path reads as is spelled with
+# the platform's separator: /a/b on POSIX, \a\b on Windows. The parts are the
+# same parts either way, which is what these check.
+_sep = os.sep
+def _p(*parts):
+    return _sep.join(parts)
 pp = P("/a/b/archive.tar.gz")
 chk("path_name", pp.name == "archive.tar.gz")
 chk("path_stem", pp.stem == "archive.tar")
 chk("path_suffix", pp.suffix == ".gz")
 chk("path_suffixes", pp.suffixes == [".tar", ".gz"])
-chk("path_parent", str(pp.parent) == "/a/b")
-chk("path_parents", str(pp.parents[1]) == "/a")
-chk("path_parts", pp.parts == ("/", "a", "b", "archive.tar.gz"))
-chk("path_anchor", pp.anchor == "/")
+chk("path_parent", str(pp.parent) == _p("", "a", "b"))
+chk("path_parents", str(pp.parents[1]) == _p("", "a"))
+chk("path_parts", pp.parts == (_sep, "a", "b", "archive.tar.gz"))
+chk("path_anchor", pp.anchor == _sep)
 
 # with_name / with_suffix derive sibling paths.
-chk("path_with_name", str(pp.with_name("x.txt")) == "/a/b/x.txt")
-chk("path_with_suffix", str(pp.with_suffix(".zip")) == "/a/b/archive.tar.zip")
+chk("path_with_name", str(pp.with_name("x.txt")) == _p("", "a", "b", "x.txt"))
+chk("path_with_suffix",
+    str(pp.with_suffix(".zip")) == _p("", "a", "b", "archive.tar.zip"))
 # with_stem (3.9+) replaces the final-component stem, keeping the suffix.
-chk("path_with_stem", str(pp.with_suffix(".zip").with_stem("data")) == "/a/b/data.zip")
+chk("path_with_stem",
+    str(pp.with_suffix(".zip").with_stem("data")) == _p("", "a", "b", "data.zip"))
 
 # match / relative_to are pure-path predicates.
 chk("path_match", P("/a/b/c.py").match("*.py"))
-chk("path_relative_to", str(P("/a/b/c").relative_to("/a")) == "b/c")
+chk("path_relative_to", str(P("/a/b/c").relative_to("/a")) == _p("b", "c"))
 # is_absolute / is_relative_to are pure-path predicates (is_relative_to 3.9+).
-chk("path_is_absolute", P("/a/b").is_absolute() and not P("a/b").is_absolute())
+# What counts as absolute is the platform's own rule: Windows wants a drive,
+# so a path that only starts at the root is not absolute there (pathlib docs,
+# PureWindowsPath.is_absolute).
+_abs = "Z:\\a\\b" if sys.platform == "win32" else "/a/b"
+chk("path_is_absolute", P(_abs).is_absolute() and not P("a/b").is_absolute())
 chk("path_is_relative_to", P("/a/b/c").is_relative_to("/a"))
 # as_posix forces forward slashes from a Path object too.
 chk("path_as_posix", P("/a/b/c").as_posix() == "/a/b/c")
