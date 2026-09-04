@@ -288,6 +288,26 @@ impl Paths for KernelHost {
             .map_err(|e| errno(e.into()))
     }
 
+    fn space(&self, at: At, path: &str) -> Result<ax_abi_port::Space, i32> {
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let Some(location) = resolve_at(dirfd, Some(path), 0).map_err(errno)?.into_file() else {
+            return Err(errno(StarryError::NotADirectory));
+        };
+        let stat = location
+            .filesystem()
+            .stat()
+            .map_err(|e| errno(StarryError::from(e)))?;
+        let block = stat.block_size as u64;
+        Ok(ax_abi_port::Space {
+            total: stat.blocks as u64 * block,
+            free: stat.blocks_free as u64 * block,
+            available: stat.blocks_available as u64 * block,
+        })
+    }
+
     fn set_mode_of(&self, fd: i32, mode: u32) -> Result<(), i32> {
         let Some(location) = resolve_at(fd, None, AT_EMPTY_PATH)
             .map_err(errno)?

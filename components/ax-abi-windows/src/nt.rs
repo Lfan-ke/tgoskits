@@ -1121,6 +1121,8 @@ mod tests {
         stamped: RefCell<Option<(i32, Option<u64>, Option<u64>)>>,
         /// The name that was unlinked, if one was.
         unlinked: RefCell<Option<String>>,
+        /// What the filesystem says it has room for, if it says.
+        space: Option<ax_abi_port::Space>,
         /// What this process ended with, if it did.
         ended: RefCell<Option<i32>>,
         /// Who was signalled, and with what.
@@ -1162,6 +1164,7 @@ mod tests {
                 moded: RefCell::default(),
                 stamped: RefCell::default(),
                 unlinked: RefCell::default(),
+                space: None,
                 ended: RefCell::default(),
                 killed: RefCell::default(),
                 kills: core::cell::Cell::new(true),
@@ -1623,6 +1626,9 @@ mod tests {
         }
         fn attributes_of(&self, _fd: i32) -> Result<Attributes, i32> {
             self.describes.clone().ok_or(ax_abi_port::EBADF)
+        }
+        fn space(&self, _at: At, _path: &str) -> Result<ax_abi_port::Space, i32> {
+            self.space.ok_or(ax_abi_port::ENOSYS)
         }
         fn unlink(&self, _at: At, path: &str) -> Result<(), i32> {
             *self.unlinked.borrow_mut() = Some(String::from(path));
@@ -3710,6 +3716,48 @@ mod tests {
             let mem = host.mem.borrow();
             assert_eq!(&mem[buffer..buffer + 5], b"hello");
         }
+    }
+
+    #[test]
+    fn the_room_a_filesystem_has_is_reported_in_bytes() {
+        use crate::win32;
+        let host = MockHost {
+            has_paths: true,
+            space: Some(ax_abi_port::Space {
+                total: 4096 * 1000,
+                free: 4096 * 400,
+                available: 4096 * 300,
+            }),
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "Z:\\app\0");
+        let (caller, total, free) = (0x7100usize, 0x7108usize, 0x7110usize);
+        let mut asked = call(
+            "GetDiskFreeSpaceExW",
+            [0x7000, caller, total, free, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut asked, &host);
+        assert_eq!(asked.result, Some(1));
+        assert_eq!(read_u64(&host, caller), 4096 * 300, "what is left to use");
+        assert_eq!(read_u64(&host, total), 4096 * 1000);
+        assert_eq!(read_u64(&host, free), 4096 * 400);
+
+        // A filesystem that cannot say fails rather than reporting nothing.
+        let host = MockHost {
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "Z:\\app\0");
+        let mut refused = call(
+            "GetDiskFreeSpaceExW",
+            [0x7000, caller, total, free, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut refused, &host);
+        assert_eq!(refused.result, Some(0));
     }
 
     #[test]

@@ -1308,6 +1308,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "DisconnectEx" => sock::disconnect_ex(&mut c),
         "SetFileTime" => file::set_file_time(&mut c),
         "CopyFile2" => file::copy_file2(&mut c),
+        "GetDiskFreeSpaceExW" => file::get_disk_free_space_ex(&mut c),
         "SysAllocStringLen" => runtime::sys_alloc_string_len(&mut c),
         "SysStringLen" => runtime::sys_string_len(&mut c),
         "SysFreeString" => runtime::sys_free_string(&mut c),

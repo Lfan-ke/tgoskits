@@ -1425,3 +1425,33 @@ pub fn copy_file2(c: &mut Call<'_>) -> Dispatch {
         Err(errno) => c.finish(hresult(nt::status_from_errno(errno).dos_error())),
     }
 }
+
+/// GetDiskFreeSpaceExW(directory, freeToCaller, total, totalFree): how much
+/// room the filesystem a name lives on has. A null name means the current
+/// directory, as the call defines it.
+pub fn get_disk_free_space_ex(c: &mut Call<'_>) -> Dispatch {
+    let (name, to_caller, total_out, free_out) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+    let path = if name == 0 {
+        current_directory(c).and_then(|dir| host_path(c, &dir))
+    } else {
+        name_at(c, name).and_then(|name| host_path(c, &name))
+    };
+    let (Some(path), Some(paths)) = (path, c.host.paths()) else {
+        return c.fail(ERROR_PATH_NOT_FOUND, FALSE);
+    };
+    let space = match paths.space(At::Cwd, &path) {
+        Ok(space) => space,
+        Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
+    };
+    for (at, value) in [
+        (to_caller, space.available),
+        (total_out, space.total),
+        (free_out, space.free),
+    ] {
+        if at != 0 && !c.write_u64(at, value) {
+            return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+        }
+    }
+    c.set_last_error(0);
+    c.finish(TRUE)
+}

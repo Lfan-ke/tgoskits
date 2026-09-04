@@ -204,6 +204,19 @@ pub enum Create {
     Exclusive,
 }
 
+/// How much room a filesystem has, in bytes.
+#[cfg(feature = "paths")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Space {
+    /// Everything it holds.
+    pub total: u64,
+    /// What is not in use.
+    pub free: u64,
+    /// What this caller may still use, which is less than free wherever some
+    /// of it is held back for another user.
+    pub available: u64,
+}
+
 /// What opening a name should do.
 ///
 /// Each ABI spells these differently - Linux and Darwin in `O_*` bits that do
@@ -338,6 +351,11 @@ pub trait Paths: Sync {
     /// Change what a name permits, to the nine permission bits every one of
     /// these systems keeps under some name of its own.
     fn set_mode(&self, _at: At, _path: &str, _mode: u32, _follow: bool) -> Result<(), i32> {
+        Err(38)
+    }
+
+    /// How much room the filesystem a name lives on has.
+    fn space(&self, _at: At, _path: &str) -> Result<Space, i32> {
         Err(38)
     }
 
