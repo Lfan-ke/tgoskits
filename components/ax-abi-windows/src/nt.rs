@@ -1044,6 +1044,22 @@ mod tests {
         has_paths: bool,
         /// Directory entries the paths port enumerates.
         entries: Vec<(String, NodeKind)>,
+        /// The monotonic clock, which a test moves by hand.
+        now: RefCell<u64>,
+        /// The sockets this host has handed out.
+        sockets: RefCell<Vec<MockSocket>>,
+    }
+
+    impl MockHost {
+        /// The socket a descriptor names, for a test to set up or inspect.
+        fn socket(&self, fd: i32) -> Result<core::cell::RefMut<'_, MockSocket>, i32> {
+            let index = (fd - 3) as usize;
+            let table = self.sockets.borrow_mut();
+            if index >= table.len() || table[index].closed {
+                return Err(88); // ENOTSOCK
+            }
+            Ok(core::cell::RefMut::map(table, |table| &mut table[index]))
+        }
     }
     impl Default for MockHost {
         fn default() -> Self {
@@ -1060,7 +1076,201 @@ mod tests {
                 opens_at: Ok(0),
                 has_paths: false,
                 entries: Vec::new(),
+                now: RefCell::default(),
+                sockets: RefCell::default(),
             }
+        }
+    }
+
+    // The host's synchronisation steps over the mock's flat memory. Nothing
+    // else runs in a test, so a park is a park nobody will end: it reports
+    // the deadline, which is what a real host reports when no wake arrives.
+    /// A socket table the tests can inspect: enough of one for the Winsock
+    /// layer to be exercised end to end without a network.
+    #[derive(Default, Clone)]
+    struct MockSocket {
+        kind: Option<ax_abi_port::SocketKind>,
+        v6: bool,
+        bound: Option<ax_abi_port::Address>,
+        peer: Option<ax_abi_port::Address>,
+        listening: bool,
+        blocking: bool,
+        sent: Vec<(usize, usize, Option<ax_abi_port::Address>)>,
+        queued: Vec<u8>,
+        shutdown: Option<ax_abi_port::Shutdown>,
+        options: Vec<(ax_abi_port::SocketOption, u32)>,
+        closed: bool,
+    }
+
+    impl ax_abi_port::Sockets for MockHost {
+        fn open(&self, kind: ax_abi_port::SocketKind, v6: bool) -> Result<i32, i32> {
+            let mut table = self.sockets.borrow_mut();
+            table.push(MockSocket {
+                kind: Some(kind),
+                v6,
+                blocking: true,
+                ..MockSocket::default()
+            });
+            // Descriptor 0 is stdin elsewhere in these tests, so sockets start
+            // above the standard three.
+            Ok(table.len() as i32 + 2)
+        }
+        fn bind(&self, fd: i32, at: &ax_abi_port::Address) -> Result<(), i32> {
+            self.socket(fd)?.bound = Some(*at);
+            Ok(())
+        }
+        fn connect(&self, fd: i32, to: &ax_abi_port::Address) -> Result<(), i32> {
+            self.socket(fd)?.peer = Some(*to);
+            Ok(())
+        }
+        fn listen(&self, fd: i32, _backlog: u32) -> Result<(), i32> {
+            self.socket(fd)?.listening = true;
+            Ok(())
+        }
+        fn accept(&self, fd: i32) -> Result<(i32, ax_abi_port::Address), i32> {
+            if !self.socket(fd)?.listening {
+                return Err(107); // ENOTCONN
+            }
+            let peer = ax_abi_port::Address::V4([198, 51, 100, 7], 4242);
+            let mut table = self.sockets.borrow_mut();
+            table.push(MockSocket {
+                peer: Some(peer),
+                blocking: true,
+                ..MockSocket::default()
+            });
+            Ok((table.len() as i32 + 2, peer))
+        }
+        fn send(
+            &self,
+            fd: i32,
+            uaddr: usize,
+            len: usize,
+            to: Option<&ax_abi_port::Address>,
+        ) -> ax_abi_port::SysResult {
+            self.socket(fd)?.sent.push((uaddr, len, to.copied()));
+            Ok(len as isize)
+        }
+        fn recv(
+            &self,
+            fd: i32,
+            uaddr: usize,
+            len: usize,
+            peek: bool,
+        ) -> Result<(usize, Option<ax_abi_port::Address>), i32> {
+            let queued = self.socket(fd)?.queued.clone();
+            let read = queued.len().min(len);
+            {
+                let mut mem = self.mem.borrow_mut();
+                if mem.len() < uaddr + read {
+                    mem.resize(uaddr + read, 0);
+                }
+                mem[uaddr..uaddr + read].copy_from_slice(&queued[..read]);
+            }
+            if !peek {
+                self.socket(fd)?.queued.drain(..read);
+            }
+            Ok((read, Some(ax_abi_port::Address::V4([203, 0, 113, 9], 1234))))
+        }
+        fn shutdown(&self, fd: i32, how: ax_abi_port::Shutdown) -> Result<(), i32> {
+            self.socket(fd)?.shutdown = Some(how);
+            Ok(())
+        }
+        fn local(&self, fd: i32) -> Result<ax_abi_port::Address, i32> {
+            self.socket(fd)?.bound.ok_or(107)
+        }
+        fn peer(&self, fd: i32) -> Result<ax_abi_port::Address, i32> {
+            self.socket(fd)?.peer.ok_or(107)
+        }
+        fn set_blocking(&self, fd: i32, blocking: bool) -> Result<(), i32> {
+            self.socket(fd)?.blocking = blocking;
+            Ok(())
+        }
+        fn pending(&self, fd: i32) -> Result<usize, i32> {
+            Ok(self.socket(fd)?.queued.len())
+        }
+        fn set_option(
+            &self,
+            fd: i32,
+            option: ax_abi_port::SocketOption,
+            value: u32,
+        ) -> Result<(), i32> {
+            self.socket(fd)?.options.push((option, value));
+            Ok(())
+        }
+        fn option(&self, fd: i32, option: ax_abi_port::SocketOption) -> Result<u32, i32> {
+            let socket = self.socket(fd)?;
+            Ok(match option {
+                ax_abi_port::SocketOption::Kind => match socket.kind {
+                    Some(ax_abi_port::SocketKind::Datagram) => 2,
+                    _ => 1,
+                },
+                other => socket
+                    .options
+                    .iter()
+                    .rev()
+                    .find(|(seen, _)| *seen == other)
+                    .map_or(0, |(_, value)| *value),
+            })
+        }
+    }
+
+    impl MockHost {
+        /// Readiness the way the host reports it: a socket with something
+        /// queued reads, one that is connected writes.
+        fn readiness(&self, fd: i32) -> Option<ax_abi_port::Ready> {
+            let socket = self.socket(fd).ok()?;
+            Some(ax_abi_port::Ready {
+                read: !socket.queued.is_empty(),
+                write: socket.peer.is_some(),
+                error: socket.shutdown.is_some(),
+            })
+        }
+    }
+
+    impl ax_abi_port::System for MockHost {
+        fn uname(&self, put: &mut dyn FnMut(ax_abi_port::UtsField, &str)) {
+            put(ax_abi_port::UtsField::SysName, "Starry");
+            put(ax_abi_port::UtsField::NodeName, "starry-host");
+        }
+    }
+
+    impl ax_abi_port::Clock for MockHost {
+        fn monotonic_ns(&self) -> u64 {
+            *self.now.borrow()
+        }
+        fn wall_ns(&self) -> u64 {
+            *self.now.borrow()
+        }
+        fn sleep_ns(&self, ns: u64) -> ax_abi_port::Slept {
+            *self.now.borrow_mut() += ns;
+            ax_abi_port::Slept::Full
+        }
+    }
+
+    impl ax_abi_port::Wait for MockHost {
+        fn wait(&self, _at: usize, _expected: u32, _timeout_ns: Option<u64>) -> Result<bool, i32> {
+            Ok(false)
+        }
+        fn wake(&self, _at: usize, _count: u32) -> Result<u32, i32> {
+            Ok(0)
+        }
+        fn swap(&self, at: usize, value: u32) -> Result<u32, i32> {
+            let mut mem = self.mem.borrow_mut();
+            if mem.len() < at + 4 {
+                mem.resize(at + 4, 0);
+            }
+            let old = u32::from_le_bytes(mem[at..at + 4].try_into().unwrap());
+            mem[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            Ok(old)
+        }
+        fn fetch_add(&self, at: usize, value: u32) -> Result<u32, i32> {
+            let mut mem = self.mem.borrow_mut();
+            if mem.len() < at + 4 {
+                mem.resize(at + 4, 0);
+            }
+            let old = u32::from_le_bytes(mem[at..at + 4].try_into().unwrap());
+            mem[at..at + 4].copy_from_slice(&old.wrapping_add(value).to_le_bytes());
+            Ok(old)
         }
     }
 
@@ -1102,6 +1312,31 @@ mod tests {
     }
 
     impl ax_abi_port::Files for MockHost {
+        fn poll(
+            &self,
+            interest: &mut [(i32, ax_abi_port::Ready)],
+            _timeout_ns: Option<u64>,
+        ) -> Result<usize, i32> {
+            let mut count = 0;
+            for (fd, ready) in interest.iter_mut() {
+                let wanted = *ready;
+                *ready = ax_abi_port::Ready::default();
+                let Some(is) = self.readiness(*fd) else {
+                    ready.error = true;
+                    count += 1;
+                    continue;
+                };
+                let asked = (wanted.read && is.read)
+                    || (wanted.write && is.write)
+                    || (wanted.error && is.error);
+                if asked {
+                    *ready = is;
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
+
         fn read(&self, _fd: i32, _uaddr: usize, len: usize) -> ax_abi_port::SysResult {
             Ok(len as isize)
         }
@@ -1272,6 +1507,18 @@ mod tests {
             Some(self)
         }
         fn mem(&self) -> Option<&dyn ax_abi_port::Mem> {
+            Some(self)
+        }
+        fn wait(&self) -> Option<&dyn ax_abi_port::Wait> {
+            Some(self)
+        }
+        fn clock(&self) -> Option<&dyn ax_abi_port::Clock> {
+            Some(self)
+        }
+        fn sockets(&self) -> Option<&dyn ax_abi_port::Sockets> {
+            Some(self)
+        }
+        fn system(&self) -> Option<&dyn ax_abi_port::System> {
             Some(self)
         }
     }
@@ -2007,6 +2254,19 @@ mod tests {
         String::from_utf16_lossy(&units)
     }
 
+    /// The descriptor a socket handle names, as the layer computes it.
+    fn socket_fd(handle: usize) -> i32 {
+        (handle / 4 - 1) as i32
+    }
+
+    fn put_bytes(host: &MockHost, at: usize, bytes: &[u8]) {
+        let mut mem = host.mem.borrow_mut();
+        if mem.len() < at + bytes.len() {
+            mem.resize(at + bytes.len(), 0);
+        }
+        mem[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
     fn call(name: &str, args: [usize; 6], teb: usize) -> Win32Trap {
         Win32Trap::new(crate::win32::Win32Call::named(name).unwrap(), args, teb)
     }
@@ -2101,14 +2361,14 @@ mod tests {
             let mem = host.mem.borrow();
             u32::from_le_bytes(mem[cs + off..cs + off + 4].try_into().unwrap())
         };
-        assert_eq!(word(8), -1i32 as u32, "LockCount starts free");
+        assert_eq!(word(8), 0, "the lock word starts free");
 
         for _ in 0..2 {
             let mut enter = call("EnterCriticalSection", [cs, 0, 0, 0, 0, 0], teb);
             win32::dispatch(&mut enter, &host);
         }
         assert_eq!(word(12), 2, "RecursionCount");
-        assert_eq!(word(8), 1, "LockCount: two enters from -1");
+        assert_eq!(word(8), 1, "held, and a recursive enter does not retake it");
 
         let mut leave = call("LeaveCriticalSection", [cs, 0, 0, 0, 0, 0], teb);
         win32::dispatch(&mut leave, &host);
@@ -2116,7 +2376,7 @@ mod tests {
         let mut leave = call("LeaveCriticalSection", [cs, 0, 0, 0, 0, 0], teb);
         win32::dispatch(&mut leave, &host);
         assert_eq!(word(12), 0);
-        assert_eq!(word(8), -1i32 as u32, "free again");
+        assert_eq!(word(8), 0, "free again");
         let owner = {
             let mem = host.mem.borrow();
             u64::from_le_bytes(mem[cs + 16..cs + 24].try_into().unwrap())
@@ -2820,12 +3080,826 @@ mod tests {
         win32::dispatch(&mut tryacq, &host);
         assert_eq!(tryacq.result, Some(1));
 
-        // Sleeping on a condition variable releases the lock and returns woken,
-        // so a caller's recheck loop makes progress in this one thread.
+        let mut rel = call("ReleaseSRWLockExclusive", [lock, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut rel, &host);
+
+        // Sleeping on a condition variable drops the lock while it waits and
+        // has it again when it returns, whether it was woken or timed out.
+        // Nothing wakes it here, so it reports the deadline.
         let mut sleep = call("SleepConditionVariableSRW", [cond, lock, 0, 0, 0, 0], teb);
         win32::dispatch(&mut sleep, &host);
-        assert_eq!(sleep.result, Some(1));
-        assert_eq!(word(lock), 0, "the lock was released");
+        assert_eq!(sleep.result, Some(0), "timed out");
+        assert_eq!(word(lock), 1, "the lock is held again on the way out");
+    }
+
+    /// The handle a create call answered with.
+    fn created(host: &MockHost, teb: usize, name: &str, args: [usize; 6]) -> usize {
+        use crate::win32;
+        let mut made = call(name, args, teb);
+        win32::dispatch(&mut made, host);
+        made.result.expect("the object was created")
+    }
+
+    /// What waiting on `handle` for `ms` reports.
+    fn waited(host: &MockHost, teb: usize, handle: usize, ms: usize) -> usize {
+        use crate::win32;
+        let mut wait = call("WaitForSingleObject", [handle, ms, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut wait, host);
+        wait.result.expect("the wait answered")
+    }
+
+    const WAIT_OBJECT_0: usize = 0;
+    const WAIT_TIMEOUT: usize = 0x102;
+
+    #[test]
+    fn an_auto_reset_event_hands_its_signal_to_one_waiter() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        // Auto reset, signalled to begin with.
+        let event = created(&host, teb, "CreateEventW", [0, 0, 1, 0, 0, 0]);
+        assert_ne!(event, 0);
+        assert_eq!(
+            waited(&host, teb, event, 0),
+            WAIT_OBJECT_0,
+            "takes the signal"
+        );
+        assert_eq!(
+            waited(&host, teb, event, 0),
+            WAIT_TIMEOUT,
+            "and the signal went with it"
+        );
+        let mut set = call("SetEvent", [event, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut set, &host);
+        assert_eq!(waited(&host, teb, event, 0), WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn a_manual_reset_event_stays_signalled_until_it_is_reset() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let event = created(&host, teb, "CreateEventW", [0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            waited(&host, teb, event, 0),
+            WAIT_TIMEOUT,
+            "not signalled yet"
+        );
+        let mut set = call("SetEvent", [event, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut set, &host);
+        assert_eq!(waited(&host, teb, event, 0), WAIT_OBJECT_0);
+        assert_eq!(
+            waited(&host, teb, event, 0),
+            WAIT_OBJECT_0,
+            "a manual reset event releases everyone"
+        );
+        let mut reset = call("ResetEvent", [event, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut reset, &host);
+        assert_eq!(waited(&host, teb, event, 0), WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn a_semaphore_hands_out_its_count_and_release_reports_the_previous_one() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let previous_out = 0x7200usize;
+        let semaphore = created(&host, teb, "CreateSemaphoreW", [0, 2, 2, 0, 0, 0]);
+        assert_eq!(waited(&host, teb, semaphore, 0), WAIT_OBJECT_0);
+        assert_eq!(waited(&host, teb, semaphore, 0), WAIT_OBJECT_0);
+        assert_eq!(
+            waited(&host, teb, semaphore, 0),
+            WAIT_TIMEOUT,
+            "the count is spent"
+        );
+        let mut release = call(
+            "ReleaseSemaphore",
+            [semaphore, 2, previous_out, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut release, &host);
+        let previous = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[previous_out..previous_out + 4].try_into().unwrap())
+        };
+        assert_eq!(previous, 0, "it was spent when the count went back up");
+        assert_eq!(waited(&host, teb, semaphore, 0), WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn a_mutex_is_recursive_to_its_owner_and_freed_on_the_last_release() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        // Created owned, so the creating thread already holds it once.
+        let mutex = created(&host, teb, "CreateMutexW", [0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            waited(&host, teb, mutex, 0),
+            WAIT_OBJECT_0,
+            "the owner takes it again rather than waiting on itself"
+        );
+        let mut release = call("ReleaseMutex", [mutex, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut release, &host);
+        let mut release = call("ReleaseMutex", [mutex, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut release, &host);
+        // Free now, so it can be taken from scratch.
+        assert_eq!(waited(&host, teb, mutex, 0), WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn waiting_on_several_objects_answers_with_the_one_that_is_ready() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let quiet = created(&host, teb, "CreateEventW", [0, 1, 0, 0, 0, 0]);
+        let ready = created(&host, teb, "CreateEventW", [0, 1, 1, 0, 0, 0]);
+        let handles = 0x7300usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[handles..handles + 8].copy_from_slice(&(quiet as u64).to_le_bytes());
+            mem[handles + 8..handles + 16].copy_from_slice(&(ready as u64).to_le_bytes());
+        }
+        let mut any = call("WaitForMultipleObjects", [2, handles, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut any, &host);
+        assert_eq!(any.result, Some(1), "the second one is the ready one");
+        // Waiting for all of them cannot finish while one is quiet.
+        let mut all = call("WaitForMultipleObjects", [2, handles, 1, 0, 0, 0], teb);
+        win32::dispatch(&mut all, &host);
+        assert_eq!(all.result, Some(WAIT_TIMEOUT));
+    }
+
+    #[test]
+    fn a_timer_is_unsignalled_until_the_moment_it_was_set_for() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let timer = created(&host, teb, "CreateWaitableTimerExW", [0, 0, 0, 0, 0, 0]);
+        assert_ne!(timer, 0);
+        // Unarmed, it is never signalled.
+        assert_eq!(waited(&host, teb, timer, 0), WAIT_TIMEOUT);
+        // A negative due time is relative, in hundreds of nanoseconds. The
+        // mock has no clock, so anything in the past is already due and
+        // anything in the future never arrives.
+        let due = 0x7000usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[due..due + 8].copy_from_slice(&(-10_000_000i64).to_le_bytes());
+        }
+        let mut set = call("SetWaitableTimerEx", [timer, due, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut set, &host);
+        assert_eq!(set.result, Some(1));
+        assert_eq!(
+            waited(&host, teb, timer, 0),
+            WAIT_TIMEOUT,
+            "a second away is not due yet"
+        );
+        // Move the clock past the moment it was set for.
+        *host.now.borrow_mut() += 1_000_000_000;
+        assert_eq!(waited(&host, teb, timer, 0), WAIT_OBJECT_0, "due now");
+        assert_eq!(
+            waited(&host, teb, timer, 0),
+            WAIT_OBJECT_0,
+            "and it stays signalled until it is set again"
+        );
+        // Cancelling leaves it unarmed and unsignalled.
+        let mut cancel = call("CancelWaitableTimer", [timer, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut cancel, &host);
+        assert_eq!(waited(&host, teb, timer, 0), WAIT_TIMEOUT);
+    }
+
+    /// The handle a socket call answered with, and the descriptor behind it.
+    fn opened(host: &MockHost, teb: usize, family: usize, kind: usize) -> usize {
+        use crate::win32;
+        let mut made = call("socket", [family, kind, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut made, host);
+        made.result.expect("socket answered")
+    }
+
+    /// Lay a Winsock SOCKADDR_IN down at `at`.
+    fn put_sockaddr_in(host: &MockHost, at: usize, ip: [u8; 4], port: u16) {
+        let mut block = [0u8; 16];
+        block[0..2].copy_from_slice(&2u16.to_le_bytes());
+        block[2..4].copy_from_slice(&port.to_be_bytes());
+        block[4..8].copy_from_slice(&ip);
+        put_bytes(host, at, &block);
+    }
+
+    #[test]
+    fn a_socket_is_opened_for_the_families_and_kinds_winsock_names() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        // AF_INET/SOCK_STREAM, AF_INET6/SOCK_DGRAM.
+        assert_ne!(opened(&host, teb, 2, 1), usize::MAX);
+        assert_ne!(opened(&host, teb, 23, 2), usize::MAX);
+        assert_eq!(host.sockets.borrow().len(), 2);
+        assert!(host.sockets.borrow()[1].v6, "AF_INET6 is 23 on Windows");
+
+        // A family this layer does not carry, and a kind it does not carry.
+        let mut family = call("socket", [17, 1, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut family, &host);
+        assert_eq!(family.result, Some(usize::MAX), "INVALID_SOCKET");
+        let mut kind = call("socket", [2, 3, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut kind, &host);
+        assert_eq!(kind.result, Some(usize::MAX));
+    }
+
+    #[test]
+    fn binding_and_connecting_read_the_address_winsock_lays_down() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let socket = opened(&host, teb, 2, 1);
+        let at = 0x7000usize;
+        put_sockaddr_in(&host, at, [192, 0, 2, 10], 8080);
+
+        let mut bound = call("bind", [socket, at, 16, 0, 0, 0], teb);
+        win32::dispatch(&mut bound, &host);
+        assert_eq!(bound.result, Some(0));
+        assert_eq!(
+            host.sockets.borrow()[0].bound,
+            Some(ax_abi_port::Address::V4([192, 0, 2, 10], 8080)),
+            "the port comes off the wire in network order"
+        );
+
+        put_sockaddr_in(&host, at, [198, 51, 100, 20], 53);
+        let mut connected = call("connect", [socket, at, 16, 0, 0, 0], teb);
+        win32::dispatch(&mut connected, &host);
+        assert_eq!(connected.result, Some(0));
+        assert_eq!(
+            host.sockets.borrow()[0].peer,
+            Some(ax_abi_port::Address::V4([198, 51, 100, 20], 53))
+        );
+
+        // An address shorter than the structure it claims to be is refused.
+        let mut short = call("bind", [socket, at, 8, 0, 0, 0], teb);
+        win32::dispatch(&mut short, &host);
+        assert_eq!(short.result, Some(-1i32 as u32 as usize), "SOCKET_ERROR");
+    }
+
+    #[test]
+    fn an_accepted_connection_reports_where_it_came_from() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let socket = opened(&host, teb, 2, 1);
+
+        // Accepting before listening is refused, as the host reports it.
+        let mut early = call("accept", [socket, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut early, &host);
+        assert_eq!(early.result, Some(usize::MAX));
+
+        let mut listening = call("listen", [socket, 8, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut listening, &host);
+        assert_eq!(listening.result, Some(0));
+        assert!(host.sockets.borrow()[0].listening);
+
+        let (at, len_at) = (0x7000usize, 0x7100usize);
+        put_bytes(&host, len_at, &16u32.to_le_bytes());
+        let mut taken = call("accept", [socket, at, len_at, 0, 0, 0], teb);
+        win32::dispatch(&mut taken, &host);
+        assert_ne!(taken.result, Some(usize::MAX));
+        let mem = host.mem.borrow();
+        assert_eq!(&mem[at..at + 2], &2u16.to_le_bytes(), "AF_INET");
+        assert_eq!(&mem[at + 2..at + 4], &4242u16.to_be_bytes());
+        assert_eq!(&mem[at + 4..at + 8], &[198, 51, 100, 7]);
+        assert_eq!(
+            u32::from_le_bytes(mem[len_at..len_at + 4].try_into().unwrap()),
+            16,
+            "and the length it took"
+        );
+    }
+
+    #[test]
+    fn sending_and_receiving_carry_the_address_when_the_call_has_one() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let socket = opened(&host, teb, 2, 2);
+        let (buf, to) = (0x7000usize, 0x7100usize);
+        put_bytes(&host, buf, b"hello");
+        put_sockaddr_in(&host, to, [203, 0, 113, 9], 1234);
+
+        let mut sent = call("send", [socket, buf, 5, 0, 0, 0], teb);
+        win32::dispatch(&mut sent, &host);
+        assert_eq!(sent.result, Some(5));
+        assert_eq!(host.sockets.borrow()[0].sent[0], (buf, 5, None));
+
+        let mut sent_to = call("sendto", [socket, buf, 5, 0, to, 16], teb);
+        win32::dispatch(&mut sent_to, &host);
+        assert_eq!(sent_to.result, Some(5));
+        assert_eq!(
+            host.sockets.borrow()[0].sent[1].2,
+            Some(ax_abi_port::Address::V4([203, 0, 113, 9], 1234))
+        );
+
+        host.socket(socket_fd(socket)).unwrap().queued = b"world".to_vec();
+        let (into, from, from_len) = (0x7200usize, 0x7300usize, 0x7400usize);
+        put_bytes(&host, from_len, &16u32.to_le_bytes());
+        // MSG_PEEK leaves what it read where it was.
+        let mut peeked = call("recv", [socket, into, 16, 2, 0, 0], teb);
+        win32::dispatch(&mut peeked, &host);
+        assert_eq!(peeked.result, Some(5));
+        assert_eq!(host.sockets.borrow()[0].queued, b"world".to_vec());
+        assert_eq!(&host.mem.borrow()[into..into + 5], b"world");
+
+        let mut from_recv = call("recvfrom", [socket, into, 16, 0, from, from_len], teb);
+        win32::dispatch(&mut from_recv, &host);
+        assert_eq!(from_recv.result, Some(5));
+        assert!(
+            host.sockets.borrow()[0].queued.is_empty(),
+            "and a plain read takes it"
+        );
+        let mem = host.mem.borrow();
+        assert_eq!(&mem[from + 4..from + 8], &[203, 0, 113, 9]);
+    }
+
+    #[test]
+    fn each_direction_of_a_shutdown_is_carried_through() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let socket = opened(&host, teb, 2, 1);
+        for (how, expected) in [
+            (0usize, ax_abi_port::Shutdown::Read),
+            (1, ax_abi_port::Shutdown::Write),
+            (2, ax_abi_port::Shutdown::Both),
+        ] {
+            let mut done = call("shutdown", [socket, how, 0, 0, 0, 0], teb);
+            win32::dispatch(&mut done, &host);
+            assert_eq!(done.result, Some(0));
+            assert_eq!(host.sockets.borrow()[0].shutdown, Some(expected));
+        }
+        let mut wrong = call("shutdown", [socket, 9, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut wrong, &host);
+        assert_eq!(wrong.result, Some(-1i32 as u32 as usize));
+    }
+
+    #[test]
+    fn the_two_socket_ioctls_reach_the_host() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let socket = opened(&host, teb, 2, 1);
+        let arg = 0x7000usize;
+
+        // FIONBIO with a non-zero argument stops calls from waiting.
+        put_bytes(&host, arg, &1u32.to_le_bytes());
+        let mut nonblocking = call("ioctlsocket", [socket, 0x8004_667E, arg, 0, 0, 0], teb);
+        win32::dispatch(&mut nonblocking, &host);
+        assert_eq!(nonblocking.result, Some(0));
+        assert!(!host.sockets.borrow()[0].blocking);
+
+        put_bytes(&host, arg, &0u32.to_le_bytes());
+        let mut blocking = call("ioctlsocket", [socket, 0x8004_667E, arg, 0, 0, 0], teb);
+        win32::dispatch(&mut blocking, &host);
+        assert!(host.sockets.borrow()[0].blocking);
+
+        // FIONREAD reports what is waiting.
+        host.socket(socket_fd(socket)).unwrap().queued = b"abcd".to_vec();
+        let mut ready = call("ioctlsocket", [socket, 0x4004_667F, arg, 0, 0, 0], teb);
+        win32::dispatch(&mut ready, &host);
+        assert_eq!(ready.result, Some(0));
+        let waiting = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[arg..arg + 4].try_into().unwrap())
+        };
+        assert_eq!(waiting, 4);
+
+        let mut unknown = call("ioctlsocket", [socket, 0x1234, arg, 0, 0, 0], teb);
+        win32::dispatch(&mut unknown, &host);
+        assert_eq!(unknown.result, Some(-1i32 as u32 as usize));
+    }
+
+    #[test]
+    fn the_options_winsock_numbers_reach_the_ones_the_host_names() {
+        use ax_abi_port::SocketOption as O;
+
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let stream = opened(&host, teb, 2, 1);
+        let (value, len) = (0x7000usize, 0x7100usize);
+        put_bytes(&host, value, &1u32.to_le_bytes());
+
+        // (level, name) pairs Winsock uses, and the settings they mean.
+        for (level, name, option) in [
+            (0xFFFFusize, 0x0004usize, O::ReuseAddress),
+            (0xFFFF, 0x0008, O::KeepAlive),
+            (0xFFFF, 0x0020, O::Broadcast),
+            (6, 0x0001, O::NoDelay),
+        ] {
+            let mut set = call("setsockopt", [stream, level, name, value, 4, 0], teb);
+            win32::dispatch(&mut set, &host);
+            assert_eq!(set.result, Some(0));
+            assert!(
+                host.sockets.borrow()[0]
+                    .options
+                    .iter()
+                    .any(|(seen, on)| *seen == option && *on == 1),
+                "{option:?} was set"
+            );
+        }
+
+        // SO_TYPE is a report, and comes from what the socket is.
+        put_bytes(&host, len, &4u32.to_le_bytes());
+        let mut kind = call("getsockopt", [stream, 0xFFFF, 0x1008, value, len, 0], teb);
+        win32::dispatch(&mut kind, &host);
+        assert_eq!(kind.result, Some(0));
+        let read = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[value..value + 4].try_into().unwrap())
+        };
+        assert_eq!(read, 1, "SOCK_STREAM");
+
+        // A pending error reads back in Winsock's numbering, since that is
+        // what the caller turns into an exception.
+        host.socket(socket_fd(stream))
+            .unwrap()
+            .options
+            .push((O::Error, 111));
+        let mut failure = call("getsockopt", [stream, 0xFFFF, 0x1007, value, len, 0], teb);
+        win32::dispatch(&mut failure, &host);
+        let reported = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[value..value + 4].try_into().unwrap())
+        };
+        assert_eq!(reported, 10061, "ECONNREFUSED as WSAECONNREFUSED");
+
+        // An option this layer does not model is accepted, and reads as zero,
+        // rather than failing a caller that only stated a preference.
+        let mut spare = call("setsockopt", [stream, 0xFFFF, 0x4242, value, 4, 0], teb);
+        win32::dispatch(&mut spare, &host);
+        assert_eq!(spare.result, Some(0));
+        let mut read_spare = call("getsockopt", [stream, 0xFFFF, 0x4242, value, len, 0], teb);
+        win32::dispatch(&mut read_spare, &host);
+        assert_eq!(read_spare.result, Some(0));
+        let zero = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[value..value + 4].try_into().unwrap())
+        };
+        assert_eq!(zero, 0);
+    }
+
+    #[test]
+    fn the_names_of_a_socket_come_back_in_winsock_shape() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let socket = opened(&host, teb, 2, 1);
+        let at = 0x7000usize;
+        put_sockaddr_in(&host, at, [192, 0, 2, 10], 8080);
+        let mut bound = call("bind", [socket, at, 16, 0, 0, 0], teb);
+        win32::dispatch(&mut bound, &host);
+
+        let (out, len_at) = (0x7200usize, 0x7300usize);
+        put_bytes(&host, len_at, &16u32.to_le_bytes());
+        let mut local = call("getsockname", [socket, out, len_at, 0, 0, 0], teb);
+        win32::dispatch(&mut local, &host);
+        assert_eq!(local.result, Some(0));
+        assert_eq!(&host.mem.borrow()[out + 4..out + 8], &[192, 0, 2, 10]);
+
+        // A socket with no peer says so rather than inventing one.
+        let mut peer = call("getpeername", [socket, out, len_at, 0, 0, 0], teb);
+        win32::dispatch(&mut peer, &host);
+        assert_eq!(peer.result, Some(-1i32 as u32 as usize));
+
+        // A buffer too small for the address is a fault, not a truncation.
+        put_bytes(&host, len_at, &4u32.to_le_bytes());
+        let mut cramped = call("getsockname", [socket, out, len_at, 0, 0, 0], teb);
+        win32::dispatch(&mut cramped, &host);
+        assert_eq!(cramped.result, Some(-1i32 as u32 as usize));
+    }
+
+    #[test]
+    fn starting_and_ending_winsock_answers_the_way_a_caller_expects() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let data = 0x7000usize;
+        let mut started = call("WSAStartup", [0x0202, data, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut started, &host);
+        assert_eq!(started.result, Some(0));
+        let mem = host.mem.borrow();
+        assert_eq!(
+            u16::from_le_bytes(mem[data..data + 2].try_into().unwrap()),
+            0x0202,
+            "the version it was asked for"
+        );
+        drop(mem);
+
+        let mut ended = call("WSACleanup", [0; 6], teb);
+        win32::dispatch(&mut ended, &host);
+        assert_eq!(ended.result, Some(0));
+
+        // The last error is the thread's, under Winsock's name for it.
+        let mut set = call("WSASetLastError", [10061, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut set, &host);
+        let mut got = call("WSAGetLastError", [0; 6], teb);
+        win32::dispatch(&mut got, &host);
+        assert_eq!(got.result, Some(10061), "WSAECONNREFUSED");
+    }
+
+    #[test]
+    fn byte_order_calls_swap_the_width_they_name() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        for (name, input, expected) in [
+            ("htons", 0x1234usize, 0x3412usize),
+            ("ntohs", 0x3412, 0x1234),
+            ("htonl", 0x1234_5678, 0x7856_3412),
+            ("ntohl", 0x7856_3412, 0x1234_5678),
+        ] {
+            let mut swapped = call(name, [input, 0, 0, 0, 0, 0], teb);
+            win32::dispatch(&mut swapped, &host);
+            assert_eq!(swapped.result, Some(expected), "{name}");
+        }
+    }
+
+    /// Lay a Winsock fd_set down: a count, then the sockets.
+    fn put_fd_set(host: &MockHost, at: usize, handles: &[usize]) {
+        let mut block = alloc::vec![0u8; 8 + handles.len() * 8];
+        block[0..4].copy_from_slice(&(handles.len() as u32).to_le_bytes());
+        for (i, handle) in handles.iter().enumerate() {
+            block[8 + i * 8..16 + i * 8].copy_from_slice(&(*handle as u64).to_le_bytes());
+        }
+        put_bytes(host, at, &block);
+    }
+
+    /// The sockets a set holds after a call wrote it back.
+    fn read_fd_set(host: &MockHost, at: usize) -> Vec<usize> {
+        let mem = host.mem.borrow();
+        let count = u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|i| {
+                u64::from_le_bytes(mem[at + 8 + i * 8..at + 16 + i * 8].try_into().unwrap())
+                    as usize
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_keeps_only_the_sockets_that_are_ready_for_what_was_asked() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let quiet = opened(&host, teb, 2, 1);
+        let ready = opened(&host, teb, 2, 1);
+        // The second socket has something to read and somewhere to write to.
+        {
+            let mut socket = host.socket(socket_fd(ready)).unwrap();
+            socket.queued = b"data".to_vec();
+            socket.peer = Some(ax_abi_port::Address::V4([127, 0, 0, 1], 9));
+        }
+        let (read_at, write_at, timeout_at) = (0x7000usize, 0x7100usize, 0x7200usize);
+        put_fd_set(&host, read_at, &[quiet, ready]);
+        put_fd_set(&host, write_at, &[ready]);
+        // A timeval of zero asks what is ready now; Windows keeps both fields
+        // 32-bit even on x64.
+        put_bytes(&host, timeout_at, &[0u8; 8]);
+
+        let mut chosen = call("select", [0, read_at, write_at, 0, timeout_at, 0], teb);
+        win32::dispatch(&mut chosen, &host);
+        assert_eq!(chosen.result, Some(2), "one readable and one writable");
+        assert_eq!(read_fd_set(&host, read_at), alloc::vec![ready]);
+        assert_eq!(read_fd_set(&host, write_at), alloc::vec![ready]);
+    }
+
+    #[test]
+    fn select_with_nothing_ready_empties_the_sets() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let quiet = opened(&host, teb, 2, 1);
+        let (read_at, timeout_at) = (0x7000usize, 0x7200usize);
+        put_fd_set(&host, read_at, &[quiet]);
+        put_bytes(&host, timeout_at, &[0u8; 8]);
+
+        let mut none = call("select", [0, read_at, 0, 0, timeout_at, 0], teb);
+        win32::dispatch(&mut none, &host);
+        assert_eq!(none.result, Some(0), "a timeout is not a failure");
+        assert!(read_fd_set(&host, read_at).is_empty());
+    }
+
+    #[test]
+    fn a_set_says_whether_it_holds_a_socket() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (inside, outside) = (opened(&host, teb, 2, 1), opened(&host, teb, 2, 1));
+        let at = 0x7000usize;
+        put_fd_set(&host, at, &[inside]);
+
+        let mut held = call("__WSAFDIsSet", [inside, at, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut held, &host);
+        assert_eq!(held.result, Some(1));
+        let mut absent = call("__WSAFDIsSet", [outside, at, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut absent, &host);
+        assert_eq!(absent.result, Some(0));
+    }
+
+    #[test]
+    fn the_machine_name_is_reported_and_its_length_asked_for_first() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (buffer, size_at) = (0x7000usize, 0x7100usize);
+
+        // A buffer too small says how much is needed, as the second call
+        // a caller makes depends on.
+        put_bytes(&host, size_at, &1u32.to_le_bytes());
+        let mut short = call("GetComputerNameExW", [0, buffer, size_at, 0, 0, 0], teb);
+        win32::dispatch(&mut short, &host);
+        assert_eq!(short.result, Some(0), "FALSE");
+        let needed = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[size_at..size_at + 4].try_into().unwrap())
+        };
+        assert!(needed > 1, "the room the name needs, with its terminator");
+
+        put_bytes(&host, size_at, &needed.to_le_bytes());
+        let mut named = call("GetComputerNameExW", [0, buffer, size_at, 0, 0, 0], teb);
+        win32::dispatch(&mut named, &host);
+        assert_eq!(named.result, Some(1), "TRUE");
+        let wrote = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[size_at..size_at + 4].try_into().unwrap())
+        };
+        assert_eq!(wrote, needed - 1, "and the count excludes the terminator");
+        assert_eq!(wide_at(&host, buffer), "starry-host");
+
+        // The same name comes back through the sockets spelling of it.
+        let (name_at, len_at) = (0x7200usize, 32usize);
+        let mut sockets_name = call("gethostname", [name_at, len_at, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut sockets_name, &host);
+        assert_eq!(sockets_name.result, Some(0));
+        let text = {
+            let mem = host.mem.borrow();
+            let end = mem[name_at..].iter().position(|b| *b == 0).unwrap();
+            String::from_utf8(mem[name_at..name_at + end].to_vec()).unwrap()
+        };
+        assert_eq!(text, "starry-host");
+    }
+
+    #[test]
+    fn select_refuses_a_handle_that_is_not_a_socket() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (read_at, timeout_at) = (0x7000usize, 0x7200usize);
+        put_fd_set(&host, read_at, &[0]);
+        put_bytes(&host, timeout_at, &[0u8; 8]);
+        let mut bad = call("select", [0, read_at, 0, 0, timeout_at, 0], teb);
+        win32::dispatch(&mut bad, &host);
+        assert_eq!(bad.result, Some(-1i32 as u32 as usize), "SOCKET_ERROR");
+    }
+
+    #[test]
+    fn an_address_goes_to_text_and_back() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (text_at, bytes_at, out_at) = (0x7000usize, 0x7100usize, 0x7200usize);
+        put_bytes(&host, text_at, b"192.0.2.10\0");
+
+        let mut to_bytes = call("inet_pton", [2, text_at, bytes_at, 0, 0, 0], teb);
+        win32::dispatch(&mut to_bytes, &host);
+        assert_eq!(to_bytes.result, Some(1), "a well-formed address parses");
+        assert_eq!(&host.mem.borrow()[bytes_at..bytes_at + 4], &[192, 0, 2, 10]);
+
+        let mut to_text = call("inet_ntop", [2, bytes_at, out_at, 64, 0, 0], teb);
+        win32::dispatch(&mut to_text, &host);
+        assert_eq!(to_text.result, Some(out_at));
+        let printed = {
+            let mem = host.mem.borrow();
+            let end = mem[out_at..].iter().position(|b| *b == 0).unwrap();
+            String::from_utf8(mem[out_at..out_at + end].to_vec()).unwrap()
+        };
+        assert_eq!(printed, "192.0.2.10");
+
+        // Text that is not an address of that family is answered with zero,
+        // which is the question answered rather than an error.
+        put_bytes(&host, text_at, b"not-an-address\0");
+        let mut refused = call("inet_pton", [2, text_at, bytes_at, 0, 0, 0], teb);
+        win32::dispatch(&mut refused, &host);
+        assert_eq!(refused.result, Some(0));
+
+        // The older pair answers the same way, with the address as a word and
+        // the text in a buffer of the calling thread's.
+        put_bytes(&host, text_at, b"192.0.2.10\0");
+        let mut packed = call("inet_addr", [text_at, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut packed, &host);
+        assert_eq!(
+            packed.result,
+            Some(u32::from_le_bytes([192, 0, 2, 10]) as usize)
+        );
+        let mut printed = call("inet_ntoa", [packed.result.unwrap(), 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut printed, &host);
+        let at = printed.result.unwrap();
+        assert_eq!(
+            at,
+            teb + crate::teb_peb::TEB_ADDRESS_TEXT,
+            "the thread's own"
+        );
+        let text = {
+            let mem = host.mem.borrow();
+            let end = mem[at..].iter().position(|b| *b == 0).unwrap();
+            String::from_utf8(mem[at..at + end].to_vec()).unwrap()
+        };
+        assert_eq!(text, "192.0.2.10");
+
+        put_bytes(&host, text_at, b"999.1.1.1\0");
+        let mut none = call("inet_addr", [text_at, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut none, &host);
+        assert_eq!(none.result, Some(0xFFFF_FFFF), "INADDR_NONE");
+    }
+
+    #[test]
+    fn a_numeric_lookup_answers_with_that_address() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (node, service, result) = (0x7000usize, 0x7040usize, 0x7080usize);
+        put_bytes(&host, node, b"127.0.0.1\0");
+        put_bytes(&host, service, b"80\0");
+
+        let mut looked = call("getaddrinfo", [node, service, 0, result, 0, 0], teb);
+        win32::dispatch(&mut looked, &host);
+        assert_eq!(looked.result, Some(0));
+        let entry = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[result..result + 8].try_into().unwrap()) as usize
+        };
+        assert_ne!(entry, 0);
+        let word = |at: usize| {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[at..at + 4].try_into().unwrap())
+        };
+        assert_eq!(word(entry + 4), 2, "AF_INET");
+        assert_eq!(word(entry + 8), 1, "SOCK_STREAM by default");
+        let address = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[entry + 32..entry + 40].try_into().unwrap()) as usize
+        };
+        let sockaddr = host.mem.borrow()[address..address + 8].to_vec();
+        assert_eq!(&sockaddr[0..2], &2u16.to_le_bytes(), "AF_INET");
+        assert_eq!(&sockaddr[2..4], &80u16.to_be_bytes(), "the port, as sent");
+        assert_eq!(&sockaddr[4..8], &[127, 0, 0, 1]);
+
+        // A name that would need a resolver is reported as not found rather
+        // than answered with a guess.
+        put_bytes(&host, node, b"example.invalid\0");
+        let mut absent = call("getaddrinfo", [node, service, 0, result, 0, 0], teb);
+        win32::dispatch(&mut absent, &host);
+        assert_eq!(absent.result, Some(11001), "WSAHOST_NOT_FOUND");
+    }
+
+    #[test]
+    fn a_well_known_service_has_its_assigned_port() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (name, proto) = (0x7000usize, 0x7040usize);
+        put_bytes(&host, name, b"http\0");
+        put_bytes(&host, proto, b"tcp\0");
+        let mut found = call("getservbyname", [name, proto, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut found, &host);
+        let entry = found.result.expect("an entry");
+        assert_ne!(entry, 0);
+        // The 64-bit servent puts the protocol before the port, which is a
+        // short in network order; reading them the other way round is the
+        // mistake this pins down.
+        let mem = host.mem.borrow();
+        let port = u16::from_be_bytes(mem[entry + 24..entry + 26].try_into().unwrap());
+        assert_eq!(port, 80);
+        let proto_at = u64::from_le_bytes(mem[entry + 16..entry + 24].try_into().unwrap()) as usize;
+        let end = mem[proto_at..].iter().position(|b| *b == 0).unwrap();
+        assert_eq!(&mem[proto_at..proto_at + end], b"tcp");
+        drop(mem);
+
+        put_bytes(&host, name, b"nosuchservice\0");
+        let mut missing = call("getservbyname", [name, proto, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut missing, &host);
+        assert_eq!(missing.result, Some(0));
+    }
+
+    #[test]
+    fn closing_a_synchronisation_handle_gives_its_block_back() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let event = created(&host, teb, "CreateEventW", [0, 1, 1, 0, 0, 0]);
+        let mut close = call("CloseHandle", [event, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut close, &host);
+        assert_eq!(close.result, Some(1));
+        // The block no longer names an object, so a stale handle cannot wait
+        // on memory that has been handed out again.
+        let magic = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[event..event + 8].try_into().unwrap())
+        };
+        assert_eq!(magic, 0);
     }
 
     #[test]

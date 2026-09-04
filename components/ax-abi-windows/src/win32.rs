@@ -62,6 +62,8 @@ const INVALID_HANDLE_VALUE: usize = usize::MAX;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+/// `ERROR_TIMEOUT`: the wait ended on its deadline, not on a wake.
+const ERROR_TIMEOUT: u32 = 1460;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
@@ -453,6 +455,14 @@ const KERNEL32: &[(&str, u16)] = &[
     ("VirtualLock", 0),
     ("WaitForMultipleObjectsEx", 0),
     ("WakeAllConditionVariable", 0),
+    ("CreateSemaphoreW", 0),
+    ("CreateMutexA", 0),
+    ("TryAcquireSRWLockShared", 0),
+    ("CreateWaitableTimerW", 0),
+    ("CreateWaitableTimerA", 0),
+    ("SetWaitableTimer", 0),
+    ("CancelWaitableTimer", 0),
+    ("GetComputerNameW", 0),
     // The child of a spawn starts in this entry's stub; nothing imports it.
     ("_StarrySpawnExec", 0),
 ];
@@ -921,23 +931,16 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             }
             c.finish(0)
         }
-        // Console control handlers and event objects: nothing is delivered
-        // and nothing waits, so registering and signalling both succeed.
-        "SetConsoleCtrlHandler" | "SetEvent" | "ResetEvent" => c.finish(TRUE),
-        // Semaphores and mutexes: with one thread nothing ever waits on them,
-        // so each is a sentinel handle that every release accepts.
-        "CreateSemaphoreA" | "CreateSemaphoreW" | "CreateMutexA" | "CreateMutexW" => {
-            c.set_last_error(0);
-            c.finish(0x1000_0008)
-        }
-        "ReleaseSemaphore" => {
-            let previous = c.arg(2);
-            if previous != 0 {
-                c.write_u32(previous, 0);
-            }
-            c.finish(TRUE)
-        }
-        "ReleaseMutex" | "VirtualLock" | "VirtualUnlock" => c.finish(TRUE),
+        // Nothing is delivered to a console control handler here, so
+        // registering one succeeds and never fires.
+        "SetConsoleCtrlHandler" => c.finish(TRUE),
+        "SetEvent" => sync::set_event(&mut c),
+        "ResetEvent" => sync::reset_event(&mut c),
+        "CreateSemaphoreA" | "CreateSemaphoreW" => sync::create_semaphore(&mut c),
+        "CreateMutexA" | "CreateMutexW" => sync::create_mutex(&mut c),
+        "ReleaseSemaphore" => sync::release_semaphore(&mut c),
+        "ReleaseMutex" => sync::release_mutex(&mut c),
+        "VirtualLock" | "VirtualUnlock" => c.finish(TRUE),
         // SystemTimeToFileTime(lpSystemTime, lpFileTime): the inverse of the
         // SYSTEMTIME the clock is written as.
         "SystemTimeToFileTime" => {
@@ -966,6 +969,9 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             c.finish(TRUE)
         }
         "CreatePipe" => file::create_pipe(&mut c),
+        "CreateThread" => thread::create_thread(&mut c),
+        "ExitThread" => thread::exit_thread(&mut c),
+        "FreeLibraryAndExitThread" => thread::free_library_and_exit_thread(&mut c),
         "CreateProcessW" => process::create_process(&mut c),
         "_StarrySpawnExec" => process::spawn_exec(&mut c),
         "GetExitCodeProcess" => process::get_exit_code_process(&mut c),
@@ -1140,9 +1146,9 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             let at = c.arg(0);
             // Back to the initialized-and-free state, with no debug info.
             c.write_u64(at, 0);
-            c.write_u32(at + 8, -1i32 as u32);
-            c.write_u32(at + 12, 0);
-            c.write_u64(at + 16, 0);
+            c.write_u32(at + CS_LOCK, 0);
+            c.write_u32(at + CS_DEPTH, 0);
+            c.write_u64(at + CS_OWNER, 0);
             c.write_u64(at + 24, 0);
             c.finish(0)
         }
@@ -1214,14 +1220,8 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "LCMapStringW" => locale::lc_map_string(&mut c),
         "CompareStringW" => locale::compare_string(&mut c),
         "CompareStringOrdinal" => locale::compare_string_ordinal(&mut c),
-        "CreateEventA" | "CreateEventW" => {
-            // Minimal event: CPython's SIGINT event only needs a valid,
-            // non-NULL handle at startup (it is set/waited only on Ctrl+C,
-            // which never happens in a batch run). Hand back a reserved
-            // sentinel handle rather than a real waitable object.
-            c.set_last_error(0);
-            c.finish(0x1000_0004)
-        }
+        "CreateEventA" | "CreateEventW" => sync::create_event(&mut c),
+        "GetComputerNameExW" | "GetComputerNameW" => runtime::get_computer_name(&mut c),
         "GetUserDefaultLCID" => c.finish(locale::USER_LCID as usize),
         "IsValidLocale" => locale::is_valid_locale(&mut c),
         "CreateDirectoryW" => file::create_directory(&mut c),
@@ -1249,19 +1249,29 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "VerSetConditionMask" => runtime::ver_set_condition_mask(&mut c),
         "VerifyVersionInfoW" => runtime::verify_version_info(&mut c),
         "LoadLibraryExW" => runtime::load_library_ex(&mut c),
-        "InitializeSRWLock" | "InitializeConditionVariable" => runtime::init_sync_word(&mut c),
-        "AcquireSRWLockExclusive" => runtime::acquire_srw_lock_exclusive(&mut c),
-        "ReleaseSRWLockExclusive" => runtime::release_srw_lock_exclusive(&mut c),
-        "TryAcquireSRWLockExclusive" => runtime::try_acquire_srw_lock_exclusive(&mut c),
-        "AcquireSRWLockShared" => runtime::acquire_srw_lock_shared(&mut c),
-        "ReleaseSRWLockShared" => runtime::release_srw_lock_shared(&mut c),
-        "WakeConditionVariable" | "WakeAllConditionVariable" => {
-            runtime::wake_condition_variable(&mut c)
+        "InitializeSRWLock" | "InitializeConditionVariable" => sync::init(&mut c),
+        "AcquireSRWLockExclusive" => sync::acquire_exclusive(&mut c),
+        "ReleaseSRWLockExclusive" => sync::release_exclusive(&mut c),
+        "TryAcquireSRWLockExclusive" => sync::try_acquire_exclusive(&mut c),
+        "AcquireSRWLockShared" => sync::acquire_shared(&mut c),
+        "ReleaseSRWLockShared" => sync::release_shared(&mut c),
+        "TryAcquireSRWLockShared" => sync::try_acquire_shared(&mut c),
+        "WakeConditionVariable" => sync::wake_condition(&mut c, false),
+        "WakeAllConditionVariable" => sync::wake_condition(&mut c, true),
+        // SleepConditionVariableSRW(cond, lock, ms, flags): a shared lock is
+        // taken exclusively here, so both flag values release the same word.
+        "SleepConditionVariableSRW" => {
+            let (lock, timeout) = (c.arg(1), c.arg(2) as u32);
+            let woken = sync::sleep_condition(&mut c, lock, timeout);
+            timed_out(&mut c, woken)
         }
-        "SleepConditionVariableSRW" => runtime::sleep_condition_variable_srw(&mut c),
-        // A spurious wake with the critical section still held, which the
-        // caller handles by rechecking its predicate.
-        "SleepConditionVariableCS" => c.finish(TRUE),
+        // The critical section's lock word sits at the same offset the
+        // enter/leave pair uses.
+        "SleepConditionVariableCS" => {
+            let (lock, timeout) = (c.arg(1) + CS_LOCK, c.arg(2) as u32);
+            let woken = sync::sleep_condition(&mut c, lock, timeout);
+            timed_out(&mut c, woken)
+        }
         "OutputDebugStringW" | "OutputDebugStringA" => runtime::output_debug_string(&mut c),
         "GetEnvironmentVariableA" => runtime::get_environment_variable_a(&mut c),
         "GetEnvironmentVariableW" => runtime::get_environment_variable_w(&mut c),
@@ -1276,26 +1286,58 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "GetFinalPathNameByHandleW" => file::get_final_path_name_by_handle(&mut c),
         "SetHandleInformation" => file::set_handle_information(&mut c),
         "GetTimeZoneInformation" => runtime::get_time_zone_information(&mut c),
-        "CreateWaitableTimerExW" => runtime::create_waitable_timer(&mut c),
-        // The only timer here is the one a sleep sets, so the wait is done
-        // now: a relative due time (negative, in hundred-nanosecond ticks)
-        // is slept out, and the wait that follows finds it signalled.
-        "SetWaitableTimerEx" => {
-            let due = c.read_u64(c.arg(1)).unwrap_or(0) as i64;
-            if due < 0 {
-                if let Some(clock) = host.clock() {
-                    let _ = clock.sleep_ns(due.unsigned_abs() * 100);
-                }
-            }
-            c.finish(TRUE)
+        "CreateWaitableTimerExW" | "CreateWaitableTimerW" | "CreateWaitableTimerA" => {
+            sync::create_timer(&mut c)
         }
-        // Nothing here blocks another thread yet, so every object is taken
-        // as signalled: WAIT_OBJECT_0.
-        "WaitForSingleObject" | "WaitForSingleObjectEx" => match process::pid_of(c.arg(0)) {
-            Some(pid) => process::wait_process(&mut c, pid),
-            None => c.finish(0),
-        },
-        "WaitForMultipleObjects" => c.finish(0),
+        "SetWaitableTimerEx" | "SetWaitableTimer" => sync::set_timer(&mut c),
+        "CancelWaitableTimer" => sync::cancel_timer(&mut c),
+        "WaitForSingleObject" | "WaitForSingleObjectEx" => {
+            let (handle, timeout) = (c.arg(0), c.arg(1) as u32);
+            match process::pid_of(handle) {
+                Some(pid) => process::wait_process(&mut c, pid),
+                None => match sync::wait_object(&mut c, handle, timeout) {
+                    Some(result) => c.finish(result),
+                    // A handle that names no object of ours is taken as
+                    // already signalled, which is what it was before any
+                    // object existed.
+                    None => c.finish(sync::WAIT_OBJECT_0),
+                },
+            }
+        }
+        "WaitForMultipleObjects" => wait_for_multiple_objects(&mut c),
+        // Winsock.
+        "socket" | "WSASocketA" | "WSASocketW" => sock::socket(&mut c),
+        "closesocket" => sock::close(&mut c),
+        "bind" => sock::bind(&mut c, false),
+        "connect" | "WSAConnect" => sock::bind(&mut c, true),
+        "listen" => sock::listen(&mut c),
+        "accept" => sock::accept(&mut c),
+        "send" => sock::send(&mut c, false),
+        "sendto" => sock::send(&mut c, true),
+        "recv" => sock::recv(&mut c, false),
+        "recvfrom" => sock::recv(&mut c, true),
+        "shutdown" => sock::shutdown(&mut c),
+        "getsockname" => sock::name_of(&mut c, false),
+        "getpeername" => sock::name_of(&mut c, true),
+        "ioctlsocket" => sock::ioctl(&mut c),
+        "setsockopt" => sock::option(&mut c, true),
+        "getsockopt" => sock::option(&mut c, false),
+        "select" => sock::select(&mut c),
+        "__WSAFDIsSet" => sock::fd_is_set(&mut c),
+        "WSAStartup" => sock::startup(&mut c),
+        "WSACleanup" => sock::cleanup(&mut c),
+        "WSAGetLastError" => sock::last_error(&mut c),
+        "WSASetLastError" => sock::set_last_error(&mut c),
+        "htons" | "ntohs" => sock::swap16(&mut c),
+        "inet_pton" => sock::inet_pton(&mut c),
+        "inet_addr" => sock::inet_addr(&mut c),
+        "inet_ntoa" => sock::inet_ntoa(&mut c),
+        "inet_ntop" => sock::inet_ntop(&mut c),
+        "getaddrinfo" => sock::getaddrinfo(&mut c),
+        "freeaddrinfo" => sock::freeaddrinfo(&mut c),
+        "getservbyname" => sock::getservbyname(&mut c),
+        "gethostname" => sock::gethostname(&mut c),
+        "htonl" | "ntohl" => sock::swap32(&mut c),
         "LoadLibraryW" => runtime::load_library_ex_w(&mut c),
         "LCMapStringEx" => locale::lc_map_string_ex(&mut c),
         "GetLocaleInfoW" => locale::get_locale_info_w(&mut c),
@@ -1318,6 +1360,12 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "CloseHandle" => {
             // A process or thread pseudo-handle holds nothing to close.
             if process::pid_of(c.arg(0)).is_some() {
+                return c.finish(TRUE);
+            }
+            // An event, semaphore or mutex is a block of the process heap,
+            // which goes back to it here.
+            let handle = c.arg(0);
+            if sync::close(&mut c, handle) {
                 return c.finish(TRUE);
             }
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
@@ -1383,6 +1431,9 @@ mod locale;
 mod process;
 mod pyd;
 mod runtime;
+mod sock;
+mod sync;
+mod thread;
 
 /// Where the top-level exception filter is kept: a word of the PEB's reserved
 /// area that nothing else here uses.
@@ -1482,6 +1533,13 @@ const PEB_COOKIE: usize = 0x3F0;
 /// address of a `(entry, base)` list ending in a zero pair, or zero.
 pub(crate) const PEB_PENDING_ATTACH: usize = 0x3E8;
 
+/// A word past the real PEB that counts every signal any waitable object in
+/// the process has received. A thread waiting on several objects at once
+/// cannot park on all their words, so it parks on this one instead: whatever
+/// is signalled bumps it and wakes everyone waiting that way, and each of them
+/// looks over its own objects again.
+pub(crate) const PEB_SIGNAL_SEQ: usize = 0x3F0;
+
 /// TlsAlloc: the first clear bit of the PEB's TLS bitmap, set, with the slot
 /// cleared in this thread's TEB.
 fn tls_alloc(c: &mut Call<'_>) -> Dispatch {
@@ -1539,6 +1597,11 @@ pub mod heap {
     /// The next arena of the heap, or 0 for the last. A heap grows by mapping
     /// another arena and chaining it here, the way Windows reserves more.
     pub const ARENA_NEXT: usize = 32;
+    /// The word that serialises the heap. Every thread of the process carves
+    /// from the same free list and the same frontier, so two of them at once
+    /// would interleave a read and a write and leave the list pointing at
+    /// itself - which is a walk that never ends, not a wrong answer.
+    const LOCK: usize = 40;
     pub const HEADER: usize = 48;
 
     /// How much each further arena maps; the memory port pages it in as it is
@@ -1567,6 +1630,14 @@ pub mod heap {
         if c.read_u64(heap)? != MAGIC {
             return None;
         }
+        super::sync::lock(c, heap + LOCK);
+        let block = carve(c, heap, size);
+        super::sync::unlock(c, heap + LOCK);
+        block
+    }
+
+    /// Carve a block with the heap already held.
+    fn carve(c: &Call<'_>, heap: usize, size: usize) -> Option<usize> {
         let want = size.max(1);
         let mut prev = 0usize;
         let mut cur = c.read_u64(heap + FREE_HEAD)? as usize;
@@ -1644,11 +1715,13 @@ pub mod heap {
     /// Return a block to the free list so a later `alloc` can reuse it. The
     /// next-free link is stored in the block's own (now unused) data.
     pub(super) fn mark_free(c: &Call<'_>, heap: usize, block: usize) {
+        super::sync::lock(c, heap + LOCK);
         let header = block - BLOCK_HEADER;
         let old = c.read_u64(heap + FREE_HEAD).unwrap_or(0);
         c.write_u64(block - 8, FREE);
         c.write_u64(block, old);
         c.write_u64(heap + FREE_HEAD, header as u64);
+        super::sync::unlock(c, heap + LOCK);
     }
 }
 
@@ -1715,34 +1788,16 @@ fn init_critical_section(c: &mut Call<'_>) -> Dispatch {
     let at = c.arg(0);
     // DebugInfo is the no-debug-info marker, (PVOID)-1.
     c.write_u64(at, u64::MAX);
-    c.write_u32(at + 8, -1i32 as u32); // LockCount
-    c.write_u32(at + 12, 0); // RecursionCount
-    c.write_u64(at + 16, 0); // OwningThread
+    // Windows packs a state and a waiter count into LockCount and starts it
+    // at -1; here the field is the lock word threads contend on, and a free
+    // lock is zero. Nothing outside this personality reads it.
+    c.write_u32(at + CS_LOCK, 0);
+    c.write_u32(at + CS_DEPTH, 0);
+    c.write_u64(at + CS_OWNER, 0);
     c.write_u64(at + 24, 0); // LockSemaphore
     c.write_u64(at + 32, 0); // SpinCount: one processor, no spinning
     // The AndSpinCount form returns a BOOL, the Ex form an NTSTATUS-shaped
     // BOOL as well; both say success the same way.
-    c.finish(TRUE)
-}
-
-/// RtlEnterCriticalSection on a process with one thread: take it, or recurse
-/// if this thread already owns it. Contention cannot arise until a second
-/// thread exists, and then a wait will be needed here.
-/// TryEnterCriticalSection: as EnterCriticalSection, which never waits here,
-/// reporting the section taken.
-fn try_enter_critical_section(c: &mut Call<'_>) -> Dispatch {
-    let at = c.arg(0);
-    let tid = c.host.tasks().map_or(1, |t| u64::from(t.gettid()));
-    let lock = c.read_u32(at + 8).unwrap_or(-1i32 as u32) as i32;
-    let owner = c.read_u64(at + 16).unwrap_or(0);
-    let depth = if lock >= 0 && owner == tid {
-        c.read_u32(at + 12).unwrap_or(0) + 1
-    } else {
-        c.write_u64(at + 16, tid);
-        1
-    };
-    c.write_u32(at + 12, depth);
-    c.write_u32(at + 8, (lock + 1) as u32);
     c.finish(TRUE)
 }
 
@@ -1780,35 +1835,142 @@ fn write_system_time(c: &Call<'_>, at: usize, ns: u64) -> bool {
     c.write(at, &bytes)
 }
 
+/// A wait that reports whether it was woken or timed out, the way the
+/// condition-variable calls report it.
+fn timed_out(c: &mut Call<'_>, woken: bool) -> Dispatch {
+    if woken {
+        c.finish(TRUE)
+    } else {
+        c.fail(ERROR_TIMEOUT, FALSE)
+    }
+}
+
+/// WaitForMultipleObjects(count, handles, wait all, ms).
+///
+/// The host can park a thread on one word, not several, so the wait is on the
+/// process's signal counter: every object that becomes signalled bumps it and
+/// wakes whoever is parked there, and each of them looks over its own handles
+/// again. The counter is read before the handles are looked at, so a signal
+/// that lands during the sweep leaves the park with a value that no longer
+/// matches and it returns at once rather than missing the wake.
+fn wait_for_multiple_objects(c: &mut Call<'_>) -> Dispatch {
+    let (count, handles, all, timeout) = (c.arg(0), c.arg(1), c.arg(2) != 0, c.arg(3) as u32);
+    if count == 0 || count > 64 {
+        return c.fail(ERROR_INVALID_PARAMETER, sync::WAIT_FAILED);
+    }
+    let deadline = (timeout != sync::INFINITE)
+        .then(|| {
+            c.host
+                .clock()
+                .map(|clock| clock.monotonic_ns() + timeout as u64 * 1_000_000)
+        })
+        .flatten();
+    loop {
+        let Some(seq) = sync::signal_count(c) else {
+            return c.fail(ERROR_INVALID_PARAMETER, sync::WAIT_FAILED);
+        };
+        let mut ready = 0;
+        for i in 0..count {
+            let Some(handle) = c.read_u64(handles + i * 8).map(|h| h as usize) else {
+                return c.fail(ERROR_INVALID_PARAMETER, sync::WAIT_FAILED);
+            };
+            match sync::wait_object(c, handle, 0) {
+                // Not one of ours to wait on, which a single wait answers as
+                // signalled; answering differently here would hang a caller
+                // on a handle this layer simply does not model.
+                None if !all => return c.finish(sync::WAIT_OBJECT_0 + i),
+                None => ready += 1,
+                Some(sync::WAIT_OBJECT_0) if !all => return c.finish(sync::WAIT_OBJECT_0 + i),
+                Some(sync::WAIT_OBJECT_0) => ready += 1,
+                Some(_) => {}
+            }
+        }
+        if all && ready == count {
+            return c.finish(sync::WAIT_OBJECT_0);
+        }
+        let mut left = match deadline {
+            // A host with no clock cannot hold a deadline, so a wait that has
+            // one is answered by the sweep that just ran.
+            None if timeout != sync::INFINITE => return c.finish(sync::WAIT_TIMEOUT),
+            None => sync::INFINITE,
+            Some(deadline) => {
+                let now = c
+                    .host
+                    .clock()
+                    .map_or(deadline, |clock| clock.monotonic_ns());
+                if now >= deadline {
+                    return c.finish(sync::WAIT_TIMEOUT);
+                }
+                ((deadline - now) / 1_000_000) as u32
+            }
+        };
+        // Nothing signals a timer, so the wait ends when the nearest one is
+        // due even if no object is touched in the meantime.
+        for i in 0..count {
+            if let Some(handle) = c.read_u64(handles + i * 8).map(|h| h as usize)
+                && let Some(due) = sync::due_in_ms(c, handle)
+            {
+                left = left.min(due);
+            }
+        }
+        if !sync::wait_for_signal(c, seq, left) && deadline.is_some() {
+            return c.finish(sync::WAIT_TIMEOUT);
+        }
+    }
+}
+
+/// A critical section's fields, from the start of the structure: the word
+/// threads contend on, how deep its owner has taken it, and who that is. The
+/// layout is Windows's own, minus the debug info a debugger would read.
+pub(super) const CS_LOCK: usize = 8;
+const CS_DEPTH: usize = 12;
+const CS_OWNER: usize = 16;
+
+/// RtlEnterCriticalSection: take it, or take it one level deeper if this
+/// thread already holds it. A critical section is recursive, which is the one
+/// way it differs from the SRW lock underneath.
 fn enter_critical_section(c: &mut Call<'_>) -> Dispatch {
     let at = c.arg(0);
     let tid = c.host.tasks().map_or(1, |t| u64::from(t.gettid()));
-    let lock = c.read_u32(at + 8).unwrap_or(-1i32 as u32) as i32;
-    let owner = c.read_u64(at + 16).unwrap_or(0);
-    if lock >= 0 && owner == tid {
-        let depth = c.read_u32(at + 12).unwrap_or(0);
-        c.write_u32(at + 12, depth + 1);
-        c.write_u32(at + 8, (lock + 1) as u32);
+    let depth = c.read_u32(at + CS_DEPTH).unwrap_or(0);
+    if depth > 0 && c.read_u64(at + CS_OWNER) == Some(tid) {
+        c.write_u32(at + CS_DEPTH, depth + 1);
         return c.finish(0);
     }
-    c.write_u32(at + 8, (lock + 1) as u32);
-    c.write_u64(at + 16, tid);
-    c.write_u32(at + 12, 1);
+    sync::lock(c, at + CS_LOCK);
+    c.write_u64(at + CS_OWNER, tid);
+    c.write_u32(at + CS_DEPTH, 1);
     c.finish(0)
+}
+
+/// RtlTryEnterCriticalSection: the same, without waiting.
+fn try_enter_critical_section(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    let tid = c.host.tasks().map_or(1, |t| u64::from(t.gettid()));
+    let depth = c.read_u32(at + CS_DEPTH).unwrap_or(0);
+    if depth > 0 && c.read_u64(at + CS_OWNER) == Some(tid) {
+        c.write_u32(at + CS_DEPTH, depth + 1);
+        return c.finish(TRUE);
+    }
+    if !sync::try_lock_word(c, at + CS_LOCK) {
+        return c.finish(FALSE);
+    }
+    c.write_u64(at + CS_OWNER, tid);
+    c.write_u32(at + CS_DEPTH, 1);
+    c.finish(TRUE)
 }
 
 /// RtlLeaveCriticalSection: unwind one level; the last one releases it.
 fn leave_critical_section(c: &mut Call<'_>) -> Dispatch {
     let at = c.arg(0);
-    let depth = c.read_u32(at + 12).unwrap_or(0);
-    let lock = c.read_u32(at + 8).unwrap_or(0) as i32;
+    let depth = c.read_u32(at + CS_DEPTH).unwrap_or(0);
     if depth > 1 {
-        c.write_u32(at + 12, depth - 1);
-    } else {
-        c.write_u32(at + 12, 0);
-        c.write_u64(at + 16, 0);
+        c.write_u32(at + CS_DEPTH, depth - 1);
+        return c.finish(0);
     }
-    c.write_u32(at + 8, (lock - 1) as u32);
+    c.write_u32(at + CS_DEPTH, 0);
+    c.write_u64(at + CS_OWNER, 0);
+    sync::unlock(c, at + CS_LOCK);
     c.finish(0)
 }
 
@@ -2046,6 +2208,30 @@ fn read_wide(c: &Call<'_>, at: usize, max: usize) -> Option<alloc::vec::Vec<u8>>
 
 /// Find a module by name in the PEB's load-order list: the base name matches
 /// case-insensitively, with or without a `.dll` extension.
+/// Every module in the process, in the order the loader brought them in.
+///
+/// The thread-local slot a module was given is its position among the modules
+/// that have thread locals, so the order this returns is what a new thread's
+/// block array has to follow.
+fn modules(c: &Call<'_>) -> alloc::vec::Vec<usize> {
+    use crate::teb_peb::{LDR_DLL_BASE, LDR_IN_LOAD_ORDER};
+    let mut out = alloc::vec::Vec::new();
+    let Some(peb) = c.peb() else { return out };
+    let Some(ldr) = c.read_u64(peb + PEB_LDR).map(|v| v as usize) else {
+        return out;
+    };
+    let head = ldr + LDR_IN_LOAD_ORDER;
+    let mut link = c.read_u64(head).unwrap_or(0) as usize;
+    while link != head && link != 0 && out.len() < 1024 {
+        match c.read_u64(link + LDR_DLL_BASE) {
+            Some(base) if base != 0 => out.push(base as usize),
+            _ => return out,
+        }
+        link = c.read_u64(link).unwrap_or(0) as usize;
+    }
+    out
+}
+
 fn find_module(c: &Call<'_>, peb: usize, wanted: &[u8]) -> Option<usize> {
     use crate::teb_peb::{LDR_BASE_NAME, LDR_DLL_BASE, LDR_IN_LOAD_ORDER};
     let ldr = c.read_u64(peb + PEB_LDR)? as usize;
@@ -2092,6 +2278,41 @@ mod mapped {
         pub functions: (usize, u32),
         pub names: (usize, u32),
         pub ordinals: usize,
+    }
+
+    /// A module's thread-local storage directory: the template every thread
+    /// gets its own copy of, and the callbacks the loader runs on a thread.
+    pub struct Tls {
+        pub template: usize,
+        pub raw: usize,
+        pub len: usize,
+        pub callbacks: usize,
+    }
+
+    /// DataDirectory[9], the thread-local storage directory, if the module has
+    /// one. The addresses in it are virtual addresses the loader relocated,
+    /// not RVAs.
+    pub fn tls(c: &Call<'_>, base: usize) -> Option<Tls> {
+        let pe = c.read_u32(base + 0x3C)? as usize;
+        if &c.read::<4>(base + pe)? != b"PE\0\0" {
+            return None;
+        }
+        let dd = base + pe + 24 + 112 + 9 * 8;
+        let rva = c.read_u32(dd)? as usize;
+        if rva == 0 {
+            return None;
+        }
+        let dir = base + rva;
+        let start = c.read_u64(dir)? as usize;
+        let end = c.read_u64(dir + 8)? as usize;
+        let zero_fill = c.read_u32(dir + 32)? as usize;
+        let raw = end.checked_sub(start)?;
+        Some(Tls {
+            template: start,
+            raw,
+            len: raw + zero_fill,
+            callbacks: c.read_u64(dir + 24)? as usize,
+        })
     }
 
     pub fn exports(c: &Call<'_>, base: usize) -> Option<Exports> {

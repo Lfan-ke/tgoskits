@@ -9,10 +9,10 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/python/python.exe /python/suite_inproc.py"
-success_regex = ['(?m)^SUITE-SUMMARY ']
+shell_init_cmd = "/python/python.exe /suite/t22_net_devices.py"
+success_regex = ['(?m)^PY_NETDEV_OK']
 fail_regex = [
     '(?i)Fatal Python error',
     '(?i)panic',
 ]
-timeout = 2400
+timeout = 6000

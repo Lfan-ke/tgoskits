@@ -428,92 +428,34 @@ fn module_at(c: &Call<'_>, peb: usize, address: usize) -> Option<usize> {
     None
 }
 
-// --- Locks and condition variables ---------------------------------------
-//
-// The process has one thread, so a lock is never contended: acquiring one that
-// is free succeeds, and the only way to find one held is to have deadlocked,
-// which a single thread cannot recover from. An SRW lock is one pointer-sized
-// word (Wine's `RtlAcquireSRWLockExclusive`); zero is free, and the exclusive
-// bit marks it held. A condition variable is one word too; waking it touches
-// that word, and sleeping on it releases the lock and returns at once, because
-// nothing else exists to do the waking - a caller's `while (!ready) sleep`
-// loop is satisfied by the predicate it set before waiting, in this one thread.
-
-const SRW_HELD_EXCLUSIVE: u64 = 1;
-
-pub fn acquire_srw_lock_exclusive(c: &mut Call<'_>) -> Dispatch {
-    let at = c.arg(0);
-    // Held already, with only one thread, is a deadlock; say so in the log
-    // rather than spin, and take it anyway so the caller makes progress.
-    if c.read_u64(at) == Some(SRW_HELD_EXCLUSIVE) {
-        c.host
-            .platform()
-            .trace("AcquireSRWLockExclusive on a lock this thread already holds");
+/// GetComputerNameExW(format, buffer, size): the machine's name, which is the
+/// host's node name whichever form is asked for - there is no domain here to
+/// tell the forms apart.
+pub fn get_computer_name(c: &mut Call<'_>) -> Dispatch {
+    const ERROR_MORE_DATA: u32 = 234;
+    let (at, size_at) = (c.arg(1), c.arg(2));
+    let mut name = alloc::string::String::new();
+    if let Some(system) = c.host.system() {
+        system.uname(&mut |field, value| {
+            if field == ax_abi_port::UtsField::NodeName {
+                name = alloc::string::String::from(value);
+            }
+        });
     }
-    c.write_u64(at, SRW_HELD_EXCLUSIVE);
-    c.finish(0)
-}
-
-pub fn release_srw_lock_exclusive(c: &mut Call<'_>) -> Dispatch {
-    c.write_u64(c.arg(0), 0);
-    c.finish(0)
-}
-
-/// TryAcquireSRWLockExclusive: always free here, so always taken.
-pub fn try_acquire_srw_lock_exclusive(c: &mut Call<'_>) -> Dispatch {
-    let at = c.arg(0);
-    if c.read_u64(at) == Some(SRW_HELD_EXCLUSIVE) {
-        return c.finish(FALSE);
+    let units: alloc::vec::Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+    let room = c.read_u32(size_at).unwrap_or(0) as usize;
+    if at == 0 || room < units.len() {
+        // The size out parameter carries what is needed, as it does on the
+        // second call a caller makes after being told the first was short.
+        c.write_u32(size_at, units.len() as u32);
+        return c.fail(ERROR_MORE_DATA, FALSE);
     }
-    c.write_u64(at, SRW_HELD_EXCLUSIVE);
-    c.finish(TRUE)
-}
-
-/// A shared lock is counted in the word above the exclusive bit; with no
-/// contention the count is bookkeeping a reader can always join.
-pub fn acquire_srw_lock_shared(c: &mut Call<'_>) -> Dispatch {
-    let at = c.arg(0);
-    let readers = c.read_u64(at).unwrap_or(0) >> 1;
-    c.write_u64(at, (readers + 1) << 1);
-    c.finish(0)
-}
-
-pub fn release_srw_lock_shared(c: &mut Call<'_>) -> Dispatch {
-    let at = c.arg(0);
-    let readers = (c.read_u64(at).unwrap_or(0) >> 1).saturating_sub(1);
-    c.write_u64(at, readers << 1);
-    c.finish(0)
-}
-
-/// InitializeSRWLock / InitializeConditionVariable: a fresh one is a zero word.
-pub fn init_sync_word(c: &mut Call<'_>) -> Dispatch {
-    c.write_u64(c.arg(0), 0);
-    c.finish(0)
-}
-
-/// WakeConditionVariable / WakeAllConditionVariable: nothing waits, so this
-/// only records that a wake happened, as ntdll's counter does.
-pub fn wake_condition_variable(c: &mut Call<'_>) -> Dispatch {
-    let at = c.arg(0);
-    let count = c.read_u64(at).unwrap_or(0);
-    c.write_u64(at, count.wrapping_add(1));
-    c.finish(0)
-}
-
-/// SleepConditionVariableSRW(cond, lock, timeout, flags): release the lock and
-/// return as if woken. With one thread the predicate the caller rechecks is
-/// its own to have set; a wait that truly needed another thread would be a
-/// deadlock, which is out of a single thread's reach either way.
-pub fn sleep_condition_variable_srw(c: &mut Call<'_>) -> Dispatch {
-    const SHARED: usize = 0x1;
-    let (lock, flags) = (c.arg(1), c.arg(3) as u32);
-    if flags & SHARED as u32 != 0 {
-        let readers = (c.read_u64(lock).unwrap_or(0) >> 1).saturating_sub(1);
-        c.write_u64(lock, readers << 1);
-    } else {
-        c.write_u64(lock, 0);
+    let bytes: alloc::vec::Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    if !c.write(at, &bytes) {
+        return c.fail(super::ERROR_INVALID_PARAMETER, FALSE);
     }
-    // TRUE: woken, not timed out, so the caller rechecks its predicate.
+    // The count a caller reads back excludes the terminator.
+    c.write_u32(size_at, units.len() as u32 - 1);
     c.finish(TRUE)
 }
 
@@ -822,18 +764,6 @@ pub fn get_time_zone_information(c: &mut Call<'_>) -> Dispatch {
         c.write(c.arg(0), &zeroed);
     }
     c.finish(TIME_ZONE_ID_UNKNOWN)
-}
-
-/// CreateWaitableTimerExW(...): a handle a program can hold and later wait on.
-/// Nothing arms or fires it yet; it is a distinct object so the program's
-/// bookkeeping is consistent, and a wait on it is what would need a scheduler.
-pub fn create_waitable_timer(c: &mut Call<'_>) -> Dispatch {
-    // A pseudo-handle distinct from the standard ones and from NULL. Reusing
-    // the current-thread pseudo-handle space above what descriptors occupy
-    // keeps it clear of a real file handle.
-    const TIMER: usize = 0xF000_0000;
-    let _ = c;
-    c.finish(TIMER)
 }
 
 #[cfg(test)]

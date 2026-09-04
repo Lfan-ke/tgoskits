@@ -46,7 +46,8 @@ static EXITED: SpinLock<BTreeMap<u32, u32>> = SpinLock::new(BTreeMap::new());
 /// Whether `handle` is one of the pseudo-handles made here, and its pid.
 pub(super) fn pid_of(handle: usize) -> Option<u32> {
     let tag = handle & TAG_MASK;
-    (handle != 0 && (tag == PROCESS_TAG || tag == THREAD_TAG)).then(|| (handle & !TAG_MASK) as u32)
+    (handle != 0 && (tag == PROCESS_TAG || tag == THREAD_TAG))
+        .then_some((handle & !TAG_MASK) as u32)
 }
 
 /// Argument `n` of a call, counting from zero: the stub carries the first six
@@ -205,13 +206,13 @@ pub fn create_process(c: &mut Call<'_>) -> Dispatch {
         return c.fail(ERROR_INVALID_PARAMETER, FALSE);
     };
     let mut args = split_command_line(&text);
-    if app != 0 {
-        if let Some(name) = c.read_wstr(app).and_then(|u| String::from_utf16(&u).ok()) {
-            if args.is_empty() {
-                args.push(name.clone());
-            } else {
-                args[0] = name;
-            }
+    if app != 0
+        && let Some(name) = c.read_wstr(app).and_then(|u| String::from_utf16(&u).ok())
+    {
+        if args.is_empty() {
+            args.push(name.clone());
+        } else {
+            args[0] = name;
         }
     }
     let Some(exe) = args.first().cloned() else {

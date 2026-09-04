@@ -94,6 +94,11 @@ const PARAMS_NORMALIZED: u32 = 0x1;
 pub const TEB_TLS_SLOTS: usize = 0x1480;
 /// `TEB.TlsExpansionSlots` (`f94/1780`): the pointer to the next 1024 slots.
 pub const TEB_TLS_EXPANSION: usize = 0x1780;
+/// Room at the end of the TEB for the text `inet_ntoa` hands back. Windows
+/// answers that call from a buffer of the calling thread's, so two threads
+/// printing an address at once do not overwrite each other; this is that
+/// buffer.
+pub const TEB_ADDRESS_TEXT: usize = 0x17E0;
 /// `TEB.FlsSlots` (`fb4/17c8`): this thread's fiber-local values, allocated
 /// the first time the thread touches one.
 pub const TEB_FLS_SLOTS: usize = 0x17C8;

@@ -29,13 +29,64 @@ pub const MODULE_HEADER: usize = 0x4000;
 /// How much address space library `lib` takes: its header, then a stub per
 /// entry, rounded to a page so the next library starts on one.
 pub fn system_size(lib: usize) -> usize {
-    let trampoline = if lib == 0 { ATTACH_LEN } else { 0 };
+    let trampoline = if lib == 0 { ATTACH_LEN + THREAD_LEN } else { 0 };
     (MODULE_HEADER + win32::LIBRARIES[lib].exports.len() * STUB_LEN + trampoline)
         .next_multiple_of(0x1000)
 }
 
 /// The room the attach trampoline takes past kernel32's last stub.
 pub const ATTACH_LEN: usize = 0x80;
+/// The room the thread trampoline takes past the attach trampoline.
+pub const THREAD_LEN: usize = 0x60;
+
+/// Where the thread trampoline sits: past kernel32's stubs and the attach
+/// trampoline. A thread starts here with its block in the first argument.
+pub const fn thread_trampoline_offset() -> usize {
+    MODULE_HEADER + win32::LIBRARIES[0].exports.len() * STUB_LEN + ATTACH_LEN
+}
+
+/// The code a thread starts in: with its block `{proc, param, callbacks}` in
+/// `rdi`, it runs each thread-attach callback the loader left for it, calls
+/// `proc(param)` on its own stack, then exits the thread with what the
+/// procedure returned. The stack is topped sixteen-byte aligned, so the shadow
+/// space each call reserves keeps it aligned at the call itself.
+pub fn thread_trampoline() -> [u8; THREAD_LEN] {
+    let mut out = [0xCC_u8; THREAD_LEN];
+    let nr = win32::Win32Call::named("ExitThread")
+        .expect("ExitThread is in the table")
+        .nr()
+        .to_le_bytes();
+    let code: &[&[u8]] = &[
+        &[0x48, 0x89, 0xFB],                 // mov rbx, rdi        ; the block
+        &[0x4C, 0x8B, 0x67, 0x10],           // mov r12, [rdi+16]   ; callbacks
+        &[0x48, 0x83, 0xEC, 0x20],           // sub rsp, 0x20       ; shadow space
+        &[0x4D, 0x85, 0xE4],                 // test r12, r12
+        &[0x74, 0x1E],                       // jz proc
+        &[0x49, 0x8B, 0x04, 0x24],           // next: mov rax, [r12]
+        &[0x48, 0x85, 0xC0],                 // test rax, rax
+        &[0x74, 0x15],                       // jz proc
+        &[0x49, 0x8B, 0x4C, 0x24, 0x08],     // mov rcx, [r12+8]    ; the module
+        &[0xBA, 0x02, 0x00, 0x00, 0x00],     // mov edx, 2          ; thread attach
+        &[0x45, 0x31, 0xC0],                 // xor r8d, r8d
+        &[0xFF, 0xD0],                       // call rax
+        &[0x49, 0x83, 0xC4, 0x10],           // add r12, 16
+        &[0xEB, 0xE2],                       // jmp next
+        &[0x48, 0x8B, 0x03],                 // proc: mov rax, [rbx]
+        &[0x48, 0x8B, 0x4B, 0x08],           // mov rcx, [rbx+8]    ; param -> arg0
+        &[0xFF, 0xD0],                       // call rax
+        &[0x48, 0x83, 0xC4, 0x20],           // add rsp, 0x20
+        &[0x89, 0xC7],                       // mov edi, eax        ; exit code -> arg0
+        &[0xB8, nr[0], nr[1], nr[2], nr[3]], // mov eax, <ExitThread nr>
+        &[0x0F, 0x05],                       // syscall
+        &[0x0F, 0x0B],                       // ud2
+    ];
+    let mut at = 0;
+    for part in code {
+        out[at..at + part.len()].copy_from_slice(part);
+        at += part.len();
+    }
+    out
+}
 
 /// The code a `LoadLibrary` stub jumps to instead of returning: with the
 /// result in `rax` and the caller's `rsi`/`rdi` still pushed, it takes the
@@ -348,5 +399,75 @@ mod tests {
     #[test]
     fn two_calls_get_different_numbers_and_so_different_stubs() {
         assert_ne!(stub(Win32Call::WRITE_FILE), stub(Win32Call::EXIT_PROCESS));
+    }
+
+    #[test]
+    fn a_thread_calls_its_procedure_and_exits_with_what_it_returned() {
+        let code = thread_trampoline();
+        // The block is in rdi: the procedure, its parameter, and the callbacks.
+        assert_eq!(&code[..3], &[0x48, 0x89, 0xFB], "mov rbx, rdi");
+        assert_eq!(&code[3..7], &[0x4C, 0x8B, 0x67, 0x10], "mov r12, [rdi+16]");
+        // Shadow space, and with it the sixteen-byte alignment every call needs.
+        assert_eq!(&code[7..11], &[0x48, 0x83, 0xEC, 0x20], "sub rsp, 0x20");
+        // Both the empty-list test and the end of the walk jump to the same
+        // place: the instruction that loads the procedure.
+        let proc_at = code
+            .windows(3)
+            .position(|w| w == [0x48, 0x8B, 0x03])
+            .expect("mov rax, [rbx]");
+        assert_eq!(&code[11..14], &[0x4D, 0x85, 0xE4], "test r12, r12");
+        assert_eq!(code[14], 0x74, "jz");
+        assert_eq!(
+            16 + code[15] as usize,
+            proc_at,
+            "an empty list skips the walk"
+        );
+        // The walk reads a callback, stops at the null entry that ends the
+        // list, and calls what it read the way DllMain is called.
+        assert_eq!(&code[16..20], &[0x49, 0x8B, 0x04, 0x24], "mov rax, [r12]");
+        assert_eq!(&code[20..23], &[0x48, 0x85, 0xC0], "test rax, rax");
+        assert_eq!(code[23], 0x74, "jz");
+        assert_eq!(25 + code[24] as usize, proc_at, "the null entry ends it");
+        assert_eq!(
+            &code[25..30],
+            &[0x49, 0x8B, 0x4C, 0x24, 0x08],
+            "mov rcx, [r12+8]"
+        );
+        assert_eq!(
+            &code[30..35],
+            &[0xBA, 0x02, 0x00, 0x00, 0x00],
+            "DLL_THREAD_ATTACH"
+        );
+        assert_eq!(&code[38..40], &[0xFF, 0xD0], "call rax");
+        assert_eq!(&code[40..44], &[0x49, 0x83, 0xC4, 0x10], "add r12, 16");
+        assert_eq!(code[44], 0xEB, "jmp");
+        assert_eq!(46 + code[45] as i8 as isize, 16, "back to the next entry");
+        // The procedure's parameter goes to its first argument register, and
+        // its return value becomes the thread's exit code.
+        assert_eq!(&code[proc_at + 3..proc_at + 7], &[0x48, 0x8B, 0x4B, 0x08]);
+        assert_eq!(&code[proc_at + 7..proc_at + 9], &[0xFF, 0xD0], "call rax");
+        assert_eq!(&code[proc_at + 9..proc_at + 13], &[0x48, 0x83, 0xC4, 0x20]);
+        assert_eq!(
+            &code[proc_at + 13..proc_at + 15],
+            &[0x89, 0xC7],
+            "mov edi, eax"
+        );
+        let at = proc_at + 15;
+        assert_eq!(code[at], 0xB8, "mov eax, imm32");
+        let nr = u32::from_le_bytes(code[at + 1..at + 5].try_into().unwrap());
+        assert_eq!(nr, Win32Call::named("ExitThread").unwrap().nr());
+        assert_eq!(&code[at + 5..at + 7], &[0x0F, 0x05], "syscall");
+        // A thread that somehow returns from ExitThread must not run on.
+        assert_eq!(&code[at + 7..at + 9], &[0x0F, 0x0B], "ud2");
+        assert!(code[at + 9..].iter().all(|b| *b == 0xCC));
+    }
+
+    #[test]
+    fn the_thread_trampoline_sits_inside_what_kernel32_reserves() {
+        let end = thread_trampoline_offset() + THREAD_LEN;
+        assert!(end <= system_size(0), "kernel32 has room for it");
+        // It follows the attach trampoline rather than overlapping it.
+        let attach = MODULE_HEADER + win32::LIBRARIES[0].exports.len() * STUB_LEN;
+        assert_eq!(thread_trampoline_offset(), attach + ATTACH_LEN);
     }
 }

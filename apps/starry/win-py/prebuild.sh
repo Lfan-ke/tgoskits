@@ -72,3 +72,4 @@ done
 # a child interpreter per module, which needs CreateProcessW; this runs them
 # in one interpreter instead.
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/suite_inproc.py" "$overlay_dir/python/suite_inproc.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_thread.py" "$overlay_dir/python/probe_thread.py"
