@@ -313,6 +313,7 @@ macro_rules! call_dispatch {
             // ---- Implemented socket options ----
             (SOL_SOCKET, SO_REUSEADDR) => ReuseAddress as IntBool,
             (SOL_SOCKET, SO_REUSEPORT) => ReusePort as IntBool,
+            (SOL_SOCKET, SO_BROADCAST) => Broadcast as IntBool,
             (SOL_SOCKET, SO_ERROR) => Error,
             (SOL_SOCKET, SO_DONTROUTE) => DontRoute as IntBool,   // stored but routing logic ignores it
             (SOL_SOCKET, SO_SNDBUF) => SendBuffer as Int<usize>,  // TODO: set is no-op, smoltcp uses fixed buffer
@@ -597,12 +598,8 @@ pub fn sys_setsockopt(
     }
 
     {
-        use linux_raw_sys::net::{SO_BINDTODEVICE, SO_BROADCAST, SOL_SOCKET};
+        use linux_raw_sys::net::{SO_BINDTODEVICE, SOL_SOCKET};
 
-        if (level, optname) == (SOL_SOCKET, SO_BROADCAST) {
-            let _ = read_int_sockopt(optval, optlen)?;
-            return Ok(0);
-        }
         if (level, optname) == (SOL_SOCKET, SO_BINDTODEVICE) {
             let binding = read_bind_to_device(optval, optlen)?;
             Socket::from_fd(fd)?.set_option(SetSocketOption::BindToDevice(&binding))?;

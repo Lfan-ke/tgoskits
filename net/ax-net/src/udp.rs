@@ -135,6 +135,23 @@ impl UdpSocket {
             .source)
     }
 
+    /// Refuse a broadcast destination on a socket that never asked for one.
+    ///
+    /// Linux gates this on the route being marked `RTCF_BROADCAST` and reports
+    /// `EACCES` (`net/ipv4/udp.c` in `udp_sendmsg`, `net/ipv4/datagram.c` in
+    /// `ip4_datagram_connect`); the check is the route's, not the address's,
+    /// so a directed broadcast is caught as well as the limited one.
+    fn permit_broadcast(&self, remote: &IpAddress) -> NetResult {
+        if self.general.broadcast() {
+            return Ok(());
+        }
+        let route = get_control().select_route_with_binding(remote, self.general.device_binding());
+        match route {
+            Ok(route) if route.broadcast => Err(NetError::PermissionDenied),
+            _ => Ok(()),
+        }
+    }
+
     fn send_source_for_remote(&self, remote: &IpAddress) -> NetResult<IpAddress> {
         if let Some(local_ep) = *self.local_addr.lock()
             && !local_ep.addr.is_unspecified()
@@ -301,6 +318,7 @@ impl SocketOps for UdpSocket {
         }
 
         let remote_addr = IpEndpoint::from(remote_addr);
+        self.permit_broadcast(&remote_addr.addr)?;
         let local_port = self.local_addr.lock().map_or(0, |endpoint| endpoint.port);
         let (src, should_update_binding) =
             self.source_and_binding_update_for_remote(&remote_addr.addr)?;
@@ -342,6 +360,7 @@ impl SocketOps for UdpSocket {
             let (remote_addr, source_addr) = match options.to {
                 Some(addr) => {
                     let addr = IpEndpoint::from(addr.into_ip()?);
+                    self.permit_broadcast(&addr.addr)?;
                     let src = self.send_source_for_remote(&addr.addr)?;
                     (addr, src)
                 }
@@ -383,6 +402,7 @@ impl SocketOps for UdpSocket {
         let resolved = match options.to {
             Some(addr) => {
                 let addr = IpEndpoint::from(addr.into_ip()?);
+                self.permit_broadcast(&addr.addr)?;
                 let src = self.send_source_for_remote(&addr.addr)?;
                 Some((addr, src))
             }
@@ -672,6 +692,57 @@ mod tests {
     use crate::test_support::{
         LOCAL_ADDR, LOCAL_IF, PEER_ADDR, PEER_IF, init_split_route_network, network_test_guard,
     };
+
+    #[test]
+    fn a_directed_broadcast_is_refused_until_the_socket_asks_for_it() {
+        use crate::options::{Configurable, GetSocketOption, SetSocketOption};
+        let _guard = network_test_guard();
+        init_split_route_network();
+
+        // The broadcast address of the local /24, which is a route Linux
+        // marks RTCF_BROADCAST and refuses with EACCES unless SO_BROADCAST
+        // is set (net/ipv4/datagram.c, ip4_datagram_connect).
+        let broadcast = core::net::Ipv4Addr::new(192, 0, 2, 255);
+        let socket = UdpSocket::new();
+        socket
+            .bind(SocketAddrEx::Ip(SocketAddr::new(IpAddr::V4(LOCAL_ADDR), 0)))
+            .unwrap();
+        assert_eq!(
+            socket.connect(SocketAddrEx::Ip(SocketAddr::new(IpAddr::V4(broadcast), 53))),
+            Err(NetError::PermissionDenied)
+        );
+
+        let mut asked = true;
+        socket
+            .get_option(GetSocketOption::Broadcast(&mut asked))
+            .unwrap();
+        assert!(!asked, "a socket starts without it, as Linux does");
+
+        socket
+            .set_option(SetSocketOption::Broadcast(&true))
+            .unwrap();
+        socket
+            .get_option(GetSocketOption::Broadcast(&mut asked))
+            .unwrap();
+        assert!(asked, "and reads back what was set");
+        socket
+            .connect(SocketAddrEx::Ip(SocketAddr::new(IpAddr::V4(broadcast), 53)))
+            .expect("permitted once the socket asked");
+    }
+
+    #[test]
+    fn an_ordinary_destination_needs_no_permission() {
+        let _guard = network_test_guard();
+        init_split_route_network();
+
+        let socket = UdpSocket::new();
+        socket
+            .bind(SocketAddrEx::Ip(SocketAddr::new(IpAddr::V4(LOCAL_ADDR), 0)))
+            .unwrap();
+        socket
+            .connect(SocketAddrEx::Ip(SocketAddr::new(IpAddr::V4(PEER_ADDR), 53)))
+            .expect("a unicast address is not gated");
+    }
 
     #[test]
     fn connect_preserves_bound_interface() {

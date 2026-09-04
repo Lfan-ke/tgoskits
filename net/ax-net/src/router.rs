@@ -322,6 +322,28 @@ pub struct RouteDecision {
     pub next_hop: IpAddress,
     /// Metric of the selected route.
     pub metric: u32,
+    /// Whether the destination is a broadcast address on this route, which is
+    /// what Linux marks `RTCF_BROADCAST` and gates `SO_BROADCAST` on. Three
+    /// destinations carry it (`net/ipv4/fib_frontend.c`): the limited
+    /// broadcast, the zero network, and the directed broadcast of a prefix
+    /// the route reaches directly.
+    pub broadcast: bool,
+}
+
+/// Whether `dst` is a broadcast destination on a route matching `filter` that
+/// is reached without a gateway.
+fn is_broadcast_to(dst: &IpAddress, filter: &IpCidr, direct: bool) -> bool {
+    let IpAddress::Ipv4(dst) = dst else {
+        // IPv6 has no broadcast; it uses multicast instead.
+        return false;
+    };
+    if *dst == Ipv4Address::BROADCAST || dst.octets()[0] == 0 {
+        return true;
+    }
+    match filter {
+        IpCidr::Ipv4(prefix) if direct => prefix.broadcast() == Some(*dst),
+        _ => false,
+    }
 }
 
 /// Route table sorted by longest prefix, then metric, then insertion order.
@@ -371,6 +393,7 @@ impl RouteTable {
                 source: rule.src,
                 next_hop: rule.via.unwrap_or(*dst),
                 metric: rule.metric,
+                broadcast: is_broadcast_to(dst, &rule.filter, rule.via.is_none()),
             })
     }
 
@@ -389,6 +412,7 @@ impl RouteTable {
                 source: rule.src,
                 next_hop: rule.via.unwrap_or(*dst),
                 metric: rule.metric,
+                broadcast: is_broadcast_to(dst, &rule.filter, rule.via.is_none()),
             })
     }
 

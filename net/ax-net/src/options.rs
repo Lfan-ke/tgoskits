@@ -225,6 +225,7 @@ define_options! {
     // ---- Socket level options (SO_*) ----
     ReuseAddress(bool),
     ReusePort(bool),
+    Broadcast(bool),
     Error(i32),
     DontRoute(bool),
     SendBuffer(usize),

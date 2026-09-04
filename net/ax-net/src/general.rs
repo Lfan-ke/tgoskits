@@ -45,6 +45,8 @@ pub(crate) struct GeneralOptions {
     nonblock: AtomicBool,
     /// Whether the socket should reuse the address.
     reuse_address: AtomicBool,
+    /// `SO_BROADCAST`: whether this socket may send to a broadcast address.
+    broadcast: AtomicBool,
     /// Whether the socket should reuse the port (SO_REUSEPORT).
     reuse_port: AtomicBool,
 
@@ -85,6 +87,7 @@ impl GeneralOptions {
         Self {
             nonblock: AtomicBool::new(false),
             reuse_address: AtomicBool::new(false),
+            broadcast: AtomicBool::new(false),
             reuse_port: AtomicBool::new(false),
 
             send_timeout_nanos: AtomicU64::new(0),
@@ -110,6 +113,11 @@ impl GeneralOptions {
     }
 
     /// Returns whether SO_REUSEADDR-style bind reuse is enabled.
+    /// Whether the socket was allowed to send to a broadcast address.
+    pub fn broadcast(&self) -> bool {
+        self.broadcast.load(Ordering::Relaxed)
+    }
+
     pub fn reuse_address(&self) -> bool {
         self.reuse_address.load(Ordering::Relaxed)
     }
@@ -315,6 +323,9 @@ impl Configurable for GeneralOptions {
             O::Priority(priority) => {
                 **priority = self.priority();
             }
+            O::Broadcast(on) => {
+                **on = self.broadcast();
+            }
             O::SocketType(t) => {
                 **t = self.socket_type.load(Ordering::Relaxed);
             }
@@ -341,6 +352,9 @@ impl Configurable for GeneralOptions {
             }
             O::ReuseAddress(reuse) => {
                 self.reuse_address.store(*reuse, Ordering::Relaxed);
+            }
+            O::Broadcast(on) => {
+                self.broadcast.store(*on, Ordering::Relaxed);
             }
             O::ReusePort(reuse) => {
                 self.reuse_port.store(*reuse, Ordering::Relaxed);
