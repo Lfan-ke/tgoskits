@@ -146,6 +146,10 @@ pub const LIBRARIES: &[Library] = &[
         exports: OLE32,
     },
     Library {
+        name: "OLEAUT32.dll",
+        exports: OLEAUT32,
+    },
+    Library {
         name: "PROPSYS.dll",
         exports: PROPSYS,
     },
@@ -601,6 +605,16 @@ const RPCRT4: &[(&str, u16)] = &[
     ("UuidToStringW", 0),
 ];
 const OLE32: &[(&str, u16)] = &[("ProgIDFromCLSID", 0)];
+
+/// The BSTR helpers and the error-info call `_ctypes` imports. It imports
+/// them by ordinal, as the import library exports them, so each carries the
+/// number oleaut32 gives it.
+const OLEAUT32: &[(&str, u16)] = &[
+    ("SysAllocStringLen", 4),
+    ("SysFreeString", 6),
+    ("SysStringLen", 7),
+    ("SetErrorInfo", 200),
+];
 const PROPSYS: &[(&str, u16)] = &[("VariantToString", 0)];
 const WINMM: &[(&str, u16)] = &[("PlaySoundW", 0)];
 
@@ -1078,12 +1092,20 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             let cookie = process_cookie(&c);
             let rotate = cookie % 64;
             let value = (c.arg(0) as u64 ^ u64::from(cookie)).rotate_right(rotate);
+            c.host.platform().trace(&alloc::format!(
+                "EncodePointer {:#x} -> {value:#x} cookie {cookie:#x}",
+                c.arg(0)
+            ));
             c.finish(value as usize)
         }
         "DecodePointer" => {
             let cookie = process_cookie(&c);
             let rotate = cookie % 64;
             let value = (c.arg(0) as u64).rotate_left(rotate) ^ u64::from(cookie);
+            c.host.platform().trace(&alloc::format!(
+                "DecodePointer {:#x} -> {value:#x} cookie {cookie:#x}",
+                c.arg(0)
+            ));
             c.finish(value as usize)
         }
         // An SLIST_HEADER is sixteen zero bytes when empty.
@@ -1285,6 +1307,11 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "AcceptEx" => sock::accept_ex(&mut c),
         "DisconnectEx" => sock::disconnect_ex(&mut c),
         "SetFileTime" => file::set_file_time(&mut c),
+        "CopyFile2" => file::copy_file2(&mut c),
+        "SysAllocStringLen" => runtime::sys_alloc_string_len(&mut c),
+        "SysStringLen" => runtime::sys_string_len(&mut c),
+        "SysFreeString" => runtime::sys_free_string(&mut c),
+        "SetErrorInfo" => runtime::set_error_info(&mut c),
         "SetFileInformationByHandle" => file::set_file_information_by_handle(&mut c),
         "GetFileAttributesExW" => file::get_file_attributes_ex(&mut c),
         "SetFileAttributesW" => file::set_file_attributes(&mut c),

@@ -84,7 +84,7 @@ pub struct SystemModule {
 }
 
 /// The lowered name of synthesized library `lib`.
-pub(crate) const SYSTEM_NAMES: [&str; 13] = [
+pub(crate) const SYSTEM_NAMES: [&str; 14] = [
     "kernel32.dll",
     "advapi32.dll",
     "version.dll",
@@ -94,6 +94,7 @@ pub(crate) const SYSTEM_NAMES: [&str; 13] = [
     "iphlpapi.dll",
     "rpcrt4.dll",
     "ole32.dll",
+    "oleaut32.dll",
     "propsys.dll",
     "winmm.dll",
     "ws2_32.dll",

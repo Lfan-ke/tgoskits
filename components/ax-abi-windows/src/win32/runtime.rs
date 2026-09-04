@@ -838,3 +838,75 @@ mod tests {
         assert_eq!(update_condition(&mut last, VER_GREATER), VER_LESS);
     }
 }
+
+/// A `BSTR`: the string's byte length in the four bytes before it, then the
+/// characters and a terminator, which is what every reader of one expects.
+const BSTR_PREFIX: usize = 4;
+
+/// SysAllocStringLen(psz, len): a BSTR of `len` characters, copied from `psz`
+/// when it is given and left uninitialised - zeroed here - when it is not.
+pub fn sys_alloc_string_len(c: &mut Call<'_>) -> Dispatch {
+    let (from, len) = (c.arg(0), c.arg(1));
+    let Some(heap) = c
+        .peb()
+        .and_then(|peb| c.read_u64(peb + PEB_PROCESS_HEAP))
+        .map(|heap| heap as usize)
+    else {
+        return c.finish(0);
+    };
+    let bytes = len * 2;
+    let Some(block) = heap::alloc(c, heap, BSTR_PREFIX + bytes + 2) else {
+        return c.finish(0);
+    };
+    if !super::zero(c, block, BSTR_PREFIX + bytes + 2) {
+        return c.finish(0);
+    }
+    c.write_u32(block, bytes as u32);
+    let text = block + BSTR_PREFIX;
+    if from != 0 {
+        let mut unit = [0u8; 2];
+        for at in 0..len {
+            let Some(read) = c.read::<2>(from + at * 2) else {
+                return c.finish(0);
+            };
+            unit.copy_from_slice(&read);
+            if !c.write(text + at * 2, &unit) {
+                return c.finish(0);
+            }
+        }
+    }
+    c.finish(text)
+}
+
+/// SysStringLen(bstr): how many characters it holds, which is the byte length
+/// in front of it halved. A null string is empty.
+pub fn sys_string_len(c: &mut Call<'_>) -> Dispatch {
+    let bstr = c.arg(0);
+    if bstr < BSTR_PREFIX {
+        return c.finish(0);
+    }
+    let bytes = c.read_u32(bstr - BSTR_PREFIX).unwrap_or(0) as usize;
+    c.finish(bytes / 2)
+}
+
+/// SysFreeString(bstr): the block goes back to the heap it came from. A null
+/// string is nothing to free, which is not an error.
+pub fn sys_free_string(c: &mut Call<'_>) -> Dispatch {
+    let bstr = c.arg(0);
+    if bstr >= BSTR_PREFIX
+        && let Some(heap) = c
+            .peb()
+            .and_then(|peb| c.read_u64(peb + PEB_PROCESS_HEAP))
+            .map(|heap| heap as usize)
+    {
+        heap::mark_free(c, heap, bstr - BSTR_PREFIX);
+    }
+    c.finish(0)
+}
+
+/// SetErrorInfo(reserved, errorinfo): the error object a COM call would leave
+/// for its caller to pick up. Nothing here makes one, so there is nothing to
+/// keep; the call succeeds, which is what a caller checks.
+pub fn set_error_info(c: &mut Call<'_>) -> Dispatch {
+    c.finish(0)
+}

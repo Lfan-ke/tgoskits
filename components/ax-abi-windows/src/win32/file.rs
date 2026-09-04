@@ -10,7 +10,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use ax_abi_port::{At, NodeKind, SeekFrom};
+use ax_abi_port::{At, Create, NodeKind, OpenHow, SeekFrom};
 
 use super::{
     Call, Dispatch, ERROR_CALL_NOT_IMPLEMENTED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
@@ -1204,4 +1204,149 @@ pub fn get_final_path_name_by_handle(c: &mut Call<'_>) -> Dispatch {
     }
     c.set_last_error(0);
     c.finish(units.len())
+}
+
+/// CopyFile2(existing, new, extended parameters): a file, its permissions and
+/// its times, copied to a new name.
+///
+/// It answers with an `HRESULT` rather than a `BOOL`, so a failure is the
+/// Win32 error wrapped as one. `shutil.copy` reaches for this before anything
+/// else on Windows and only falls back for two particular errors, so a file
+/// this cannot copy is a copy that does not happen.
+pub fn copy_file2(c: &mut Call<'_>) -> Dispatch {
+    /// `COPY_FILE_FAIL_IF_EXISTS`.
+    const FAIL_IF_EXISTS: u32 = 0x1;
+    /// `S_OK`, and the way a Win32 error is written as an `HRESULT`.
+    const S_OK: usize = 0;
+    const FACILITY_WIN32: u32 = 0x8007_0000;
+    let (from, to, parameters) = (c.arg(0), c.arg(1), c.arg(2));
+    let hresult = |error: u32| (FACILITY_WIN32 | error) as usize;
+    // COPYFILE2_EXTENDED_PARAMETERS: size, then the copy flags.
+    let flags = if parameters == 0 {
+        0
+    } else {
+        c.read_u32(parameters + 4).unwrap_or(0)
+    };
+    let (Some(source), Some(target)) = (
+        name_at(c, from).and_then(|name| host_path(c, &name)),
+        name_at(c, to).and_then(|name| host_path(c, &name)),
+    ) else {
+        return c.finish(hresult(ERROR_PATH_NOT_FOUND));
+    };
+    let (Some(paths), Some(files)) = (c.host.paths(), c.host.files()) else {
+        return c.finish(hresult(super::ERROR_CALL_NOT_IMPLEMENTED));
+    };
+    let attributes = match paths.attributes(At::Cwd, &source, true) {
+        Ok(attributes) => attributes,
+        Err(errno) => return c.finish(hresult(nt::status_from_errno(errno).dos_error())),
+    };
+    let opened = paths.open(
+        At::Cwd,
+        &source,
+        &OpenHow {
+            read: true,
+            write: false,
+            append: false,
+            truncate: false,
+            create: Create::Never,
+            directory: false,
+            follow: true,
+            close_on_exec: true,
+            mode: 0,
+        },
+    );
+    let source_fd = match opened {
+        Ok(fd) => fd as i32,
+        Err(errno) => return c.finish(hresult(nt::status_from_errno(errno).dos_error())),
+    };
+    let made = paths.open(
+        At::Cwd,
+        &target,
+        &OpenHow {
+            read: false,
+            write: true,
+            append: false,
+            truncate: true,
+            create: if flags & FAIL_IF_EXISTS != 0 {
+                Create::Exclusive
+            } else {
+                Create::IfAbsent
+            },
+            directory: false,
+            follow: true,
+            close_on_exec: true,
+            mode: attributes.mode & 0o7777,
+        },
+    );
+    let target_fd = match made {
+        Ok(fd) => fd as i32,
+        Err(errno) => {
+            let _ = files.close(source_fd);
+            return c.finish(hresult(nt::status_from_errno(errno).dos_error()));
+        }
+    };
+    // The bytes go through a block of the program's own memory, which is what
+    // the ports move data to and from.
+    let chunk = 64 * 1024;
+    let Some(heap) = c
+        .peb()
+        .and_then(|peb| c.read_u64(peb + crate::teb_peb::PEB_PROCESS_HEAP))
+        .and_then(|heap| super::heap::alloc(c, heap as usize, chunk))
+    else {
+        let _ = files.close(source_fd);
+        let _ = files.close(target_fd);
+        return c.finish(hresult(super::ERROR_NOT_ENOUGH_MEMORY));
+    };
+    let mut copied = Ok(());
+    loop {
+        let read = match files.read(source_fd, heap, chunk) {
+            Ok(0) => break,
+            Ok(read) => read as usize,
+            Err(errno) => {
+                copied = Err(errno);
+                break;
+            }
+        };
+        let mut written = 0;
+        while written < read {
+            match files.write(target_fd, heap + written, read - written) {
+                Ok(0) => {
+                    copied = Err(ax_abi_port::EIO);
+                    break;
+                }
+                Ok(wrote) => written += wrote as usize,
+                Err(errno) => {
+                    copied = Err(errno);
+                    break;
+                }
+            }
+        }
+        if copied.is_err() {
+            break;
+        }
+    }
+    // A copy carries the times and the permissions of what it copied.
+    if copied.is_ok() {
+        let _ = paths.set_times_of(
+            target_fd,
+            Some(attributes.accessed_ns),
+            Some(attributes.modified_ns),
+        );
+        let _ = paths.set_mode_of(target_fd, attributes.mode & 0o7777);
+    }
+    if let Some(process_heap) = c
+        .peb()
+        .and_then(|peb| c.read_u64(peb + crate::teb_peb::PEB_PROCESS_HEAP))
+    {
+        super::heap::mark_free(c, process_heap as usize, heap);
+    }
+    let _ = files.close(source_fd);
+    let _ = files.close(target_fd);
+    match copied {
+        Ok(()) => {
+            c.set_last_error(0);
+            c.finish(S_OK)
+        }
+        Err(errno) => c.finish(hresult(nt::status_from_errno(errno).dos_error())),
+    }
 }

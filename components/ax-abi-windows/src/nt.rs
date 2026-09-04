@@ -3706,6 +3706,55 @@ mod tests {
     }
 
     #[test]
+    fn a_bstr_carries_its_length_in_front_of_it() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let from = 0x7000usize;
+        put_wide(&host, from, "hi");
+
+        let mut made = call("SysAllocStringLen", [from, 2, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut made, &host);
+        let bstr = made.result.expect("a string");
+        assert_ne!(bstr, 0);
+        {
+            let mem = host.mem.borrow();
+            let bytes = u32::from_le_bytes(mem[bstr - 4..bstr].try_into().unwrap());
+            assert_eq!(bytes, 4, "two characters, in bytes");
+            assert_eq!(&mem[bstr..bstr + 4], b"h\0i\0");
+            assert_eq!(&mem[bstr + 4..bstr + 6], b"\0\0", "and a terminator");
+        }
+        let mut len = call("SysStringLen", [bstr, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut len, &host);
+        assert_eq!(len.result, Some(2));
+
+        // A string of nothing is as long as it was asked for, and reads as
+        // zeroes rather than as whatever the heap held.
+        let mut empty = call("SysAllocStringLen", [0, 3, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut empty, &host);
+        let empty = empty.result.expect("a string");
+        {
+            let mem = host.mem.borrow();
+            assert_eq!(&mem[empty..empty + 6], &[0u8; 6]);
+        }
+        let mut len = call("SysStringLen", [empty, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut len, &host);
+        assert_eq!(len.result, Some(3));
+
+        // Freeing one gives its block back, and a null string is nothing to
+        // free rather than a fault.
+        let mut freed = call("SysFreeString", [bstr, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut freed, &host);
+        assert_eq!(freed.result, Some(0));
+        let mut nothing = call("SysFreeString", [0, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut nothing, &host);
+        assert_eq!(nothing.result, Some(0));
+        let mut len = call("SysStringLen", [0, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut len, &host);
+        assert_eq!(len.result, Some(0), "a null string is empty");
+    }
+
+    #[test]
     fn a_named_pipe_is_a_socket_bound_to_the_name_the_path_carries() {
         use crate::win32;
         const ERROR_PIPE_CONNECTED: u32 = 535;
