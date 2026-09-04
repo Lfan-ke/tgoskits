@@ -3123,12 +3123,20 @@ mod tests {
             Ok(0)
         );
         // The wait status carries the exit code in its upper byte.
-        assert_eq!(*host.exited.borrow(), Some((3, false)), "the plain code, not a status");
+        assert_eq!(
+            *host.exited.borrow(),
+            Some((3, false)),
+            "the plain code, not a status"
+        );
         assert_eq!(
             dispatch(&host, &Trap::new(Sysno::exit_group, [4, 0, 0, 0, 0, 0])),
             Ok(0)
         );
-        assert_eq!(*host.exited.borrow(), Some((4, true)), "the plain code, not a status");
+        assert_eq!(
+            *host.exited.borrow(),
+            Some((4, true)),
+            "the plain code, not a status"
+        );
     }
 
     #[test]
