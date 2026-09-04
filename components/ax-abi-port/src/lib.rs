@@ -142,11 +142,13 @@ pub trait Tasks: Sync {
     fn gettid(&self) -> u32;
     fn set_tid_address(&self, tidptr: usize) -> SysResult;
     fn sched_yield(&self) -> SysResult;
-    /// Terminate the calling thread. A host whose exit path returns - marking
-    /// the thread and letting the trap return handle it - reports that outcome
-    /// here rather than diverging.
+    /// Terminate the calling thread with `code`, the plain exit code a
+    /// waiting parent is told about - how a host lays that out in the status
+    /// it reports is the host's own business, not a caller's. A host whose
+    /// exit path returns - marking the thread and letting the trap return
+    /// handle it - reports that outcome here rather than diverging.
     fn exit(&self, code: i32) -> SysResult;
-    /// Terminate every thread in the process.
+    /// Terminate every thread in the process, with `code` as above.
     fn exit_group(&self, code: i32) -> SysResult;
     /// Wait for child `pid` to end, writing its wait status to user memory
     /// at `status_out`; `nohang` asks not to wait. The pid reaped, or zero
@@ -407,6 +409,22 @@ pub struct Segment {
 /// kernel would not have produced. The domain still owns the call: it decodes
 /// and validates the arguments and maps the errno; the host owns moving the
 /// bytes, since only it can touch user memory and the file layer together.
+/// What a descriptor is ready for.
+///
+/// Every one of these ABIs asks the same question in its own words - `poll`,
+/// `select`, `kevent` - and the answer is these three facts.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ready {
+    /// Reading would not wait.
+    pub read: bool,
+    /// Writing would not wait.
+    pub write: bool,
+    /// The descriptor has an error or hung up, which every caller is told
+    /// about whether it asked or not.
+    pub error: bool,
+}
+
 #[cfg(feature = "fs")]
 pub trait Files: Sync {
     /// Read from `fd` into the user range at `uaddr`, returning the count read.
@@ -414,6 +432,18 @@ pub trait Files: Sync {
     /// Write the user range at `uaddr` to `fd`, returning the count written.
     fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult;
     fn close(&self, fd: i32) -> SysResult;
+
+    /// Wait until one of `interest` is ready for what its entry asks for, or
+    /// until `timeout_ns` passes; a deadline of zero asks what is ready now.
+    ///
+    /// Each entry's flags are replaced with what that descriptor is actually
+    /// ready for, and the count of descriptors with anything set comes back.
+    /// A descriptor that is not one of this host's is reported as an error on
+    /// that entry rather than failing the whole call, which is what a caller
+    /// polling a mixed set needs.
+    fn poll(&self, _interest: &mut [(i32, Ready)], _timeout_ns: Option<u64>) -> Result<usize, i32> {
+        Err(38)
+    }
     fn dup(&self, fd: i32) -> SysResult;
     /// A pipe: the read end and the write end, as descriptors.
     fn pipe(&self) -> Result<(i32, i32), i32> {
@@ -616,6 +646,125 @@ pub trait System: Sync {
 
 /// Process credentials. Each getter returns the `(real, effective, saved)`
 /// triple; a domain projects the single ids it needs from it.
+/// Where a socket is bound, or who it is talking to.
+///
+/// Only the address itself: the family, the length and the byte order each
+/// ABI writes it in are that ABI's own business, and every one of them writes
+/// the same address differently.
+#[cfg(feature = "net")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Address {
+    /// Four bytes and a port, in the order they are read aloud.
+    V4([u8; 4], u16),
+    /// Sixteen bytes, a port, and the scope a link-local address needs.
+    V6([u8; 16], u16, u32),
+}
+
+/// What a socket carries: a stream of bytes, or messages that keep their
+/// boundaries.
+#[cfg(feature = "net")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketKind {
+    Stream,
+    Datagram,
+}
+
+/// Which direction of a socket is being closed.
+#[cfg(feature = "net")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shutdown {
+    Read,
+    Write,
+    Both,
+}
+
+/// A socket setting both sides can name. The numbers each ABI uses for these
+/// differ; the setting does not.
+#[cfg(feature = "net")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketOption {
+    /// Rebind an address still in its wait state.
+    ReuseAddress,
+    /// Send keep-alives on an idle connection.
+    KeepAlive,
+    /// Send small writes at once rather than coalescing them.
+    NoDelay,
+    /// Allow sending to a broadcast address; without it such a send is
+    /// refused, which is what every one of these ABIs does.
+    Broadcast,
+    /// The receive buffer, in bytes.
+    ReceiveBuffer,
+    /// The send buffer, in bytes.
+    SendBuffer,
+    /// The error a connection attempt ended with, cleared by reading it.
+    Error,
+    /// What the socket carries, as [`SocketKind`] numbers it. Read only.
+    Kind,
+}
+
+/// Sockets, as a capability a host either has or has not.
+#[cfg(feature = "net")]
+pub trait Sockets: Sync {
+    /// A new socket, as a descriptor the file ports also accept.
+    fn open(&self, kind: SocketKind, v6: bool) -> Result<i32, i32>;
+    fn bind(&self, fd: i32, at: &Address) -> Result<(), i32>;
+    fn connect(&self, fd: i32, to: &Address) -> Result<(), i32>;
+    fn listen(&self, fd: i32, backlog: u32) -> Result<(), i32>;
+    /// Take the next connection: its descriptor and where it came from.
+    fn accept(&self, fd: i32) -> Result<(i32, Address), i32>;
+    /// Send from user memory, to `to` for a socket that is not connected.
+    fn send(&self, fd: i32, uaddr: usize, len: usize, to: Option<&Address>) -> SysResult;
+    /// Receive into user memory; `peek` leaves what it read in place. The
+    /// sender's address comes back for a socket that keeps boundaries.
+    fn recv(
+        &self,
+        fd: i32,
+        uaddr: usize,
+        len: usize,
+        peek: bool,
+    ) -> Result<(usize, Option<Address>), i32>;
+    fn shutdown(&self, fd: i32, how: Shutdown) -> Result<(), i32>;
+    fn local(&self, fd: i32) -> Result<Address, i32>;
+    fn peer(&self, fd: i32) -> Result<Address, i32>;
+    /// Whether a call that would wait returns instead.
+    fn set_blocking(&self, fd: i32, blocking: bool) -> Result<(), i32>;
+    /// How many bytes could be read without waiting.
+    fn pending(&self, fd: i32) -> Result<usize, i32>;
+    fn set_option(&self, fd: i32, option: SocketOption, value: u32) -> Result<(), i32>;
+    fn option(&self, fd: i32, option: SocketOption) -> Result<u32, i32>;
+}
+
+/// What thread synchronisation needs from the host: an atomic update of a
+/// word several threads share, and blocking on one until another says so.
+///
+/// A personality can lay out a lock, an event or a semaphore itself - they are
+/// words in the program's own memory - but it cannot read and write one
+/// without another processor seeing a half-done update, and it cannot take a
+/// thread off the processor and give it back later. Those two steps are the
+/// host's, and together they are enough to build the rest on.
+#[cfg(feature = "wait")]
+pub trait Wait: Sync {
+    /// Block the calling thread while the `u32` at `addr` still holds
+    /// `expected`, until another thread wakes it or `timeout_ns` elapses.
+    ///
+    /// The comparison and the block are one step, so a wake that lands
+    /// between a caller's own check and this call cannot be missed. `Ok(true)`
+    /// means woken, `Ok(false)` that the deadline passed first; a word that
+    /// already differs is `Err(EAGAIN)`, which is the caller's signal to look
+    /// again rather than an error.
+    fn wait(&self, addr: usize, expected: u32, timeout_ns: Option<u64>) -> Result<bool, i32>;
+
+    /// Wake at most `count` threads blocked on `addr`, and say how many were.
+    fn wake(&self, addr: usize, count: u32) -> Result<u32, i32>;
+
+    /// Atomically put `value` in the `u32` at `addr` and return what it held.
+    fn swap(&self, addr: usize, value: u32) -> Result<u32, i32>;
+
+    /// Atomically add `value` to the `u32` at `addr`, wrapping, and return
+    /// what it held.
+    fn fetch_add(&self, addr: usize, value: u32) -> Result<u32, i32>;
+}
+
 #[cfg(feature = "creds")]
 pub trait Creds: Sync {
     fn uids(&self) -> (u32, u32, u32);
@@ -670,6 +819,18 @@ pub trait Host: Sync {
     }
     #[cfg(feature = "creds")]
     fn creds(&self) -> Option<&dyn Creds> {
+        None
+    }
+
+    /// The host's thread blocking, if it has any.
+    #[cfg(feature = "wait")]
+    fn wait(&self) -> Option<&dyn Wait> {
+        None
+    }
+
+    /// The host's sockets, if it has a network at all.
+    #[cfg(feature = "net")]
+    fn sockets(&self) -> Option<&dyn Sockets> {
         None
     }
 }

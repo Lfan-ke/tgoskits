@@ -365,9 +365,9 @@ fn route(host: &dyn Host, uctx: &dyn TrapEnv) -> Option<SysResult> {
         Sysno::sched_yield => host.tasks()?.sched_yield(),
         // The wait-status encoding is the ABI's, so the domain applies it.
         #[cfg(feature = "task")]
-        Sysno::exit => host.tasks()?.exit((arg(0) as i32) << 8),
+        Sysno::exit => host.tasks()?.exit(arg(0) as i32),
         #[cfg(feature = "task")]
-        Sysno::exit_group => host.tasks()?.exit_group((arg(0) as i32) << 8),
+        Sysno::exit_group => host.tasks()?.exit_group(arg(0) as i32),
 
         // Address space.
         #[cfg(feature = "mm")]
@@ -3123,12 +3123,12 @@ mod tests {
             Ok(0)
         );
         // The wait status carries the exit code in its upper byte.
-        assert_eq!(*host.exited.borrow(), Some((3 << 8, false)));
+        assert_eq!(*host.exited.borrow(), Some((3, false)), "the plain code, not a status");
         assert_eq!(
             dispatch(&host, &Trap::new(Sysno::exit_group, [4, 0, 0, 0, 0, 0])),
             Ok(0)
         );
-        assert_eq!(*host.exited.borrow(), Some((4 << 8, true)));
+        assert_eq!(*host.exited.borrow(), Some((4, true)), "the plain code, not a status");
     }
 
     #[test]

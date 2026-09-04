@@ -17,7 +17,10 @@
 
 mod port;
 
-use ax_abi_port::{Clock, Creds, CurrentHost, Files, Host, Mem, Paths, Platform, Random, Signals, System, Tasks};
+use ax_abi_port::{
+    Clock, Creds, CurrentHost, Files, Host, Mem, Paths, Platform, Random, Signals, Sockets, System,
+    Tasks, Wait,
+};
 use ax_dispatch::TrapEnv;
 use ax_crate_interface::call_interface;
 use ax_runtime::hal::cpu::uspace::UserContext;
@@ -84,6 +87,28 @@ impl TrapEnv for TrapCtx<'_> {
         let child = UserContext::new(entry, VirtAddr::from_usize(self.uctx.sp()), arg);
         crate::syscall::sys_clone(&child, SIGCHLD, 0, 0, 0, 0)
             .map(|pid| pid as u32)
+            .map_err(errno)
+    }
+
+    fn spawn_thread(
+        &mut self,
+        entry: usize,
+        stack: usize,
+        arg: usize,
+        tls: usize,
+    ) -> Result<u32, i32> {
+        use crate::syscall::CloneFlags;
+        let mut child = UserContext::new(entry, VirtAddr::from_usize(stack), arg);
+        // Windows keeps the thread block through gs; the clone carries it.
+        child.gs_base = tls as u64;
+        let flags = (CloneFlags::VM
+            | CloneFlags::FS
+            | CloneFlags::FILES
+            | CloneFlags::SIGHAND
+            | CloneFlags::THREAD)
+            .bits() as u32;
+        crate::syscall::sys_clone(&child, flags, stack, 0, 0, 0)
+            .map(|tid| tid as u32)
             .map_err(errno)
     }
 
@@ -172,6 +197,12 @@ impl Host for KernelHost {
         Some(self)
     }
     fn paths(&self) -> Option<&dyn Paths> {
+        Some(self)
+    }
+    fn wait(&self) -> Option<&dyn Wait> {
+        Some(self)
+    }
+    fn sockets(&self) -> Option<&dyn Sockets> {
         Some(self)
     }
 }

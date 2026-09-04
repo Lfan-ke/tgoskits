@@ -7,14 +7,18 @@
 //! underneath stays the one the kernel already ships.
 
 use alloc::vec::Vec;
-use core::{ffi::c_char, mem::MaybeUninit, time::Duration};
+use core::{ffi::c_char, mem::align_of, mem::MaybeUninit, time::Duration};
 
 use ax_abi_port::{
     Access, At, Attributes, NodeKind, OpenHow, Paths,
     Clock, Creds, Files, MapRequest, MapSource, Mem, Platform, Prot, Random, SeekFrom,
-    Advice, Segment, SignalTarget, Signals, Slept, SysResult, System, Tasks, UtsField,
+    Address, Advice, Ready, Segment, Shutdown as PortShutdown, SignalTarget, Signals, Slept,
+    SocketKind, SocketOption, Sockets, SysResult, System, Tasks, UtsField, Wait,
 };
+use ax_net::{SocketAddrEx, SocketOps};
+use linux_raw_sys::net::{AF_INET, AF_INET6};
 use ax_runtime::hal;
+use ax_runtime::hal::cpu::UserAtomicU32Op;
 use ax_task::current;
 use axfs_ng_vfs::NodePermission;
 use linux_raw_sys::general::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
@@ -30,11 +34,17 @@ use crate::{
         Directory, FileLike, ResolveAtResult, add_file_like, close_file_like, get_file_like,
         resolve_at, with_fs, Pipe,
     },
-    mm::VmBytesMut,
+    mm::{
+        VmBytes, VmBytesMut, atomic_update_user_u32_nofault, fault_in_user_u32_read,
+        fault_in_user_u32_write, read_user_u32_nofault,
+    },
     syscall::access_permitted,
     syscall,
     syscall::{KillTarget, MmapFlags, MmapProt, open_path},
-    task::{AsThread, PgidNumber, TgidNumber, current_pid_view, do_exit},
+    task::{
+        AsThread, FutexAccessError, FutexKey, FutexKeyMode, PgidNumber, TgidNumber,
+        current_pid_view, do_exit, futex_table_for, retry_futex_nofault,
+    },
 };
 
 impl Platform for KernelHost {
@@ -105,8 +115,8 @@ impl Tasks for KernelHost {
         Ok(0)
     }
 
-    fn exit(&self, status: i32) -> SysResult {
-        do_exit(status, false);
+    fn exit(&self, code: i32) -> SysResult {
+        do_exit(code << 8, false);
         Ok(0)
     }
 
@@ -118,8 +128,8 @@ impl Tasks for KernelHost {
             .map_err(errno)
     }
 
-    fn exit_group(&self, status: i32) -> SysResult {
-        do_exit(status, true);
+    fn exit_group(&self, code: i32) -> SysResult {
+        do_exit(code << 8, true);
         Ok(0)
     }
 }
@@ -329,6 +339,98 @@ impl Files for KernelHost {
             .read(&mut VmBytesMut::new(uaddr as *mut u8, len))
             .map_err(errno)?;
         Ok(read as isize)
+    }
+
+    fn poll(&self, interest: &mut [(i32, Ready)], timeout_ns: Option<u64>) -> Result<usize, i32> {
+        use core::task::{Context, Poll};
+
+        use axpoll::{IoEvents, Pollable};
+        use core::future::poll_fn;
+
+        use ax_task::future::{block_on, interruptible, timeout};
+
+        // The descriptors, with what each asked about. One that is not ours is
+        // answered on its own entry, the way poll reports POLLNVAL, instead of
+        // failing the whole call.
+        struct Set(Vec<(alloc::sync::Arc<dyn FileLike>, IoEvents)>);
+        impl Pollable for Set {
+            fn poll(&self) -> IoEvents {
+                IoEvents::empty()
+            }
+            fn register(&self, context: &mut Context<'_>, _events: IoEvents) {
+                for (file, events) in &self.0 {
+                    file.register(context, *events);
+                }
+            }
+        }
+
+        let mut files = Vec::with_capacity(interest.len());
+        let mut invalid = 0;
+        for (fd, ready) in interest.iter_mut() {
+            // The entry carries what the caller asked about on the way in and
+            // what it got on the way out, so what it asked for is taken before
+            // the slot is cleared.
+            let wanted = *ready;
+            *ready = Ready::default();
+            match get_file_like(*fd) {
+                Ok(file) => {
+                    let mut events = IoEvents::ALWAYS_POLL;
+                    events.set(IoEvents::IN, wanted.read);
+                    events.set(IoEvents::OUT, wanted.write);
+                    files.push(Some((file, events)));
+                }
+                Err(_) => {
+                    ready.error = true;
+                    invalid += 1;
+                    files.push(None);
+                }
+            }
+        }
+        if invalid > 0 {
+            return Ok(invalid);
+        }
+
+        let set = Set(files.into_iter().flatten().collect());
+        let ready_now = |interest: &mut [(i32, Ready)]| {
+            let mut count = 0;
+            for (slot, (file, wanted)) in interest.iter_mut().zip(set.0.iter()) {
+                let events = file.poll();
+                let ready = Ready {
+                    read: events.contains(IoEvents::IN),
+                    write: events.contains(IoEvents::OUT),
+                    error: events.intersects(IoEvents::ERR | IoEvents::HUP | IoEvents::NVAL),
+                };
+                let asked = (ready.read && wanted.contains(IoEvents::IN))
+                    || (ready.write && wanted.contains(IoEvents::OUT))
+                    || ready.error;
+                slot.1 = if asked { ready } else { Ready::default() };
+                if asked {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        let interest = core::cell::RefCell::new(interest);
+        let wait = poll_fn(|cx| {
+            let mut count = ready_now(&mut interest.borrow_mut()[..]);
+            if count > 0 {
+                return Poll::Ready(count);
+            }
+            set.register(cx, IoEvents::empty());
+            count = ready_now(&mut interest.borrow_mut()[..]);
+            if count > 0 {
+                return Poll::Ready(count);
+            }
+            Poll::Pending
+        });
+        let deadline = timeout_ns.map(Duration::from_nanos);
+        match block_on(interruptible(timeout(deadline, wait))) {
+            // The deadline passed with nothing ready, which is not a failure.
+            Ok(Err(_)) => Ok(0),
+            Ok(Ok(count)) => Ok(count),
+            Err(error) => Err(errno(error.into())),
+        }
     }
 
     fn close(&self, fd: i32) -> SysResult {
@@ -623,4 +725,280 @@ fn set_to_bits(set: SignalSet) -> u64 {
     let raw: linux_raw_sys::general::kernel_sigset_t = set.into();
     // SAFETY: as above, the two types share a layout.
     unsafe { core::mem::transmute::<linux_raw_sys::general::kernel_sigset_t, u64>(raw) }
+}
+
+/// Threads block and wake on a word of their own memory, which is what the
+/// kernel's futexes are. The port takes a plain timeout rather than a
+/// `timespec` in user memory, so a personality can wait on a deadline it
+/// computed itself.
+impl Wait for KernelHost {
+    fn wait(&self, addr: usize, expected: u32, timeout_ns: Option<u64>) -> Result<bool, i32> {
+        let word = addr as *const u32;
+        if !addr.is_multiple_of(align_of::<u32>()) {
+            return Err(errno(StarryError::InvalidInput));
+        }
+        let key = FutexKey::new_current(addr, FutexKeyMode::Private);
+        let table = futex_table_for(&key);
+        // The word is read once before parking so a caller that is already
+        // out of date is told to look again instead of sleeping on a value
+        // nobody will wake it for.
+        match read_user_u32_nofault(word) {
+            Ok(value) if value != expected => return Err(errno(StarryError::WouldBlock)),
+            Ok(_) => {}
+            Err(_) => return Err(errno(StarryError::BadAddress)),
+        }
+        let timeout = timeout_ns.map(Duration::from_nanos);
+        let futex = table.get_or_insert(&key);
+        let cleanup = table.cleanup_for(&key);
+        // The queue reports three outcomes and they are not the same: it
+        // slept and was woken, it never slept because the word had already
+        // changed, or the deadline passed - and the last of those arrives as
+        // an error rather than a value.
+        match retry_futex_nofault(
+            || {
+                futex.wq.wait_if_with_cleanup_nofault(
+                    u32::MAX,
+                    timeout,
+                    Some(cleanup.clone()),
+                    || match read_user_u32_nofault(word) {
+                        Ok(value) => Ok(value == expected),
+                        Err(_) => Err(FutexAccessError::Fault),
+                    },
+                )
+            },
+            || fault_in_user_u32_read(word),
+        ) {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(errno(StarryError::WouldBlock)),
+            // The deadline arrives as an error, and as more than one variant
+            // of it - the queue's own timeout and the task timer's each have
+            // their own. What they share is the number they report, so that
+            // is what this compares.
+            Err(other) => {
+                let code = errno(other);
+                if code == errno(StarryError::TimedOut) {
+                    Ok(false)
+                } else {
+                    Err(code)
+                }
+            }
+        }
+    }
+
+    fn swap(&self, addr: usize, value: u32) -> Result<u32, i32> {
+        atomic(addr, UserAtomicU32Op::Set, value)
+    }
+
+    fn fetch_add(&self, addr: usize, value: u32) -> Result<u32, i32> {
+        atomic(addr, UserAtomicU32Op::Add, value)
+    }
+
+    fn wake(&self, addr: usize, count: u32) -> Result<u32, i32> {
+        if !addr.is_multiple_of(align_of::<u32>()) {
+            return Err(errno(StarryError::InvalidInput));
+        }
+        let key = FutexKey::new_current(addr, FutexKeyMode::Private);
+        let woken = futex_table_for(&key)
+            .get(&key)
+            .map_or(0, |futex| futex.wq.wake(count as usize, u32::MAX));
+        ax_task::yield_now();
+        Ok(woken as u32)
+    }
+}
+
+/// One atomic update of a user word, reported the way the ports report errors.
+fn atomic(addr: usize, operation: UserAtomicU32Op, argument: u32) -> Result<u32, i32> {
+    if !addr.is_multiple_of(align_of::<u32>()) {
+        return Err(errno(StarryError::InvalidInput));
+    }
+    let word = addr as *mut u32;
+    retry_futex_nofault(
+        || {
+            atomic_update_user_u32_nofault(word, operation, argument)
+                .map_err(|_| FutexAccessError::Fault)
+        },
+        || fault_in_user_u32_write(word),
+    )
+    .map_err(errno)
+}
+
+/// Turning a port address into the one the network stack speaks, and back.
+/// Only the shape differs: the bytes and the port are the same address.
+fn endpoint(at: &Address) -> SocketAddrEx {
+    let addr = match *at {
+        Address::V4(bytes, port) => {
+            core::net::SocketAddr::V4(core::net::SocketAddrV4::new(bytes.into(), port))
+        }
+        Address::V6(bytes, port, scope) => core::net::SocketAddr::V6(
+            core::net::SocketAddrV6::new(bytes.into(), port, 0, scope),
+        ),
+    };
+    SocketAddrEx::Ip(addr)
+}
+
+fn address(from: SocketAddrEx) -> Result<Address, i32> {
+    match from {
+        SocketAddrEx::Ip(core::net::SocketAddr::V4(v4)) => {
+            Ok(Address::V4(v4.ip().octets(), v4.port()))
+        }
+        SocketAddrEx::Ip(core::net::SocketAddr::V6(v6)) => {
+            Ok(Address::V6(v6.ip().octets(), v6.port(), v6.scope_id()))
+        }
+        // A local socket has a name, not an address; a caller that asked for
+        // an address has to be told this one has none rather than given a
+        // made-up one.
+        _ => Err(errno(StarryError::OperationNotSupported)),
+    }
+}
+
+/// The socket behind a descriptor.
+fn socket_of(fd: i32) -> Result<alloc::sync::Arc<crate::file::Socket>, i32> {
+    crate::file::Socket::from_fd(fd).map_err(errno)
+}
+
+impl Sockets for KernelHost {
+    fn open(&self, kind: SocketKind, v6: bool) -> Result<i32, i32> {
+        use ax_net::{tcp::TcpSocket, udp::UdpSocket};
+        let inner: ax_net::Socket = match kind {
+            SocketKind::Stream => TcpSocket::new().into(),
+            SocketKind::Datagram => UdpSocket::new().into(),
+        };
+        let domain = if v6 { AF_INET6 } else { AF_INET };
+        let socket = crate::file::Socket::new(inner, domain);
+        socket.add_to_fd_table(false).map_err(errno).map(|fd| fd as i32)
+    }
+
+    fn bind(&self, fd: i32, at: &Address) -> Result<(), i32> {
+        socket_of(fd)?.bind(endpoint(at)).map_err(|e| errno(e.into()))
+    }
+
+    fn connect(&self, fd: i32, to: &Address) -> Result<(), i32> {
+        socket_of(fd)?
+            .connect(endpoint(to))
+            .map_err(|e| errno(e.into()))
+    }
+
+    fn listen(&self, fd: i32, backlog: u32) -> Result<(), i32> {
+        socket_of(fd)?
+            .listen(backlog as usize)
+            .map_err(|e| errno(e.into()))
+    }
+
+    fn accept(&self, fd: i32) -> Result<(i32, Address), i32> {
+        let socket = socket_of(fd)?;
+        let taken = socket.accept().map_err(|e| errno(e.into()))?;
+        let peer = taken.peer_addr().map_err(|e| errno(e.into()))?;
+        let file = crate::file::Socket::new(taken, socket.ip_domain());
+        let fd = file.add_to_fd_table(false).map_err(errno)? as i32;
+        Ok((fd, address(peer)?))
+    }
+
+    fn send(&self, fd: i32, uaddr: usize, len: usize, to: Option<&Address>) -> SysResult {
+        let socket = socket_of(fd)?;
+        let options = ax_net::SendOptions {
+            to: to.map(endpoint),
+            ..Default::default()
+        };
+        socket
+            .send(&mut VmBytes::new(uaddr as *const u8, len), options)
+            .map(|sent| sent as isize)
+            .map_err(|e| errno(e.into()))
+    }
+
+    fn recv(
+        &self,
+        fd: i32,
+        uaddr: usize,
+        len: usize,
+        peek: bool,
+    ) -> Result<(usize, Option<Address>), i32> {
+        let socket = socket_of(fd)?;
+        let mut from = SocketAddrEx::Ip(core::net::SocketAddr::V4(
+            core::net::SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0),
+        ));
+        let mut flags = ax_net::RecvFlags::empty();
+        flags.set(ax_net::RecvFlags::PEEK, peek);
+        let options = ax_net::RecvOptions {
+            from: Some(&mut from),
+            flags,
+            ..Default::default()
+        };
+        let read = socket
+            .recv(&mut VmBytesMut::new(uaddr as *mut u8, len), options)
+            .map_err(|e| errno(e.into()))?;
+        Ok((read, address(from).ok()))
+    }
+
+    fn shutdown(&self, fd: i32, how: PortShutdown) -> Result<(), i32> {
+        let how = match how {
+            PortShutdown::Read => ax_net::Shutdown::Read,
+            PortShutdown::Write => ax_net::Shutdown::Write,
+            PortShutdown::Both => ax_net::Shutdown::Both,
+        };
+        socket_of(fd)?.shutdown(how).map_err(|e| errno(e.into()))
+    }
+
+    fn local(&self, fd: i32) -> Result<Address, i32> {
+        address(socket_of(fd)?.local_addr().map_err(|e| errno(e.into()))?)
+    }
+
+    fn peer(&self, fd: i32) -> Result<Address, i32> {
+        address(socket_of(fd)?.peer_addr().map_err(|e| errno(e.into()))?)
+    }
+
+    fn set_blocking(&self, fd: i32, blocking: bool) -> Result<(), i32> {
+        socket_of(fd)?
+            .set_nonblocking(!blocking)
+            .map_err(|e| errno(e.into()))
+    }
+
+    fn pending(&self, fd: i32) -> Result<usize, i32> {
+        socket_of(fd)?.recv_available().map_err(|e| errno(e.into()))
+    }
+
+    fn set_option(&self, fd: i32, option: SocketOption, value: u32) -> Result<(), i32> {
+        use ax_net::options::{Configurable, SetSocketOption as Set};
+        let socket = socket_of(fd)?;
+        let on = value != 0;
+        let size = value as usize;
+        let done = match option {
+            SocketOption::ReuseAddress => socket.set_option(Set::ReuseAddress(&on)),
+            SocketOption::KeepAlive => socket.set_option(Set::KeepAlive(&on)),
+            SocketOption::NoDelay => socket.set_option(Set::NoDelay(&on)),
+            SocketOption::Broadcast => socket.set_option(Set::Broadcast(&on)),
+            SocketOption::SendBuffer => socket.set_option(Set::SendBuffer(&size)),
+            SocketOption::ReceiveBuffer => socket.set_option(Set::ReceiveBuffer(&size)),
+            // What the socket is, and what went wrong, are reports rather
+            // than settings.
+            SocketOption::Error | SocketOption::Kind => {
+                return Err(errno(StarryError::OperationNotSupported));
+            }
+        };
+        done.map_err(|e| errno(e.into()))
+    }
+
+    fn option(&self, fd: i32, option: SocketOption) -> Result<u32, i32> {
+        use ax_net::options::{Configurable, GetSocketOption as Get};
+        let socket = socket_of(fd)?;
+        let (mut flag, mut size, mut number) = (false, 0usize, 0i32);
+        let done = match option {
+            SocketOption::ReuseAddress => socket.get_option(Get::ReuseAddress(&mut flag)),
+            SocketOption::KeepAlive => socket.get_option(Get::KeepAlive(&mut flag)),
+            SocketOption::NoDelay => socket.get_option(Get::NoDelay(&mut flag)),
+            SocketOption::Broadcast => socket.get_option(Get::Broadcast(&mut flag)),
+            SocketOption::SendBuffer => socket.get_option(Get::SendBuffer(&mut size)),
+            SocketOption::ReceiveBuffer => socket.get_option(Get::ReceiveBuffer(&mut size)),
+            SocketOption::Error => socket.get_option(Get::Error(&mut number)),
+            SocketOption::Kind => socket.get_option(Get::SocketType(&mut number)),
+        };
+        done.map_err(|e| errno(e.into()))?;
+        Ok(match option {
+            SocketOption::ReuseAddress
+            | SocketOption::KeepAlive
+            | SocketOption::NoDelay
+            | SocketOption::Broadcast => u32::from(flag),
+            SocketOption::SendBuffer | SocketOption::ReceiveBuffer => size as u32,
+            SocketOption::Error | SocketOption::Kind => number as u32,
+        })
+    }
 }

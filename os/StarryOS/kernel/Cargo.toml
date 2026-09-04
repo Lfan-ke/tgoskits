@@ -313,6 +313,8 @@ ax-abi-port = { workspace = true, features = [
     "random",
     "system",
     "creds",
+    "wait",
+    "net",
 ] }
 ax-abi = { workspace = true, features = ["linux", "linux-elf", "auto-dispatch"] }
 ax-cgroup = { workspace = true }

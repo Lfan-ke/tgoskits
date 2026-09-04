@@ -85,6 +85,19 @@ pub trait TrapEnv {
     /// NUL-terminated string in user memory - given `argv` and `envp`,
     /// NULL-terminated arrays of such. On success the call never returns to
     /// the old image.
+    /// Start a thread of the calling task: a clone sharing the address
+    /// space, descriptors and handlers, beginning at `entry` with `arg` in
+    /// its first argument register, on the stack topped at `stack`, and
+    /// reading its thread block through `gs` based at `tls`. The thread id.
+    fn spawn_thread(
+        &mut self,
+        _entry: usize,
+        _stack: usize,
+        _arg: usize,
+        _tls: usize,
+    ) -> Result<u32, i32> {
+        Err(38)
+    }
     fn exec_with_stdio(
         &mut self,
         _stdio: [i32; 3],

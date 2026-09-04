@@ -12,7 +12,7 @@ license.workspace = true
 [features]
 # Each capability is a part the build can leave out. A host that has no
 # filesystem drops `fs`, and the file ports stop existing at all.
-default = ["fs", "mm", "task", "signal", "time", "random", "system", "creds", "paths"]
+default = ["fs", "mm", "task", "signal", "time", "random", "system", "creds", "paths", "wait", "net"]
 fs = []
 paths = []
 mm = []
@@ -22,6 +22,8 @@ time = []
 random = []
 system = []
 creds = []
+wait = []
+net = []
 
 [dependencies]
 ax-io = { workspace = true }
