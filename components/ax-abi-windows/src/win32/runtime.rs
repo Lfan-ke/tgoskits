@@ -12,8 +12,8 @@
 //! `RtlVerifyVersionInfo` compares it, condition mask and all.
 
 use super::{
-    Call, Dispatch, ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_PARAMETER, ERROR_MOD_NOT_FOUND,
-    ERROR_NOT_ENOUGH_MEMORY, FALSE, TRUE, heap,
+    Call, Dispatch, ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+    ERROR_MOD_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, FALSE, PEB_ERROR_MODE, TRUE, heap,
 };
 use crate::{
     dll,
@@ -24,7 +24,6 @@ use crate::{
     },
 };
 
-const ERROR_INVALID_HANDLE: u32 = 6;
 /// `ERROR_OLD_WIN_VERSION`, what `STATUS_REVISION_MISMATCH` maps to.
 const ERROR_OLD_WIN_VERSION: u32 = 1150;
 const FLS_OUT_OF_INDEXES: usize = u32::MAX as usize;
@@ -243,6 +242,50 @@ fn update_condition(last: &mut u8, condition: u8) -> u8 {
 /// VerifyVersionInfoW(lpVersionInformation, dwTypeMask, dwlConditionMask):
 /// `RtlVerifyVersionInfo`, with a mismatch reported as ERROR_OLD_WIN_VERSION.
 pub fn verify_version_info(c: &mut Call<'_>) -> Dispatch {
+    verify_version(c, SERVICE_PACK_W)
+}
+
+/// VerifyVersionInfoA: the same comparison over `OSVERSIONINFOEXA`, whose
+/// `szCSDVersion` is 128 bytes rather than 128 characters, so everything
+/// after it sits 128 bytes earlier.
+pub fn verify_version_info_ansi(c: &mut Call<'_>) -> Dispatch {
+    verify_version(c, SERVICE_PACK_A)
+}
+
+/// SetErrorMode(uMode): which faults the process handles itself rather than
+/// leaving to the system. Nothing here puts up a dialog, so the mode is only
+/// remembered - which is what a caller reads back and restores.
+pub fn set_error_mode(c: &mut Call<'_>) -> Dispatch {
+    let Some(peb) = c.peb() else {
+        return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+    };
+    let had = c.read_u32(peb + PEB_ERROR_MODE).unwrap_or(0);
+    // SEM_FAILCRITICALERRORS is the one bit a process cannot clear once the
+    // system set it; the others are the caller's to keep.
+    c.write_u32(peb + PEB_ERROR_MODE, c.arg(0) as u32 & ERROR_MODE_BITS);
+    c.finish(had as usize)
+}
+
+/// GetErrorMode(): the mode last set, without changing it.
+pub fn get_error_mode(c: &mut Call<'_>) -> Dispatch {
+    let Some(peb) = c.peb() else {
+        return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+    };
+    let mode = c.read_u32(peb + PEB_ERROR_MODE).unwrap_or(0);
+    c.finish(mode as usize)
+}
+
+/// The bits `SetErrorMode` defines: SEM_FAILCRITICALERRORS,
+/// SEM_NOGPFAULTERRORBOX, SEM_NOALIGNMENTFAULTEXCEPT and
+/// SEM_NOOPENFILEERRORBOX.
+const ERROR_MODE_BITS: u32 = 0x1 | 0x2 | 0x4 | 0x8000;
+
+/// Where `wServicePackMajor` starts in `OSVERSIONINFOEXW` and in the ANSI
+/// structure; the suite mask and product type follow it.
+const SERVICE_PACK_W: usize = 276;
+const SERVICE_PACK_A: usize = 148;
+
+fn verify_version(c: &mut Call<'_>, sp: usize) -> Dispatch {
     let (info, kinds, mask) = (c.arg(0), c.arg(1) as u32, c.arg(2) as u64);
     if info == 0 || kinds == 0 || mask == 0 {
         return c.fail(ERROR_INVALID_PARAMETER, FALSE);
@@ -260,14 +303,14 @@ pub fn verify_version_info(c: &mut Call<'_>) -> Dispatch {
     if kinds & VER_PRODUCT_TYPE != 0
         && !compare(
             u32::from(ours.product),
-            u32::from(c.read::<1>(info + 282).unwrap_or([0])[0]),
+            u32::from(c.read::<1>(info + sp + 6).unwrap_or([0])[0]),
             cond(7),
         )
     {
         return mismatch(c);
     }
     if kinds & VER_SUITENAME != 0 {
-        let theirs = want16(280);
+        let theirs = want16(sp + 4);
         match cond(6) {
             VER_AND if theirs & ours.suite != theirs => return mismatch(c),
             VER_OR if theirs & ours.suite == 0 && theirs != 0 => return mismatch(c),
@@ -292,13 +335,13 @@ pub fn verify_version_info(c: &mut Call<'_>) -> Dispatch {
             (
                 VER_SERVICEPACKMAJOR,
                 u32::from(ours.sp_major),
-                u32::from(want16(276)),
+                u32::from(want16(sp)),
                 5,
             ),
             (
                 VER_SERVICEPACKMINOR,
                 u32::from(ours.sp_minor),
-                u32::from(want16(278)),
+                u32::from(want16(sp + 2)),
                 4,
             ),
         ];
@@ -323,6 +366,16 @@ pub(super) fn module_named(c: &Call<'_>, name: &str) -> Option<usize> {
     // A synthesized library is in the list under its own name, as is a file.
     let canonical = dll::canonical(name);
     super::find_module(c, peb, canonical.as_bytes())
+}
+
+/// The address of one entry point of a library the process has, the way
+/// `GetProcAddress` finds it. A caller that is handed a function pointer
+/// rather than a name - `WSAIoctl` for the Winsock extensions - needs the
+/// same answer.
+pub(super) fn entry_point(c: &Call<'_>, library: &str, name: &str) -> Option<usize> {
+    let base = module_named(c, library)?;
+    let exports = super::mapped::exports(c, base)?;
+    super::mapped::by_name(c, base, &exports, name.as_bytes())
 }
 
 /// LoadLibraryExW(lpLibFileName, hFile, dwFlags): a library already in the

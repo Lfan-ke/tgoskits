@@ -58,7 +58,7 @@ const MSG_PEEK: u32 = 0x2;
 
 /// The `WSAE*` number a host errno reports as. The two spaces agree below 10000
 /// only by accident, so the ones a socket call actually returns are named.
-fn wsa_error(errno: i32) -> u32 {
+pub(super) fn error_of(errno: i32) -> u32 {
     match errno {
         11 => WSAEWOULDBLOCK,
         22 => WSAEINVAL,
@@ -111,7 +111,7 @@ fn socket_handle(fd: i32) -> usize {
 
 /// Read a `SOCKADDR` of `len` bytes. The family, the port and the address are
 /// each in Winsock's own layout and order.
-fn read_address(c: &Call<'_>, at: usize, len: usize) -> Option<Address> {
+pub(super) fn take_address(c: &Call<'_>, at: usize, len: usize) -> Option<Address> {
     if at == 0 {
         return None;
     }
@@ -130,7 +130,7 @@ fn read_address(c: &Call<'_>, at: usize, len: usize) -> Option<Address> {
 
 /// Write a `SOCKADDR` and the length it took, as the out parameter pair every
 /// call that reports an address uses.
-fn write_address(c: &Call<'_>, at: usize, len_at: usize, address: &Address) -> bool {
+pub(super) fn put_address(c: &Call<'_>, at: usize, len_at: usize, address: &Address) -> bool {
     if at == 0 {
         return true;
     }
@@ -168,7 +168,7 @@ fn write_address(c: &Call<'_>, at: usize, len_at: usize, address: &Address) -> b
 /// Report a failure the way Winsock does: the error is fetched separately, so
 /// the call itself only says that it failed.
 fn failed(c: &mut Call<'_>, errno: i32, result: usize) -> Dispatch {
-    c.set_last_error(wsa_error(errno));
+    c.set_last_error(error_of(errno));
     c.finish(result)
 }
 
@@ -228,6 +228,9 @@ pub fn close(c: &mut Call<'_>) -> Dispatch {
     let Some(fd) = descriptor(c.arg(0)) else {
         return failed(c, 88, SOCKET_ERROR);
     };
+    // The number goes back to the host here, so nothing may still think it
+    // reports to a completion port.
+    super::iocp::unregister(c, fd);
     match c.host.files().map(|files| files.close(fd)) {
         Some(Ok(_)) => {
             c.set_last_error(0);
@@ -244,7 +247,7 @@ pub fn bind(c: &mut Call<'_>, connecting: bool) -> Dispatch {
     let (Some(fd), Some(sockets)) = (descriptor(handle), c.host.sockets()) else {
         return failed(c, 88, SOCKET_ERROR);
     };
-    let Some(address) = read_address(c, at, len) else {
+    let Some(address) = take_address(c, at, len) else {
         return failed(c, 22, SOCKET_ERROR);
     };
     let done = if connecting {
@@ -284,7 +287,7 @@ pub fn accept(c: &mut Call<'_>) -> Dispatch {
     };
     match sockets.accept(fd) {
         Ok((taken, peer)) => {
-            if !write_address(c, at, len_at, &peer) {
+            if !put_address(c, at, len_at, &peer) {
                 return failed(c, 14, INVALID_SOCKET);
             }
             c.set_last_error(0);
@@ -301,7 +304,7 @@ pub fn send(c: &mut Call<'_>, to_address: bool) -> Dispatch {
         return failed(c, 88, SOCKET_ERROR);
     };
     let to = if to_address {
-        read_address(c, c.arg(4), c.arg(5))
+        take_address(c, c.arg(4), c.arg(5))
     } else {
         None
     };
@@ -324,7 +327,7 @@ pub fn recv(c: &mut Call<'_>, from_address: bool) -> Dispatch {
         Ok((read, from)) => {
             if from_address
                 && let Some(from) = from
-                && !write_address(c, c.arg(4), c.arg(5), &from)
+                && !put_address(c, c.arg(4), c.arg(5), &from)
             {
                 return failed(c, 14, SOCKET_ERROR);
             }
@@ -369,7 +372,7 @@ pub fn name_of(c: &mut Call<'_>, peer: bool) -> Dispatch {
     };
     match found {
         Ok(address) => {
-            if !write_address(c, at, len_at, &address) {
+            if !put_address(c, at, len_at, &address) {
                 return failed(c, 14, SOCKET_ERROR);
             }
             c.set_last_error(0);
@@ -449,7 +452,7 @@ pub fn option(c: &mut Call<'_>, setting: bool) -> Dispatch {
             // number into an exception, and 111 there means something else
             // entirely.
             let value = if option == SocketOption::Error && value != 0 {
-                wsa_error(value as i32)
+                error_of(value as i32)
             } else {
                 value
             };
@@ -754,7 +757,7 @@ pub fn getaddrinfo(c: &mut Call<'_>) -> Dispatch {
         return c.finish(WSA_BASE as usize + 55);
     };
     let address_at = block + AI_SIZE;
-    if !write_address(c, address_at, 0, &address) {
+    if !put_address(c, address_at, 0, &address) {
         return c.finish(WSAEFAULT as usize);
     }
     let (declared_family, length) = match address {
@@ -966,4 +969,305 @@ pub fn swap16(c: &mut Call<'_>) -> Dispatch {
 pub fn swap32(c: &mut Call<'_>) -> Dispatch {
     let value = c.arg(0) as u32;
     c.finish(value.swap_bytes() as usize)
+}
+
+/// A `WSABUF` array flattened to the one buffer these transfers use: the
+/// first non-empty span. A caller passing several spans gets the first one
+/// moved and is told how much that was, which is a short transfer - what
+/// Winsock is allowed to report and what every caller here handles.
+fn first_buffer(c: &Call<'_>, buffers: usize, count: usize) -> Option<(usize, usize)> {
+    for i in 0..count {
+        // WSABUF is { ULONG len; char *buf; }, padded to sixteen bytes.
+        let at = buffers + i * 16;
+        let len = c.read_u32(at)? as usize;
+        let buf = c.read_u64(at + 8)? as usize;
+        if len != 0 {
+            return Some((buf, len));
+        }
+    }
+    Some((0, 0))
+}
+
+/// WSARecv(s, buffers, count, received, flags, overlapped, routine) and
+/// WSARecvFrom, which adds the address the datagram came from.
+///
+/// Without an `OVERLAPPED` this is `recv`; with one the socket must report to
+/// a completion port, which is where the transfer is reported.
+pub fn overlapped_recv(c: &mut Call<'_>, from_address: bool) -> Dispatch {
+    let (handle, buffers, count, received) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+    let (address, address_len, overlapped) = if from_address {
+        (
+            c.arg(5),
+            super::arg_n(c, 6).unwrap_or(0),
+            super::arg_n(c, 7).unwrap_or(0),
+        )
+    } else {
+        (0, 0, c.arg(5))
+    };
+    let (Some(fd), Some((buffer, length))) = (descriptor(handle), first_buffer(c, buffers, count))
+    else {
+        return failed(c, 14, SOCKET_ERROR);
+    };
+    if overlapped == 0 {
+        let flags = c.read_u32(c.arg(4)).unwrap_or(0);
+        return match c.host.sockets() {
+            Some(sockets) => match sockets.recv(fd, buffer, length, flags & MSG_PEEK != 0) {
+                Ok((read, from)) => {
+                    if from_address
+                        && let Some(from) = from
+                        && address != 0
+                        && !put_address(c, address, address_len, &from)
+                    {
+                        return failed(c, 14, SOCKET_ERROR);
+                    }
+                    if received != 0 {
+                        c.write_u32(received, read as u32);
+                    }
+                    c.set_last_error(0);
+                    c.finish(0)
+                }
+                Err(errno) => failed(c, errno, SOCKET_ERROR),
+            },
+            None => failed(c, 38, SOCKET_ERROR),
+        };
+    }
+    let kind = if from_address {
+        super::iocp::OP_RECV_FROM
+    } else {
+        super::iocp::OP_RECV
+    };
+    super::iocp::start(
+        c,
+        kind,
+        fd,
+        overlapped,
+        buffer,
+        length,
+        address,
+        address_len,
+        received,
+        true,
+    )
+}
+
+/// WSASend(s, buffers, count, sent, flags, overlapped, routine) and WSASendTo,
+/// which names where the datagram goes.
+pub fn overlapped_send(c: &mut Call<'_>, to_address: bool) -> Dispatch {
+    let (handle, buffers, count, sent) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+    let (address, address_len, overlapped) = if to_address {
+        (
+            c.arg(5),
+            super::arg_n(c, 6).unwrap_or(0),
+            super::arg_n(c, 7).unwrap_or(0),
+        )
+    } else {
+        (0, 0, c.arg(5))
+    };
+    let (Some(fd), Some((buffer, length))) = (descriptor(handle), first_buffer(c, buffers, count))
+    else {
+        return failed(c, 14, SOCKET_ERROR);
+    };
+    if overlapped == 0 {
+        let to = to_address
+            .then(|| take_address(c, address, address_len))
+            .flatten();
+        return match c.host.sockets() {
+            Some(sockets) => match sockets.send(fd, buffer, length, to.as_ref()) {
+                Ok(moved) => {
+                    if sent != 0 {
+                        c.write_u32(sent, moved as u32);
+                    }
+                    c.set_last_error(0);
+                    c.finish(0)
+                }
+                Err(errno) => failed(c, errno, SOCKET_ERROR),
+            },
+            None => failed(c, 38, SOCKET_ERROR),
+        };
+    }
+    let kind = if to_address {
+        super::iocp::OP_SEND_TO
+    } else {
+        super::iocp::OP_SEND
+    };
+    super::iocp::start(
+        c,
+        kind,
+        fd,
+        overlapped,
+        buffer,
+        length,
+        address,
+        address_len,
+        sent,
+        true,
+    )
+}
+
+/// The GUIDs `SIO_GET_EXTENSION_FUNCTION_POINTER` is asked for, and the entry
+/// point each names. Winsock keeps these out of the export table on purpose -
+/// a program has to ask for them - so they are answered from the library
+/// that provides them, mswsock.
+const EXTENSIONS: [(&str, [u8; 16]); 4] = [
+    // WSAID_ACCEPTEX {b5367df1-cbac-11cf-95ca-00805f48a192}
+    (
+        "AcceptEx",
+        [
+            0xf1, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48,
+            0xa1, 0x92,
+        ],
+    ),
+    // WSAID_CONNECTEX {25a207b9-ddf3-4660-8ee9-76e58c74063e}
+    (
+        "ConnectEx",
+        [
+            0xb9, 0x07, 0xa2, 0x25, 0xf3, 0xdd, 0x60, 0x46, 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74,
+            0x06, 0x3e,
+        ],
+    ),
+    // WSAID_DISCONNECTEX {7fda2e11-8630-436f-a031-f536a6eec157}
+    (
+        "DisconnectEx",
+        [
+            0x11, 0x2e, 0xda, 0x7f, 0x30, 0x86, 0x6f, 0x43, 0xa0, 0x31, 0xf5, 0x36, 0xa6, 0xee,
+            0xc1, 0x57,
+        ],
+    ),
+    // WSAID_TRANSMITFILE {b5367df0-cbac-11cf-95ca-00805f48a192}
+    (
+        "TransmitFile",
+        [
+            0xf0, 0x7d, 0x36, 0xb5, 0xac, 0xcb, 0xcf, 0x11, 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48,
+            0xa1, 0x92,
+        ],
+    ),
+];
+
+/// WSAIoctl(s, code, in, in size, out, out size, returned, overlapped,
+/// routine): the control codes a socket answers here.
+pub fn wsa_ioctl(c: &mut Call<'_>) -> Dispatch {
+    /// `SIO_GET_EXTENSION_FUNCTION_POINTER`, which is `_WSAIORW(IOC_WS2, 6)`:
+    /// IOC_INOUT 0xC000_0000, IOC_WS2 0x0800_0000, and the number six.
+    const GET_EXTENSION: u32 = 0xC800_0006;
+    /// `SIO_KEEPALIVE_VALS`, which the caller sets and reads nothing back
+    /// from.
+    const KEEPALIVE_VALS: u32 = 0x9800_0004;
+    let (handle, code, input) = (c.arg(0), c.arg(1) as u32, c.arg(2));
+    let (output, output_len, returned) = (c.arg(4), c.arg(5), super::arg_n(c, 6).unwrap_or(0));
+    if descriptor(handle).is_none() {
+        return failed(c, 9, SOCKET_ERROR);
+    }
+    match code {
+        GET_EXTENSION => {
+            let Some(guid) = c.read::<16>(input) else {
+                return failed(c, 14, SOCKET_ERROR);
+            };
+            let Some((name, _)) = EXTENSIONS.iter().find(|(_, id)| *id == guid) else {
+                return failed(c, 45, SOCKET_ERROR);
+            };
+            let Some(at) = super::runtime::entry_point(c, "mswsock.dll", name) else {
+                return failed(c, 45, SOCKET_ERROR);
+            };
+            if output_len < 8 || !c.write_u64(output, at as u64) {
+                return failed(c, 14, SOCKET_ERROR);
+            }
+            if returned != 0 {
+                c.write_u32(returned, 8);
+            }
+            c.set_last_error(0);
+            c.finish(0)
+        }
+        KEEPALIVE_VALS => {
+            if returned != 0 {
+                c.write_u32(returned, 0);
+            }
+            c.set_last_error(0);
+            c.finish(0)
+        }
+        _ => {
+            c.host.platform().trace(&alloc::format!(
+                "WSAIoctl: control code {code:#010x} is not answered here"
+            ));
+            failed(c, 45, SOCKET_ERROR)
+        }
+    }
+}
+
+/// ConnectEx(s, name, namelen, sendbuf, sendlen, sent, overlapped): connect
+/// through a completion port, which is what a proactor does instead of
+/// waiting for the socket to become writable itself.
+pub fn connect_ex(c: &mut Call<'_>) -> Dispatch {
+    let (handle, name, name_len) = (c.arg(0), c.arg(1), c.arg(2));
+    let (sent, overlapped) = (c.arg(5), super::arg_n(c, 6).unwrap_or(0));
+    let (Some(fd), Some(to), Some(sockets)) = (
+        descriptor(handle),
+        take_address(c, name, name_len),
+        c.host.sockets(),
+    ) else {
+        return failed(c, 14, super::FALSE);
+    };
+    // The connection is started here and finishes when the socket says so;
+    // a host that takes it at once still reports through the port.
+    /// `EINPROGRESS`: a connection that has begun and not yet arrived.
+    const EINPROGRESS: i32 = 115;
+    match sockets.connect(fd, &to) {
+        Ok(()) => {}
+        Err(errno) if errno == EINPROGRESS || errno == ax_abi_port::EAGAIN => {}
+        Err(errno) => return failed(c, errno, super::FALSE),
+    }
+    super::iocp::start(
+        c,
+        super::iocp::OP_CONNECT,
+        fd,
+        overlapped,
+        0,
+        0,
+        0,
+        0,
+        sent,
+        false,
+    )
+}
+
+/// AcceptEx(listener, accepting, buffer, receive length, local length,
+/// remote length, received, overlapped): take a connection into a socket the
+/// caller has already made, reporting through the listener's port.
+pub fn accept_ex(c: &mut Call<'_>) -> Dispatch {
+    let (listener, accepting, buffer, data) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+    let local_len = c.arg(4);
+    let (received, overlapped) = (
+        super::arg_n(c, 6).unwrap_or(0),
+        super::arg_n(c, 7).unwrap_or(0),
+    );
+    let (Some(fd), Some(onto)) = (descriptor(listener), descriptor(accepting)) else {
+        return failed(c, 9, super::FALSE);
+    };
+    super::iocp::start(
+        c,
+        super::iocp::OP_ACCEPT,
+        fd,
+        overlapped,
+        buffer,
+        data,
+        onto as usize,
+        local_len,
+        received,
+        false,
+    )
+}
+
+/// DisconnectEx(s, overlapped, flags, reserved): shut the connection down.
+/// It finishes at once here, since there is nothing to linger over.
+pub fn disconnect_ex(c: &mut Call<'_>) -> Dispatch {
+    let handle = c.arg(0);
+    let (Some(fd), Some(sockets)) = (descriptor(handle), c.host.sockets()) else {
+        return failed(c, 9, super::FALSE);
+    };
+    match sockets.shutdown(fd, Shutdown::Both) {
+        Ok(()) => {
+            c.set_last_error(0);
+            c.finish(super::TRUE)
+        }
+        Err(errno) => failed(c, errno, super::FALSE),
+    }
 }

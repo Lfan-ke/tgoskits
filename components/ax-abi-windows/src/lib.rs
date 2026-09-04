@@ -209,9 +209,15 @@ const HEAP_LEN: u64 = 64 << 20;
 /// are the descriptors a process starts with.
 fn process_params(req: &LoadRequest<'_>, path: &str, at: u64) -> Vec<u8> {
     let image = teb_peb::windows_path(path);
-    let dir = match image.rsplit_once('\\') {
-        Some((dir, _)) if !dir.is_empty() && dir != "Z:" => alloc::string::String::from(dir),
-        _ => alloc::string::String::from("Z:\\"),
+    // The directory the process starts in: what started it said, under the
+    // `=X:` name Windows keeps a drive's current directory under, or the
+    // program's own directory when nothing did.
+    let dir = match starting_directory(req.envs) {
+        Some(dir) => dir,
+        None => match image.rsplit_once('\\') {
+            Some((dir, _)) if !dir.is_empty() && dir != "Z:" => alloc::string::String::from(dir),
+            _ => alloc::string::String::from("Z:\\"),
+        },
     };
     let own = [image.as_str()];
     let args: &[&str] = if req.args.is_empty() { &own } else { req.args };
@@ -225,6 +231,21 @@ fn process_params(req: &LoadRequest<'_>, path: &str, at: u64) -> Vec<u8> {
         },
         at,
     )
+}
+
+/// The current directory an `=X:=X:\\dir` entry names, if the environment has
+/// one. Windows keeps a current directory per drive this way; there is one
+/// drive here, so the first such entry is the directory to start in.
+fn starting_directory(envs: &[&str]) -> Option<alloc::string::String> {
+    envs.iter().find_map(|entry| {
+        let rest = entry.strip_prefix('=')?;
+        let (name, value) = rest.split_once('=')?;
+        let mut chars = name.chars();
+        let drive = chars.next()?;
+        (drive.is_ascii_alphabetic() && chars.eq(":".chars()) && !value.is_empty())
+            .then(|| alloc::string::String::from(value.trim_end_matches('\\')))
+            .filter(|dir| dir.len() > 2)
+    })
 }
 
 /// The loader's view of the process, as `PEB.Ldr` publishes it: which modules
@@ -1417,6 +1438,20 @@ impl ImageFormat for PeFormat {
         // the caller still has the space it came with. The program keeps its
         // preferred base; libraries follow it, each relocated to where it lands.
         let mut linked = dll::link(pe, bytes, req.path, env)?;
+
+        // Where each module landed, so an address in a fault report can be
+        // read as a module and an offset in it.
+        {
+            let host = ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current);
+            for module in &linked.modules {
+                host.platform().trace(&alloc::format!(
+                    "{} at {:#x}+{:#x}",
+                    module.name,
+                    module.base,
+                    image_extent(&module.pe, &module.bytes)
+                ));
+            }
+        }
 
         // What the thread starts with, laid out after the code: its control
         // blocks, then the array and blocks its thread locals live in. The

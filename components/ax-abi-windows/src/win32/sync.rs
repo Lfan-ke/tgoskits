@@ -15,7 +15,7 @@ use ax_abi_port::Wait;
 use ax_dispatch::Dispatch;
 
 use super::{Call, FALSE, TRUE, heap};
-use crate::teb_peb::PEB_PROCESS_HEAP;
+use crate::{nt::Ntstatus, teb_peb::PEB_PROCESS_HEAP};
 
 /// The lock word's three states.
 const FREE: u32 = 0;
@@ -46,6 +46,9 @@ const OWNER: usize = 20;
 const GUARD: usize = 20;
 const DEPTH: usize = 24;
 const DUE: usize = 24;
+/// A thread's own fields: which thread it is, and what it ended with.
+const TID: usize = 20;
+const EXIT_CODE: usize = 24;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -55,6 +58,7 @@ enum Kind {
     Semaphore   = 3,
     Mutex       = 4,
     Timer       = 5,
+    Thread      = 6,
 }
 
 impl Kind {
@@ -65,6 +69,7 @@ impl Kind {
             3 => Self::Semaphore,
             4 => Self::Mutex,
             5 => Self::Timer,
+            6 => Self::Thread,
             _ => return None,
         })
     }
@@ -216,7 +221,7 @@ pub fn sleep_condition(c: &mut Call<'_>, lock_at: usize, timeout_ms: u32) -> boo
 /// Every waiting loop keeps its own deadline rather than trusting the port to
 /// say which of its outcomes ended the park: a wait that was told to time out
 /// has to, whatever the park reports.
-fn deadline_for(c: &Call<'_>, timeout_ms: u32) -> Option<u64> {
+pub(super) fn deadline_for(c: &Call<'_>, timeout_ms: u32) -> Option<u64> {
     if timeout_ms == INFINITE {
         return None;
     }
@@ -224,7 +229,7 @@ fn deadline_for(c: &Call<'_>, timeout_ms: u32) -> Option<u64> {
 }
 
 /// What is left of a deadline, in milliseconds, or nothing once it has passed.
-fn left_of(c: &Call<'_>, deadline: Option<u64>) -> Option<u32> {
+pub(super) fn left_of(c: &Call<'_>, deadline: Option<u64>) -> Option<u32> {
     let Some(deadline) = deadline else {
         return Some(INFINITE);
     };
@@ -242,6 +247,34 @@ fn left_of(c: &Call<'_>, deadline: Option<u64>) -> Option<u32> {
 /// to look over its own objects again.
 pub(super) fn signal_count(c: &Call<'_>) -> Option<u32> {
     c.read_u32(c.peb()? + super::PEB_SIGNAL_SEQ)
+}
+
+/// Signal an event by the block that is it, which is what a completion does
+/// to the event an `OVERLAPPED` carries.
+pub(super) fn signal(c: &Call<'_>, handle: usize) {
+    let Some((block, kind)) = object(c, handle) else {
+        return;
+    };
+    if !matches!(kind, Kind::ManualEvent | Kind::AutoEvent) {
+        return;
+    }
+    swap(c, block + STATE, 1);
+    unpark(
+        c,
+        block + STATE,
+        if kind == Kind::ManualEvent {
+            u32::MAX
+        } else {
+            1
+        },
+    );
+    announce(c);
+}
+
+/// Wake everyone waiting on several objects at once, for a change none of
+/// their own words records.
+pub(super) fn announce_signal(c: &Call<'_>) {
+    announce(c);
 }
 
 /// Record a signal and wake everyone waiting on several objects at once.
@@ -337,6 +370,7 @@ pub fn set_event(c: &mut Call<'_>) -> Dispatch {
             1
         },
     );
+    announce(c);
     c.finish(TRUE)
 }
 
@@ -344,6 +378,44 @@ pub fn set_event(c: &mut Call<'_>) -> Dispatch {
 pub fn reset_event(c: &mut Call<'_>) -> Dispatch {
     if let Some((block, _)) = object(c, c.arg(0)) {
         swap(c, block + STATE, 0);
+    }
+    c.finish(TRUE)
+}
+
+/// The object a thread's handle names: unsignalled while it runs, signalled
+/// once it ends, which is what a join waits for.
+pub(super) fn create_thread_object(c: &mut Call<'_>, tid: u32) -> Option<usize> {
+    let block = create(c, Kind::Thread, 0)?;
+    c.write_u32(block + TID, tid);
+    c.write_u32(block + EXIT_CODE, STILL_ACTIVE);
+    Some(block)
+}
+
+/// `STILL_ACTIVE`, which a thread's exit code reads as until it ends.
+pub(super) const STILL_ACTIVE: u32 = 259;
+
+/// Record what a thread ended with and let go of everyone joining it.
+pub(super) fn end_thread(c: &Call<'_>, handle: usize, code: u32) {
+    let Some((block, Kind::Thread)) = object(c, handle) else {
+        return;
+    };
+    c.write_u32(block + EXIT_CODE, code);
+    swap(c, block + STATE, 1);
+    unpark(c, block + STATE, u32::MAX);
+    announce(c);
+}
+
+/// GetExitCodeThread(handle, out): what it ended with, or that it has not.
+pub fn thread_exit_code(c: &mut Call<'_>) -> Dispatch {
+    let (handle, out) = (c.arg(0), c.arg(1));
+    let code = match object(c, handle) {
+        Some((block, Kind::Thread)) => c.read_u32(block + EXIT_CODE).unwrap_or(STILL_ACTIVE),
+        // A thread this layer did not hand out is reported as finished, which
+        // is what a caller of an unknown handle was told before.
+        _ => 0,
+    };
+    if out != 0 && !c.write_u32(out, code) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
     }
     c.finish(TRUE)
 }
@@ -514,6 +586,9 @@ pub(super) fn wait_object(c: &mut Call<'_>, handle: usize, timeout_ms: u32) -> O
                 count > 0
             }
             Kind::Mutex => try_lock_word(c, state),
+            // A thread that has ended stays ended, so everyone joining it
+            // is released and stays released.
+            Kind::Thread => c.read_u32(state) == Some(1),
             // An armed timer is signalled once its moment has passed, and
             // stays that way until it is set again.
             Kind::Timer => {

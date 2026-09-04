@@ -26,9 +26,19 @@ pub const TEB_PEB: usize = 0x60;
 /// `TEB.LastErrorValue` - the `ULONG` `GetLastError` reports. Wine's
 /// `include/winternl.h` marks the field `034/0068`, the 32- and 64-bit offsets.
 pub const TEB_LAST_ERROR: usize = 0x68;
-/// Bytes reserved for the TEB; larger than the fields used so later phases can
-/// populate more without moving the block.
-pub const TEB_SIZE: usize = 0x1800;
+/// How far the fields of a real x64 TEB reach: the last of them,
+/// `EffectiveContainerId`, ends near here. A C runtime reads its own field
+/// out of that range - ucrtbase keeps a word in `ReservedForCrt` at 0x1820 -
+/// so a block shorter than this leaves it reading whatever follows.
+pub const TEB_FIELDS: usize = 0x1838;
+
+/// Bytes reserved for the TEB: the real fields, then room for the words this
+/// package keeps of its own, which begin at [`TEB_PRIVATE`].
+pub const TEB_SIZE: usize = 0x2000;
+
+/// Where this package's own per-thread words start: past every field a real
+/// TEB defines, so nothing a program reads through `gs` lands on one.
+pub const TEB_PRIVATE: usize = 0x1E00;
 
 // PEB field offsets (x86-64).
 /// `PEB.BeingDebugged`.
@@ -98,7 +108,15 @@ pub const TEB_TLS_EXPANSION: usize = 0x1780;
 /// answers that call from a buffer of the calling thread's, so two threads
 /// printing an address at once do not overwrite each other; this is that
 /// buffer.
-pub const TEB_ADDRESS_TEXT: usize = 0x17E0;
+pub const TEB_ADDRESS_TEXT: usize = TEB_PRIVATE;
+/// The object a thread signals when it ends, so a join on its handle finishes.
+/// Windows keeps this in the kernel's thread object; here the thread carries
+/// the address of its own, because it is the one that has to signal it.
+pub const TEB_THREAD_OBJECT: usize = TEB_PRIVATE + 0x10;
+
+/// `GuaranteedStackBytes`: how much stack the thread keeps for handling an
+/// overflow, where a real TEB keeps it.
+pub const TEB_STACK_GUARANTEE: usize = 0x1748;
 /// `TEB.FlsSlots` (`fb4/17c8`): this thread's fiber-local values, allocated
 /// the first time the thread touches one.
 pub const TEB_FLS_SLOTS: usize = 0x17C8;
@@ -501,5 +519,34 @@ mod tests {
         assert_eq!(read_u64(&peb, PEB_LDR), 0);
         assert_eq!(read_u64(&peb, PEB_PROCESS_PARAMS), 0);
         assert_eq!(peb[PEB_BEING_DEBUGGED], 0);
+    }
+
+    /// A C runtime reads fields of its own out of the TEB - ucrtbase keeps a
+    /// word in `ReservedForCrt` at 0x1820 - so the block has to cover every
+    /// field a real one defines, and the words this package keeps have to sit
+    /// past them rather than under one.
+    #[test]
+    fn the_private_words_sit_past_every_field_a_real_teb_has() {
+        assert!(TEB_SIZE >= TEB_FIELDS, "the block covers a real TEB");
+        assert!(
+            TEB_PRIVATE >= TEB_FIELDS,
+            "our own words are past the last real field"
+        );
+        for (name, at) in [
+            ("address text", TEB_ADDRESS_TEXT),
+            ("thread object", TEB_THREAD_OBJECT),
+        ] {
+            assert!(at >= TEB_PRIVATE, "{name} is one of ours");
+            assert!(at + 16 <= TEB_SIZE, "{name} is inside the block");
+        }
+        // The fields a real TEB defines are read where it defines them.
+        for (name, at) in [
+            ("TlsSlots", TEB_TLS_SLOTS),
+            ("TlsExpansionSlots", TEB_TLS_EXPANSION),
+            ("FlsData", TEB_FLS_SLOTS),
+            ("GuaranteedStackBytes", TEB_STACK_GUARANTEE),
+        ] {
+            assert!(at < TEB_FIELDS, "{name} is a real field");
+        }
     }
 }

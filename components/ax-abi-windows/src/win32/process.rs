@@ -18,7 +18,9 @@ use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use ax_dispatch::Dispatch;
 use ax_sync::SpinLock;
 
-use super::{Call, ERROR_INVALID_PARAMETER, FALSE, TRUE, Win32Call, file, runtime};
+use super::{
+    Call, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, FALSE, TRUE, Win32Call, file, runtime,
+};
 use crate::{
     dll,
     nt::Ntstatus,
@@ -33,6 +35,11 @@ pub(super) const THREAD_TAG: usize = 0x3000_0000;
 const TAG_MASK: usize = 0xF000_0000;
 /// What `GetExitCodeProcess` reports for a process still running.
 const STILL_ACTIVE: u32 = 259;
+/// `WAIT_OBJECT_0`, `WAIT_TIMEOUT` and `WAIT_FAILED`, as a wait on a process
+/// reports them.
+const WAIT_OBJECT_0: usize = 0;
+const WAIT_TIMEOUT: usize = super::sync::WAIT_TIMEOUT;
+const WAIT_FAILED: usize = 0xFFFF_FFFF;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// `STARTF_USESTDHANDLES`: the three handles in the startup info apply.
@@ -48,20 +55,6 @@ pub(super) fn pid_of(handle: usize) -> Option<u32> {
     let tag = handle & TAG_MASK;
     (handle != 0 && (tag == PROCESS_TAG || tag == THREAD_TAG))
         .then_some((handle & !TAG_MASK) as u32)
-}
-
-/// Argument `n` of a call, counting from zero: the stub carries the first six
-/// in registers, and the rest sit on the caller's stack past the return
-/// address, the shadow space, and the two pushes the stub made.
-fn arg_n(c: &Call<'_>, n: usize) -> Option<usize> {
-    if n < 6 {
-        return Some(c.arg(n));
-    }
-    let sp = c.env.stack_pointer();
-    (sp != 0)
-        .then(|| c.read_u64(sp + 0x48 + 8 * (n - 6)))
-        .flatten()
-        .map(|v| v as usize)
 }
 
 /// A Windows command line as `CommandLineToArgvW` splits it: whitespace
@@ -192,9 +185,12 @@ fn spawn_entry(c: &Call<'_>) -> Option<usize> {
 /// lpCurrentDirectory, lpStartupInfo, lpProcessInformation).
 pub fn create_process(c: &mut Call<'_>) -> Dispatch {
     let (app, line) = (c.arg(0), c.arg(1));
-    let (Some(env), Some(_cwd), Some(si), Some(pi)) =
-        (arg_n(c, 6), arg_n(c, 7), arg_n(c, 8), arg_n(c, 9))
-    else {
+    let (Some(env), Some(cwd), Some(si), Some(pi)) = (
+        super::arg_n(c, 6),
+        super::arg_n(c, 7),
+        super::arg_n(c, 8),
+        super::arg_n(c, 9),
+    ) else {
         return c.fail(ERROR_INVALID_PARAMETER, FALSE);
     };
     let text = if line != 0 {
@@ -221,13 +217,38 @@ pub fn create_process(c: &mut Call<'_>) -> Dispatch {
     let Some(path) = file::host_path(c, &exe) else {
         return c.fail(ERROR_FILE_NOT_FOUND, FALSE);
     };
-    let envs = if env != 0 {
+    let mut envs = if env != 0 {
         environment(c, env)
     } else {
         c.params()
             .and_then(|p| c.read_u64(p + PARAMS_ENVIRONMENT))
             .map_or_else(Vec::new, |at| environment(c, at as usize))
     };
+    // Where the child starts: the directory the caller named, or this
+    // process's, which is what a child inherits when none is named. It rides
+    // with the environment under the `=X:` name Windows keeps a drive's
+    // current directory under, since the C runtime hides those from the
+    // program and the loader is the only reader.
+    let here = match cwd {
+        0 => file::current_directory(c),
+        at => c
+            .read_wstr(at)
+            .and_then(|u| String::from_utf16(&u).ok())
+            .and_then(|name| file::full_windows_path(c, &name)),
+    };
+    if let Some(here) = here {
+        // Spelled the way Windows keeps it: no trailing separator unless the
+        // directory is the root of the drive.
+        let here = match here.trim_end_matches('\\') {
+            "" | "Z:" => String::from("Z:\\"),
+            trimmed if trimmed.len() == 2 => alloc::format!("{trimmed}\\"),
+            trimmed => String::from(trimmed),
+        };
+        let drive = here.chars().next().unwrap_or('Z');
+        let name = alloc::format!("={drive}:=");
+        envs.retain(|entry| !entry.starts_with(&name));
+        envs.push(alloc::format!("{name}{here}"));
+    }
     // The startup info: dwFlags at 60, then hStdInput, hStdOutput and
     // hStdError at 80, 88 and 96 of STARTUPINFOW.
     let mut stdio = [-1i32; 3];
@@ -255,6 +276,9 @@ pub fn create_process(c: &mut Call<'_>) -> Dispatch {
         Ok(pid) => pid,
         Err(errno) => return c.fail_status(super::nt::status_from_errno(errno), FALSE),
     };
+    // This child has the number, so whatever the last one to hold it exited
+    // with is no longer an answer about this one.
+    forget(pid);
     // PROCESS_INFORMATION: hProcess, hThread, dwProcessId, dwThreadId.
     if !c.write_u64(pi, (PROCESS_TAG | pid as usize) as u64)
         || !c.write_u64(pi + 8, (THREAD_TAG | pid as usize) as u64)
@@ -299,43 +323,136 @@ fn exit_child(c: &Call<'_>, code: i32) {
     }
 }
 
+/// Forget what a pid exited with, because a new process now has it.
+///
+/// The table below remembers an exit code until someone asks for it, and the
+/// host hands pids out again once they are free. Without this, a child that
+/// takes the number of one that has been reaped is reported as having already
+/// exited - with the other one's code - the moment it starts.
+pub(super) fn forget(pid: u32) {
+    EXITED.lock().remove(&pid);
+    TERMINATED.lock().remove(&pid);
+}
+
+/// What a look at a child found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Child {
+    /// It has ended and its code is in the table.
+    Ended,
+    /// It is still running.
+    Running,
+    /// There is no such child of ours to wait for.
+    Gone,
+}
+
 /// Reap `pid` if it has ended, recording its exit code; `block` waits for it.
-/// Whether it has ended.
-fn reap(c: &Call<'_>, pid: u32, block: bool) -> bool {
+fn reap(c: &Call<'_>, pid: u32, block: bool) -> Child {
     if EXITED.lock().contains_key(&pid) {
-        return true;
+        return Child::Ended;
     }
     let (Some(tasks), Some(peb)) = (c.host.tasks(), c.peb()) else {
-        return false;
+        return Child::Gone;
     };
     let Some(heap) = c.read_u64(peb + PEB_PROCESS_HEAP) else {
-        return false;
+        return Child::Gone;
     };
     let Some(status_at) = super::heap::alloc(c, heap as usize, 4) else {
-        return false;
+        return Child::Gone;
     };
     c.write_u32(status_at, 0);
-    match tasks.wait(pid, status_at, !block) {
+    let waited = tasks.wait(pid, status_at, !block);
+    let status = c.read_u32(status_at).unwrap_or(0);
+    super::heap::mark_free(c, heap as usize, status_at);
+    match waited {
         Ok(reaped) if reaped == pid => {
-            let status = c.read_u32(status_at).unwrap_or(0);
             // A Linux wait status: the exit code above the low byte, or the
             // terminating signal in it, reported the way a shell would.
-            let code = if status & 0x7F == 0 {
-                (status >> 8) & 0xFF
-            } else {
-                128 + (status & 0x7F)
+            let code = match TERMINATED.lock().remove(&pid) {
+                Some(code) => code,
+                None if status & 0x7F == 0 => (status >> 8) & 0xFF,
+                None => 128 + (status & 0x7F),
             };
             EXITED.lock().insert(pid, code);
-            true
+            Child::Ended
         }
-        _ => false,
+        // Asked not to block, a child that has not ended answers with zero.
+        Ok(_) => Child::Running,
+        Err(_) => Child::Gone,
     }
 }
 
-/// WaitForSingleObject on a process handle: wait for the child to end.
-pub fn wait_process(c: &mut Call<'_>, pid: u32) -> Dispatch {
-    reap(c, pid, true);
-    c.finish(0)
+/// OpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId): a handle for a
+/// process that is running. There is one process table here and no access
+/// checks in it, so what the handle carries is the number itself; whether the
+/// process is there is asked by signalling it with nothing.
+pub fn open_process(c: &mut Call<'_>) -> Dispatch {
+    let pid = c.arg(2) as u32;
+    if pid == 0 {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    let alive = match c.host.signals() {
+        Some(signals) => signals
+            .kill(ax_abi_port::SignalTarget::Process(pid), 0)
+            .is_ok(),
+        // A host that cannot ask takes the caller's word for it.
+        None => true,
+    };
+    // A process that has ended still has a handle while its exit code is
+    // there to be read, which is what a parent opens one for.
+    if !alive && !EXITED.lock().contains_key(&pid) {
+        return c.fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    c.set_last_error(0);
+    c.finish(PROCESS_TAG | pid as usize)
+}
+
+/// What a child was told to exit with, until it has.
+///
+/// `TerminateProcess` names the code the process is to report, and the host
+/// ends it with a signal, which is a different thing to report; this is what
+/// keeps the two apart.
+static TERMINATED: SpinLock<BTreeMap<u32, u32>> = SpinLock::new(BTreeMap::new());
+
+/// TerminateProcess on a child: end it, and remember what it is to be
+/// reported as having exited with.
+pub(super) fn terminate(c: &mut Call<'_>, pid: u32, code: u32) -> Dispatch {
+    /// `SIGKILL`, which is what ending a process without its cooperation is.
+    const SIGKILL: u32 = 9;
+    let Some(signals) = c.host.signals() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    match signals.kill(ax_abi_port::SignalTarget::Process(pid), SIGKILL) {
+        Ok(_) => {
+            TERMINATED.lock().insert(pid, code);
+            c.set_last_error(0);
+            c.finish(TRUE)
+        }
+        Err(errno) => c.fail_status(super::nt::status_from_errno(errno), FALSE),
+    }
+}
+
+/// How long a wait on a child sleeps before looking again. A child ending
+/// signals nothing in this process, so the wait has to come back and ask.
+const POLL_MS: u32 = 10;
+
+/// WaitForSingleObject on a process handle: the child ending, or the timeout.
+pub fn wait_process(c: &mut Call<'_>, pid: u32, timeout_ms: u32) -> Dispatch {
+    let deadline = super::sync::deadline_for(c, timeout_ms);
+    loop {
+        match reap(c, pid, false) {
+            Child::Ended => return c.finish(WAIT_OBJECT_0),
+            // The child could not be waited for, which is not the same as it
+            // having ended; saying otherwise sends the caller off to collect
+            // an exit code that does not exist yet.
+            Child::Gone => return c.fail(ERROR_INVALID_HANDLE, WAIT_FAILED),
+            Child::Running => {}
+        }
+        let Some(left) = super::sync::left_of(c, deadline) else {
+            return c.finish(WAIT_TIMEOUT);
+        };
+        let seen = super::sync::signal_count(c).unwrap_or(0);
+        super::sync::wait_for_signal(c, seen, left.min(POLL_MS));
+    }
 }
 
 /// GetExitCodeProcess(hProcess, lpExitCode): the code once the child has

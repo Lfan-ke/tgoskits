@@ -60,6 +60,7 @@ const INVALID_HANDLE_VALUE: usize = usize::MAX;
 
 // Win32 error codes (`winerror.h`).
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 /// `ERROR_TIMEOUT`: the wait ended on its deadline, not on a wake.
@@ -157,6 +158,10 @@ pub const LIBRARIES: &[Library] = &[
     Library {
         name: "WS2_32.dll",
         exports: WS2_32,
+    },
+    Library {
+        name: "MSWSOCK.dll",
+        exports: MSWSOCK,
     },
 ];
 
@@ -598,6 +603,16 @@ const OLE32: &[(&str, u16)] = &[("ProgIDFromCLSID", 0)];
 const PROPSYS: &[(&str, u16)] = &[("VariantToString", 0)];
 const WINMM: &[(&str, u16)] = &[("PlaySoundW", 0)];
 
+/// The Winsock extensions. A program does not import these by name - it asks
+/// `WSAIoctl` for a pointer to each - but they are entry points of a library
+/// all the same, and this is the library they belong to.
+const MSWSOCK: &[(&str, u16)] = &[
+    ("AcceptEx", 0),
+    ("ConnectEx", 0),
+    ("DisconnectEx", 0),
+    ("TransmitFile", 0),
+];
+
 /// A Win32 entry point this package binds: a position across [`LIBRARIES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Win32Call(u32);
@@ -889,17 +904,28 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         // ExitProcess ends every thread in the process, which is exit_group and
         // not exit. A host that returns from it leaves the caller holding a
         // value, so say the call did not succeed.
-        "ExitProcess" | "TerminateProcess" => {
-            let code = if call.symbol() == "ExitProcess" {
-                c.arg(0)
-            } else {
-                c.arg(1)
-            };
+        "ExitProcess" => {
             let Some(tasks) = host.tasks() else {
                 return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
             };
-            let _ = tasks.exit_group(code as i32);
+            let _ = tasks.exit_group(c.arg(0) as i32);
             c.finish(FALSE)
+        }
+        // TerminateProcess ends the process the handle names, which is this
+        // one only when that is what the handle says.
+        "TerminateProcess" => {
+            let (handle, code) = (c.arg(0), c.arg(1));
+            if handle == Handle::CURRENT_PROCESS.0 as usize {
+                let Some(tasks) = host.tasks() else {
+                    return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+                };
+                let _ = tasks.exit_group(code as i32);
+                return c.finish(FALSE);
+            }
+            match process::pid_of(handle) {
+                Some(pid) => process::terminate(&mut c, pid, code as u32),
+                None => c.fail(ERROR_INVALID_HANDLE, FALSE),
+            }
         }
         // Windows reads both out of the TEB's ClientId; the host is the one
         // that knows them here, and the answer is the same.
@@ -972,7 +998,9 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "CreateThread" => thread::create_thread(&mut c),
         "ExitThread" => thread::exit_thread(&mut c),
         "FreeLibraryAndExitThread" => thread::free_library_and_exit_thread(&mut c),
+        "GetExitCodeThread" => sync::thread_exit_code(&mut c),
         "CreateProcessW" => process::create_process(&mut c),
+        "OpenProcess" => process::open_process(&mut c),
         "_StarrySpawnExec" => process::spawn_exec(&mut c),
         "GetExitCodeProcess" => process::get_exit_code_process(&mut c),
         "InitializeProcThreadAttributeList" => process::init_proc_thread_attribute_list(&mut c),
@@ -1236,7 +1264,23 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "GetFileSizeEx" => file::get_file_size_ex(&mut c),
         "FlushFileBuffers" => file::flush_file_buffers(&mut c),
         "SetEndOfFile" => file::set_end_of_file(&mut c),
+        "CreateIoCompletionPort" => iocp::create_port(&mut c),
+        "GetQueuedCompletionStatus" => iocp::queued(&mut c),
+        "PostQueuedCompletionStatus" => iocp::post(&mut c),
+        "CancelIoEx" | "CancelIo" => iocp::cancel(&mut c),
+        "GetOverlappedResult" => iocp::result(&mut c),
+        "WSARecv" => sock::overlapped_recv(&mut c, false),
+        "WSARecvFrom" => sock::overlapped_recv(&mut c, true),
+        "WSASend" => sock::overlapped_send(&mut c, false),
+        "WSASendTo" => sock::overlapped_send(&mut c, true),
+        "WSAIoctl" => sock::wsa_ioctl(&mut c),
+        "ConnectEx" => sock::connect_ex(&mut c),
+        "AcceptEx" => sock::accept_ex(&mut c),
+        "DisconnectEx" => sock::disconnect_ex(&mut c),
+        "SetFileTime" => file::set_file_time(&mut c),
+        "SetFileInformationByHandle" => file::set_file_information_by_handle(&mut c),
         "GetFileAttributesExW" => file::get_file_attributes_ex(&mut c),
+        "SetFileAttributesW" => file::set_file_attributes(&mut c),
         "GetFileInformationByHandle" => file::get_file_information_by_handle(&mut c),
         "DuplicateHandle" => file::duplicate_handle(&mut c),
         "GetFullPathNameW" => file::get_full_path_name(&mut c),
@@ -1248,6 +1292,16 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "FlsFree" => runtime::fls_free(&mut c),
         "VerSetConditionMask" => runtime::ver_set_condition_mask(&mut c),
         "VerifyVersionInfoW" => runtime::verify_version_info(&mut c),
+        "VerifyVersionInfoA" => runtime::verify_version_info_ansi(&mut c),
+        "SetErrorMode" => runtime::set_error_mode(&mut c),
+        "GetErrorMode" => runtime::get_error_mode(&mut c),
+        "GetCurrentThreadStackLimits" => thread::stack_limits(&mut c),
+        "SetThreadStackGuarantee" => thread::set_stack_guarantee(&mut c),
+        // Nothing here is a console: the standard handles are a serial device,
+        // which is what Windows calls a character device that is not one.
+        "GetConsoleMode" | "SetConsoleMode" | "GetConsoleScreenBufferInfo" => {
+            c.fail(ERROR_INVALID_HANDLE, FALSE)
+        }
         "LoadLibraryExW" => runtime::load_library_ex(&mut c),
         "InitializeSRWLock" | "InitializeConditionVariable" => sync::init(&mut c),
         "AcquireSRWLockExclusive" => sync::acquire_exclusive(&mut c),
@@ -1294,7 +1348,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "WaitForSingleObject" | "WaitForSingleObjectEx" => {
             let (handle, timeout) = (c.arg(0), c.arg(1) as u32);
             match process::pid_of(handle) {
-                Some(pid) => process::wait_process(&mut c, pid),
+                Some(pid) => process::wait_process(&mut c, pid, timeout),
                 None => match sync::wait_object(&mut c, handle, timeout) {
                     Some(result) => c.finish(result),
                     // A handle that names no object of ours is taken as
@@ -1358,19 +1412,24 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         // No thread here was converted to a fiber.
         "IsThreadAFiber" => c.finish(FALSE),
         "CloseHandle" => {
-            // A process or thread pseudo-handle holds nothing to close.
-            if process::pid_of(c.arg(0)).is_some() {
+            // A process or thread pseudo-handle holds nothing but what the
+            // child exited with, which nobody can ask for once it is closed.
+            if let Some(pid) = process::pid_of(c.arg(0)) {
+                process::forget(pid);
                 return c.finish(TRUE);
             }
             // An event, semaphore or mutex is a block of the process heap,
             // which goes back to it here.
             let handle = c.arg(0);
-            if sync::close(&mut c, handle) {
+            if sync::close(&mut c, handle) || iocp::close(&mut c, handle) {
                 return c.finish(TRUE);
             }
             let (Some(files), Ok(fd)) = (host.files(), nt::descriptor(c.arg(0))) else {
                 return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
             };
+            // The number goes back to the host here, so nothing may still
+            // think it reports to a completion port.
+            iocp::unregister(&mut c, fd);
             match files.close(fd) {
                 Ok(_) => c.finish(TRUE),
                 Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
@@ -1426,7 +1485,20 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     }
 }
 
+/// address, the shadow space, and the two pushes the stub made.
+fn arg_n(c: &Call<'_>, n: usize) -> Option<usize> {
+    if n < 6 {
+        return Some(c.arg(n));
+    }
+    let sp = c.env.stack_pointer();
+    (sp != 0)
+        .then(|| c.read_u64(sp + 0x48 + 8 * (n - 6)))
+        .flatten()
+        .map(|v| v as usize)
+}
+
 mod file;
+mod iocp;
 mod locale;
 mod process;
 mod pyd;
@@ -1449,10 +1521,28 @@ fn write_file(c: &mut Call<'_>) -> Dispatch {
     if written != 0 && !c.write_u32(written, 0) {
         return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
     }
-    // An OVERLAPPED asks for asynchronous delivery, which the NT layer refuses
-    // too rather than quietly serving it synchronously.
+    // An OVERLAPPED asks for asynchronous delivery, which a handle reporting
+    // to a completion port gets; any other handle is refused rather than
+    // quietly served synchronously.
     if overlapped != 0 {
-        return c.fail_status(Ntstatus::NOT_IMPLEMENTED, FALSE);
+        let Ok(fd) = file::descriptor(handle) else {
+            return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
+        };
+        if !iocp::registered(c, fd) {
+            return c.fail_status(Ntstatus::NOT_IMPLEMENTED, FALSE);
+        }
+        return iocp::start(
+            c,
+            iocp::OP_WRITE,
+            fd,
+            overlapped,
+            buffer,
+            length,
+            0,
+            0,
+            written,
+            false,
+        );
     }
     let (status, information) =
         nt::transfer(c.host, true, handle, buffer, length, None).unwrap_or_else(|s| (s, 0));
@@ -1526,6 +1616,13 @@ fn process_cookie(c: &Call<'_>) -> u32 {
     }
 }
 
+/// Where the completion-port registrations hang: a word of the PEB's
+/// reserved area holding the first of them, or zero.
+pub(crate) const PEB_PORT_FILES: usize = 0x3D0;
+
+/// Where the process's error mode is kept: another reserved word of the PEB.
+pub(crate) const PEB_ERROR_MODE: usize = 0x3D8;
+
 /// Where the cookie is kept: another reserved word of the PEB.
 const PEB_COOKIE: usize = 0x3F0;
 /// Where a run-time load leaves the entry points still to be called with
@@ -1538,7 +1635,27 @@ pub(crate) const PEB_PENDING_ATTACH: usize = 0x3E8;
 /// cannot park on all their words, so it parks on this one instead: whatever
 /// is signalled bumps it and wakes everyone waiting that way, and each of them
 /// looks over its own objects again.
-pub(crate) const PEB_SIGNAL_SEQ: usize = 0x3F0;
+pub(crate) const PEB_SIGNAL_SEQ: usize = 0x3E0;
+
+// Each of these words is written for a different reason; sharing one would
+// let a signal rewrite the cookie under an encoded pointer.
+const _: () = assert!(
+    PEB_PORT_FILES != PEB_ERROR_MODE
+        && PEB_PORT_FILES != PEB_SIGNAL_SEQ
+        && PEB_PORT_FILES != PEB_COOKIE
+        && PEB_PORT_FILES != PEB_PENDING_ATTACH
+        && PEB_PORT_FILES != PEB_EXCEPTION_FILTER
+        && PEB_ERROR_MODE != PEB_SIGNAL_SEQ
+        && PEB_ERROR_MODE != PEB_COOKIE
+        && PEB_ERROR_MODE != PEB_PENDING_ATTACH
+        && PEB_ERROR_MODE != PEB_EXCEPTION_FILTER
+        && PEB_SIGNAL_SEQ != PEB_COOKIE
+        && PEB_SIGNAL_SEQ != PEB_PENDING_ATTACH
+        && PEB_SIGNAL_SEQ != PEB_EXCEPTION_FILTER
+        && PEB_COOKIE != PEB_PENDING_ATTACH
+        && PEB_COOKIE != PEB_EXCEPTION_FILTER
+        && PEB_PENDING_ATTACH != PEB_EXCEPTION_FILTER
+);
 
 /// TlsAlloc: the first clear bit of the PEB's TLS bitmap, set, with the slot
 /// cleared in this thread's TEB.
@@ -1715,12 +1832,21 @@ pub mod heap {
     /// Return a block to the free list so a later `alloc` can reuse it. The
     /// next-free link is stored in the block's own (now unused) data.
     pub(super) fn mark_free(c: &Call<'_>, heap: usize, block: usize) {
+        if block < BLOCK_HEADER {
+            return;
+        }
         super::sync::lock(c, heap + LOCK);
-        let header = block - BLOCK_HEADER;
-        let old = c.read_u64(heap + FREE_HEAD).unwrap_or(0);
-        c.write_u64(block - 8, FREE);
-        c.write_u64(block, old);
-        c.write_u64(heap + FREE_HEAD, header as u64);
+        // A block that is not in use is not put on the list again: the list
+        // links live in the blocks themselves, so a block on it twice is two
+        // callers handed the same memory, which corrupts whatever the second
+        // one is.
+        if c.read_u64(block - 8) == Some(IN_USE) {
+            let header = block - BLOCK_HEADER;
+            let old = c.read_u64(heap + FREE_HEAD).unwrap_or(0);
+            c.write_u64(block - 8, FREE);
+            c.write_u64(block, old);
+            c.write_u64(heap + FREE_HEAD, header as u64);
+        }
         super::sync::unlock(c, heap + LOCK);
     }
 }

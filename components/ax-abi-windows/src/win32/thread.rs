@@ -11,11 +11,14 @@
 use ax_abi_port::{MapRequest, MapSource, Prot};
 use ax_dispatch::Dispatch;
 
-use super::{Call, mapped, process::THREAD_TAG, runtime};
+use super::{Call, mapped, runtime};
 use crate::{
     dll,
     nt::Ntstatus,
-    teb_peb::{TEB_PEB, TEB_SELF, TEB_SIZE, TEB_STACK_BASE, TEB_STACK_LIMIT, TEB_TLS_POINTER},
+    teb_peb::{
+        TEB_PEB, TEB_SELF, TEB_SIZE, TEB_STACK_BASE, TEB_STACK_GUARANTEE, TEB_STACK_LIMIT,
+        TEB_TLS_POINTER,
+    },
     thunk,
 };
 
@@ -102,8 +105,14 @@ pub fn create_thread(c: &mut Call<'_>) -> Dispatch {
     if thread_id_out != 0 {
         c.write_u32(thread_id_out, tid);
     }
+    // The handle is an object the thread signals when it ends, which is what
+    // a join on it waits for; the thread finds its own through its block.
+    let Some(object) = super::sync::create_thread_object(c, tid) else {
+        return c.fail(super::ERROR_NOT_ENOUGH_MEMORY, 0);
+    };
+    c.write_u64(teb + crate::teb_peb::TEB_THREAD_OBJECT, object as u64);
     c.set_last_error(0);
-    c.finish(THREAD_TAG | tid as usize)
+    c.finish(object)
 }
 
 /// FreeLibraryAndExitThread(hLibModule, dwExitCode): let go of the library the
@@ -122,10 +131,58 @@ pub fn exit_thread(c: &mut Call<'_>) -> Dispatch {
 /// End the calling thread with `code`. The task does not come back from this;
 /// the finish is what the trap layer needs to see if it ever did.
 fn exit_with(c: &mut Call<'_>, code: i32) -> Dispatch {
+    // Whoever is joining this thread is waiting on its object, so it is
+    // signalled before the thread stops running.
+    if let Some(object) = c.read_u64(c.teb + crate::teb_peb::TEB_THREAD_OBJECT) {
+        super::sync::end_thread(c, object as usize, code as u32);
+    }
     if let Some(tasks) = c.host.tasks() {
         let _ = tasks.exit(code);
     }
     c.finish(0)
+}
+
+/// GetCurrentThreadStackLimits(LowLimit out, HighLimit out): the bounds this
+/// thread's TEB carries, which is where Windows keeps them too.
+pub fn stack_limits(c: &mut Call<'_>) -> Dispatch {
+    let (low_out, high_out) = (c.arg(0), c.arg(1));
+    let (Some(limit), Some(base)) = (
+        c.read_u64(c.teb + TEB_STACK_LIMIT),
+        c.read_u64(c.teb + TEB_STACK_BASE),
+    ) else {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+    };
+    if (low_out != 0 && !c.write_u64(low_out, limit))
+        || (high_out != 0 && !c.write_u64(high_out, base))
+    {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, 0);
+    }
+    c.finish(0)
+}
+
+/// SetThreadStackGuarantee(StackSizeInBytes in out): how much stack the thread
+/// keeps for handling an overflow. The word is read for the size wanted and
+/// written back with the one that was in force, rounded up to a page as
+/// Windows rounds it, and a request to shrink it is kept as the larger value.
+pub fn set_stack_guarantee(c: &mut Call<'_>) -> Dispatch {
+    let at = c.arg(0);
+    if at == 0 {
+        return c.fail(super::ERROR_INVALID_PARAMETER, super::FALSE);
+    }
+    let Some(wanted) = c.read_u32(at) else {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, super::FALSE);
+    };
+    let had = c.read_u32(c.teb + TEB_STACK_GUARANTEE).unwrap_or(0);
+    let wanted = if wanted == 0 {
+        had
+    } else {
+        had.max(wanted.next_multiple_of(0x1000))
+    };
+    if !c.write_u32(at, had) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, super::FALSE);
+    }
+    c.write_u32(c.teb + TEB_STACK_GUARANTEE, wanted);
+    c.finish(super::TRUE)
 }
 
 /// The thread-local blocks a starting thread needs, and the callbacks to run

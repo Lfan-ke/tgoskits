@@ -58,7 +58,7 @@ const STD_OUTPUT_HANDLE: usize = -11i32 as u32 as usize;
 const STD_ERROR_HANDLE: usize = -12i32 as u32 as usize;
 
 /// The process's current directory as Windows spells it, `Z:\\app\\`.
-fn current_directory(c: &Call<'_>) -> Option<String> {
+pub(super) fn current_directory(c: &Call<'_>) -> Option<String> {
     let params = c.params()?;
     let (len, buf) = c.unicode(params + PARAMS_CURRENT_DIRECTORY)?;
     let units = c.read_wide_n(buf, len / 2)?;
@@ -68,7 +68,7 @@ fn current_directory(c: &Call<'_>) -> Option<String> {
 /// A Windows name made absolute and normalized, still spelled the Windows
 /// way: `Z:\\app\\..\\x` becomes `Z:\\x`. Relative names go against the current
 /// directory; `\\\\?\\` is dropped; a device name has no place here.
-fn full_windows_path(c: &Call<'_>, name: &str) -> Option<String> {
+pub(super) fn full_windows_path(c: &Call<'_>, name: &str) -> Option<String> {
     let name = name.strip_prefix("\\\\?\\").unwrap_or(name);
     if name.starts_with("\\\\") {
         return None;
@@ -115,9 +115,35 @@ fn full_windows_path(c: &Call<'_>, name: &str) -> Option<String> {
     Some(out)
 }
 
+/// The host path a reserved DOS device name means, or nothing for an ordinary
+/// name.
+///
+/// Windows resolves these names before it looks at any directory
+/// (`RtlIsDosDeviceName_U`), so `C:\\tmp\\nul` is the null device as much as
+/// `nul` is, and an extension, a trailing colon, dots and spaces are ignored.
+/// The ports this machine does not have - `AUX`, `PRN`, `COM1`, `LPT1` - are
+/// left to fail as the names of files that are not there, which is what
+/// Windows answers for a port that is not fitted.
+fn dos_device(name: &str) -> Option<&'static str> {
+    // A name given the way that turns device resolution off is a path.
+    if name.starts_with("\\\\?\\") {
+        return None;
+    }
+    let tail = name.rsplit(['\\', '/']).next()?;
+    let stem = tail.split(['.', ':']).next()?.trim_end_matches([' ', '.']);
+    match stem.to_ascii_uppercase().as_str() {
+        "NUL" => Some("/dev/null"),
+        "CON" | "CONIN$" | "CONOUT$" => Some("/dev/console"),
+        _ => None,
+    }
+}
+
 /// The host path a Windows name means: the full path with its drive dropped,
 /// since one tree is all there is, and separators the host resolves.
 pub(super) fn host_path(c: &Call<'_>, name: &str) -> Option<String> {
+    if let Some(device) = dos_device(name) {
+        return Some(String::from(device));
+    }
     let full = full_windows_path(c, name)?;
     let path: String = full[2..]
         .chars()
@@ -222,13 +248,30 @@ pub fn read_file(c: &mut Call<'_>) -> Dispatch {
     if read != 0 && !c.write_u32(read, 0) {
         return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
     }
-    if overlapped != 0 {
-        return c.fail_status(Ntstatus::NOT_IMPLEMENTED, FALSE);
-    }
-    let handle = match descriptor(handle) {
-        Ok(fd) => Handle::from_slot(fd as usize).0 as usize,
+    let fd = match descriptor(handle) {
+        Ok(fd) => fd,
         Err(status) => return c.fail_status(status, FALSE),
     };
+    // A handle that reports to a completion port reads through it, which is
+    // what an overlapped read on one means.
+    if overlapped != 0 {
+        if !super::iocp::registered(c, fd) {
+            return c.fail_status(Ntstatus::NOT_IMPLEMENTED, FALSE);
+        }
+        return super::iocp::start(
+            c,
+            super::iocp::OP_READ,
+            fd,
+            overlapped,
+            buffer,
+            length,
+            0,
+            0,
+            read,
+            false,
+        );
+    }
+    let handle = Handle::from_slot(fd as usize).0 as usize;
     let (status, information) =
         nt::transfer(c.host, false, handle, buffer, length, None).unwrap_or_else(|s| (s, 0));
     if status != Ntstatus::SUCCESS && status != Ntstatus::END_OF_FILE {
@@ -615,6 +658,166 @@ pub fn get_file_attributes_w(c: &mut Call<'_>) -> Dispatch {
             c.finish(nt::file_attributes(&attr) as usize)
         }
         Err(errno) => c.fail_status(nt::status_from_errno(errno), INVALID_FILE_ATTRIBUTES),
+    }
+}
+
+/// SetFileAttributesW(lpFileName, dwFileAttributes).
+///
+/// Of the attributes a caller can set, only the read-only one means anything
+/// where files carry permission bits instead. Wine maps it the same way
+/// (`dlls/ntdll/unix/file.c`, `fd_set_file_info`): setting it clears the three
+/// write bits, and clearing it adds write permission only where read
+/// permission already is, so a file readable by its group does not become
+/// writable by everyone. A directory keeps its bits either way, as it does on
+/// Windows, where the attribute means something else there.
+pub fn set_file_attributes(c: &mut Call<'_>) -> Dispatch {
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    let (name, attributes) = (c.arg(0), c.arg(1) as u32);
+    let Some(path) = name_at(c, name).and_then(|n| host_path(c, &n)) else {
+        return c.fail(ERROR_PATH_NOT_FOUND, FALSE);
+    };
+    let Some(paths) = c.host.paths() else {
+        return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    let attr = match paths.attributes(At::Cwd, &path, true) {
+        Ok(attr) => attr,
+        Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
+    };
+    if attr.kind == NodeKind::Directory {
+        c.set_last_error(0);
+        return c.finish(TRUE);
+    }
+    let wanted = mode_for_attributes(attr.mode & 0o7777, attributes, paths.umask());
+    match paths.set_mode(At::Cwd, &path, wanted, true) {
+        Ok(()) => {
+            c.set_last_error(0);
+            c.finish(TRUE)
+        }
+        Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+    }
+}
+
+/// The permission bits a readonly attribute means, over the ones a file has.
+///
+/// Windows keeps one write bit for a file; Wine maps it onto the three the
+/// host keeps (`ntdll/unix/file.c`), and clearing it puts back the bits the
+/// process would have been allowed to create the file with.
+fn mode_for_attributes(mode: u32, attributes: u32, umask: u32) -> u32 {
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    if attributes & FILE_ATTRIBUTE_READONLY != 0 {
+        mode & !0o222
+    } else {
+        mode | ((0o200 | ((mode & 0o044) >> 1)) & !umask)
+    }
+}
+
+/// The nanoseconds a `FILETIME` means, or nothing when the field says to
+/// leave the time alone: zero for "no change", and -1 for "do not stamp this
+/// handle's writes", which is a request to change nothing here either.
+fn time_from_file_time(ticks: u64) -> Option<u64> {
+    if ticks == 0 || ticks == u64::MAX {
+        return None;
+    }
+    ticks
+        .checked_sub(super::TICKS_1601_TO_1970)
+        .map(|since| since.saturating_mul(100))
+}
+
+/// SetFileTime(hFile, lpCreationTime, lpLastAccessTime, lpLastWriteTime): the
+/// times a handle's file carries. There is no creation time to keep here, so
+/// that one is accepted and dropped, as it is on a filesystem that has none.
+pub fn set_file_time(c: &mut Call<'_>) -> Dispatch {
+    let (handle, accessed, written) = (c.arg(0), c.arg(2), c.arg(3));
+    let (Ok(fd), Some(paths)) = (descriptor(handle), c.host.paths()) else {
+        return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
+    };
+    let at = |at: usize| {
+        (at != 0)
+            .then(|| c.read_u64(at))
+            .flatten()
+            .and_then(time_from_file_time)
+    };
+    let (accessed, written) = (at(accessed), at(written));
+    if accessed.is_none() && written.is_none() {
+        c.set_last_error(0);
+        return c.finish(TRUE);
+    }
+    match paths.set_times_of(fd, accessed, written) {
+        Ok(()) => {
+            c.set_last_error(0);
+            c.finish(TRUE)
+        }
+        Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+    }
+}
+
+/// SetFileInformationByHandle(hFile, class, info, size): the classes that
+/// change a file this host can change - what it permits and how long it is.
+///
+/// A runtime reaches for this rather than `SetFileAttributesW` when it has a
+/// handle: CPython's `os.chmod` opens one and sets `FILE_BASIC_INFO`. Classes
+/// that name something this filesystem does not keep say so rather than
+/// report a change that did not happen.
+pub fn set_file_information_by_handle(c: &mut Call<'_>) -> Dispatch {
+    const FILE_BASIC_INFO: usize = 0;
+    const FILE_END_OF_FILE_INFO: usize = 6;
+    let (handle, class, info, size) = (c.arg(0), c.arg(1), c.arg(2), c.arg(3));
+    let Ok(fd) = descriptor(handle) else {
+        return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
+    };
+    match class {
+        // FILE_BASIC_INFO: four times, then the attributes.
+        FILE_BASIC_INFO => {
+            if size < 40 || info == 0 {
+                return c.fail(ERROR_INVALID_PARAMETER, FALSE);
+            }
+            let Some(paths) = c.host.paths() else {
+                return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+            };
+            let (Some(accessed), Some(written), Some(attributes)) = (
+                c.read_u64(info + 8),
+                c.read_u64(info + 16),
+                c.read_u32(info + 32),
+            ) else {
+                return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+            };
+            let (accessed, written) = (time_from_file_time(accessed), time_from_file_time(written));
+            if (accessed.is_some() || written.is_some())
+                && let Err(errno) = paths.set_times_of(fd, accessed, written)
+            {
+                return c.fail_status(nt::status_from_errno(errno), FALSE);
+            }
+            // Zero attributes leave them as they are; a directory has no
+            // write bit of its own to answer for.
+            if attributes != 0 {
+                let attr = match paths.attributes_of(fd) {
+                    Ok(attr) => attr,
+                    Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
+                };
+                if attr.kind != NodeKind::Directory {
+                    let wanted = mode_for_attributes(attr.mode & 0o7777, attributes, paths.umask());
+                    if let Err(errno) = paths.set_mode_of(fd, wanted) {
+                        return c.fail_status(nt::status_from_errno(errno), FALSE);
+                    }
+                }
+            }
+            c.set_last_error(0);
+            c.finish(TRUE)
+        }
+        // FILE_END_OF_FILE_INFO: one length, which is what the file becomes.
+        FILE_END_OF_FILE_INFO => {
+            let (Some(files), Some(length)) = (c.host.files(), c.read_u64(info)) else {
+                return c.fail(ERROR_INVALID_PARAMETER, FALSE);
+            };
+            match files.ftruncate(fd, length) {
+                Ok(_) => {
+                    c.set_last_error(0);
+                    c.finish(TRUE)
+                }
+                Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+            }
+        }
+        _ => c.fail(ERROR_INVALID_PARAMETER, FALSE),
     }
 }
 

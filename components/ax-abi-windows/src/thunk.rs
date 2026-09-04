@@ -346,8 +346,10 @@ mod tests {
 
     #[test]
     fn a_library_exported_by_ordinal_places_each_stub_under_its_ordinal() {
-        let lib = win32::LIBRARIES.len() - 1;
-        assert_eq!(win32::LIBRARIES[lib].name, "WS2_32.dll");
+        let lib = win32::LIBRARIES
+            .iter()
+            .position(|library| library.name == "WS2_32.dll")
+            .expect("the library exported by ordinal");
         let base = 0x1_4000_0000u64;
         let img = system_header(base, lib);
         let u32_at = |at: usize| u32::from_le_bytes(img[at..at + 4].try_into().unwrap());
