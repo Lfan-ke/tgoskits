@@ -910,3 +910,62 @@ pub fn sys_free_string(c: &mut Call<'_>) -> Dispatch {
 pub fn set_error_info(c: &mut Call<'_>) -> Dispatch {
     c.finish(0)
 }
+
+/// GetVersionExW(lpVersionInformation): the version, into either the plain
+/// `OSVERSIONINFOW` or the extended one, told apart by the size the caller
+/// filled in - which is how the call has always distinguished them.
+pub fn get_version_ex(c: &mut Call<'_>) -> Dispatch {
+    /// `OSVERSIONINFOW` and `OSVERSIONINFOEXW`, in bytes.
+    const PLAIN: u32 = 276;
+    const EXTENDED: u32 = 284;
+    let at = c.arg(0);
+    let Some(size) = c.read_u32(at) else {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+    };
+    if size != PLAIN && size != EXTENDED {
+        return c.fail(ERROR_INVALID_PARAMETER, FALSE);
+    }
+    let Some(ours) = version(c) else {
+        return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
+    };
+    for (offset, value) in [
+        (4, ours.major),
+        (8, ours.minor),
+        (12, ours.build),
+        (16, ours.platform),
+    ] {
+        if !c.write_u32(at + offset, value) {
+            return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+        }
+    }
+    // szCSDVersion: 128 characters, empty here - there is no service pack.
+    if !c.write_u32(at + 20, 0) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+    }
+    if size == EXTENDED {
+        for (offset, value) in [
+            (276u32, u32::from(ours.sp_major)),
+            (278, u32::from(ours.sp_minor)),
+            (280, u32::from(ours.suite)),
+        ] {
+            if !c.write(at + offset as usize, &(value as u16).to_le_bytes()) {
+                return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+            }
+        }
+        if !c.write(at + 282, &[ours.product, 0]) {
+            return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+        }
+    }
+    c.set_last_error(0);
+    c.finish(TRUE)
+}
+
+/// GetVersion(): the old form, which packs the same numbers into one word -
+/// major and minor in the low half, the build in the high half.
+pub fn get_version(c: &mut Call<'_>) -> Dispatch {
+    let Some(ours) = version(c) else {
+        return c.fail(ERROR_CALL_NOT_IMPLEMENTED, 0);
+    };
+    let packed = (ours.major & 0xFF) | ((ours.minor & 0xFF) << 8) | ((ours.build & 0x7FFF) << 16);
+    c.finish(packed as usize)
+}

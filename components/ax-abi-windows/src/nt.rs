@@ -3719,6 +3719,51 @@ mod tests {
     }
 
     #[test]
+    fn the_version_is_reported_in_both_shapes_of_the_block() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        with_modules(&host);
+        let at = 0x7000usize;
+        let read32 = |host: &MockHost, off: usize| read_u32(host, at + off);
+
+        // The plain OSVERSIONINFOW: the caller says which shape by its size.
+        put_bytes(&host, at, &276u32.to_le_bytes());
+        let mut plain = call("GetVersionExW", [at, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut plain, &host);
+        assert_eq!(plain.result, Some(1));
+        assert_eq!((read32(&host, 4), read32(&host, 8)), (10, 0), "10.0");
+        assert_eq!(read32(&host, 12), 19041, "the build");
+        assert_eq!(read32(&host, 16), 2, "VER_PLATFORM_WIN32_NT");
+        assert_eq!(read32(&host, 20), 0, "no service pack text");
+
+        // The extended one carries the service pack, suite and product too.
+        put_bytes(&host, at, &284u32.to_le_bytes());
+        let mut extended = call("GetVersionExW", [at, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut extended, &host);
+        assert_eq!(extended.result, Some(1));
+        {
+            let mem = host.mem.borrow();
+            let sp = u16::from_le_bytes(mem[at + 276..at + 278].try_into().unwrap());
+            let suite = u16::from_le_bytes(mem[at + 280..at + 282].try_into().unwrap());
+            assert_eq!(sp, 0);
+            assert_eq!(suite, 0x100, "VER_SUITE_SINGLEUSERTS");
+            assert_eq!(mem[at + 282], 1, "VER_NT_WORKSTATION");
+        }
+
+        // A size that is neither shape is refused.
+        put_bytes(&host, at, &8u32.to_le_bytes());
+        let mut odd = call("GetVersionExW", [at, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut odd, &host);
+        assert_eq!(odd.result, Some(0));
+
+        // The old form packs the same numbers into one word.
+        let mut packed = call("GetVersion", [0; 6], teb);
+        win32::dispatch(&mut packed, &host);
+        assert_eq!(packed.result, Some(10 | (0 << 8) | (19041 << 16)));
+    }
+
+    #[test]
     fn the_room_a_filesystem_has_is_reported_in_bytes() {
         use crate::win32;
         let host = MockHost {

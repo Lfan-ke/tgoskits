@@ -1328,6 +1328,8 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "VerSetConditionMask" => runtime::ver_set_condition_mask(&mut c),
         "VerifyVersionInfoW" => runtime::verify_version_info(&mut c),
         "VerifyVersionInfoA" => runtime::verify_version_info_ansi(&mut c),
+        "GetVersionExW" => runtime::get_version_ex(&mut c),
+        "GetVersion" => runtime::get_version(&mut c),
         "SetErrorMode" => runtime::set_error_mode(&mut c),
         "GetErrorMode" => runtime::get_error_mode(&mut c),
         "GetCurrentThreadStackLimits" => thread::stack_limits(&mut c),
