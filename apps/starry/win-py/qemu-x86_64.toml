@@ -11,8 +11,8 @@ to_bin = true
 shell_prefix = "root@starry:"
 shell_init_cmd = "/python/python.exe /suite/run_all.py"
 success_regex = ['(?m)^TEST PASSED']
-fail_regex = [
-    '(?i)Fatal Python error',
-    '(?i)panic',
-]
+# Only the machine failing ends the run: the suite prints its own verdict, and
+# t19 drives the interpreter's own error paths on purpose - a child that dies
+# with "Fatal Python error" is a check passing, not the run failing.
+fail_regex = ['(?i)panic']
 timeout = 6000

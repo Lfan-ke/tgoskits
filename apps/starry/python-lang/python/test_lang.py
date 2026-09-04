@@ -574,7 +574,13 @@ proc = subprocess.run(
     [sys.executable, "-m", "venv", "--without-pip", venv_dir],
     capture_output=True, text=True,
 )
-venv_py = os.path.join(venv_dir, "bin", "python")
+# Where the environment's interpreter lands is the platform's own layout:
+# Scripts\python.exe on Windows, bin/python elsewhere (venv's docs, and
+# sysconfig's "scripts" path).
+if sys.platform == "win32":
+    venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
+else:
+    venv_py = os.path.join(venv_dir, "bin", "python")
 venv_ok = (proc.returncode == 0 and os.path.exists(venv_py)
            and os.path.exists(os.path.join(venv_dir, "pyvenv.cfg")))
 if venv_ok:

@@ -783,7 +783,18 @@ import subprocess
 
 PY = sys.executable
 SH = "/bin/sh"
-_have_sh = os.path.exists(SH)
+# Which shell a command string runs through is the platform's own answer:
+# POSIX uses /bin/sh, Windows uses whatever %ComSpec% names (cmd.exe). A
+# machine with neither has no shell, and the checks below say so rather than
+# fail for the want of one.
+if sys.platform == "win32":
+    _shell = os.environ.get("ComSpec") or ""
+    _have_sh = bool(_shell) and os.path.exists(_shell)
+    _no_shell = "(skip: no %ComSpec% shell)"
+else:
+    _have_sh = os.path.exists(SH)
+    _no_shell = "(skip: no /bin/sh)"
+    _shell = SH
 
 # basic run with captured text output
 r = subprocess.run([PY, "-c", "print('hello-child')"], capture_output=True, text=True)
@@ -857,7 +868,7 @@ if _have_sh:
     r_sh = subprocess.run("echo shellmode", shell=True, capture_output=True, text=True)
     chk("sp_run_shell", r_sh.returncode == 0 and r_sh.stdout == "shellmode\n")
 else:
-    chk("sp_run_shell", True, "(skip: no /bin/sh)")
+    chk("sp_run_shell", True, _no_shell)
 
 # stdin=PIPE with no input= : child sees EOF on stdin immediately
 r_eof = subprocess.run([PY, "-c", "import sys; sys.stdout.write('eof:%d' % len(sys.stdin.read()))"],
@@ -930,11 +941,11 @@ chk("sp_popen_poll_lifecycle", (poll_running is None or poll_running == 0)
 
 # Popen with /bin/sh child if available (covers shell exec path)
 if _have_sh:
-    ps = subprocess.Popen([SH, "-c", "echo shellout"], stdout=subprocess.PIPE, text=True)
+    ps = subprocess.Popen([_shell, "-c", "echo shellout"], stdout=subprocess.PIPE, text=True)
     so, _ = ps.communicate()
     chk("sp_popen_sh", so == "shellout\n" and ps.returncode == 0)
 else:
-    chk("sp_popen_sh", True, "(skip: no /bin/sh)")
+    chk("sp_popen_sh", True, _no_shell)
 
 # pid attribute is a positive integer
 p4 = subprocess.Popen([PY, "-c", ""])

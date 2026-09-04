@@ -39,6 +39,17 @@ done
 install -d "$overlay_dir/python/Lib"
 unzip -qo "$dll_dir/python314.zip" -d "$overlay_dir/python/Lib"
 
+# The embeddable distribution leaves venv out of its archive, so the module
+# comes from the official source release of the same version - the pure-Python
+# package as CPython ships it, no third party in it.
+venv_src="${STARRY_PY_SOURCE:-$dll_dir/Python-3.14.7.tgz}"
+if [[ ! -f "$venv_src" ]]; then
+    curl -fsSL -o "$venv_src" \
+        "https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tgz"
+fi
+tar -xzf "$venv_src" -C "$overlay_dir/python/Lib" \
+    --strip-components=2 "Python-3.14.7/Lib/venv"
+
 # A python._pth beside the executable pins sys.path to exactly these entries
 # (each resolved relative to the executable's directory) and disables the
 # prefix landmark / realpath search that fails on this host. Lib holds the
@@ -76,3 +87,5 @@ install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_thread.py" 
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/child_capture.py" "$overlay_dir/python/child_capture.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_gaps.py" "$overlay_dir/python/probe_gaps.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_wait.py" "$overlay_dir/python/probe_wait.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_failing.py" "$overlay_dir/python/probe_failing.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_cli.py" "$overlay_dir/python/probe_cli.py"
