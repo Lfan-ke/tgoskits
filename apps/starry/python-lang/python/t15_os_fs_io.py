@@ -347,15 +347,29 @@ chk("path_getmtime", os.path.getmtime(_sf) == st.st_mtime)
 # to actually stick (a kernel that ignores chmod without raising is a bug we
 # want to surface, not paper over).
 # ============================================================================
+# On Windows a file has one read-only bit rather than nine permission bits,
+# and os.chmod sets that bit from the write bits of the mode (posixmodule.c).
+# So the mode does not read back as it was written there; what must hold is
+# that taking write away makes the file read-only and giving it back makes it
+# writable, and that the change is real either way. CPython's own test suite
+# splits the same way (test_os.ChmodTests).
 _cf = os.path.join(SBX, "perm.txt")
 open(_cf, "w").close()
 try:
-    os.chmod(_cf, 0o640)
-    _mode = statmod.S_IMODE(os.stat(_cf).st_mode)
-    chk("chmod", _mode == 0o640, "mode=%o" % _mode)
-    # A second distinct mode confirms it isn't latched at one value.
-    os.chmod(_cf, 0o600)
-    chk("chmod_again", statmod.S_IMODE(os.stat(_cf).st_mode) == 0o600)
+    if sys.platform == "win32":
+        os.chmod(_cf, 0o444)
+        _mode = statmod.S_IMODE(os.stat(_cf).st_mode)
+        chk("chmod", _mode & 0o222 == 0, "mode=%o" % _mode)
+        os.chmod(_cf, 0o666)
+        _mode = statmod.S_IMODE(os.stat(_cf).st_mode)
+        chk("chmod_again", _mode & 0o222 != 0, "mode=%o" % _mode)
+    else:
+        os.chmod(_cf, 0o640)
+        _mode = statmod.S_IMODE(os.stat(_cf).st_mode)
+        chk("chmod", _mode == 0o640, "mode=%o" % _mode)
+        # A second distinct mode confirms it isn't latched at one value.
+        os.chmod(_cf, 0o600)
+        chk("chmod_again", statmod.S_IMODE(os.stat(_cf).st_mode) == 0o600)
 except OSError as e:
     chk("chmod", False, "errno=%d" % e.errno)
     chk("chmod_again", False, "errno=%d" % e.errno)
@@ -1051,11 +1065,18 @@ _pst = ptxt.stat()
 chk("path_stat", _pst.st_size == len("hi pathlib") and statmod.S_ISREG(_pst.st_mode))
 # Path.chmod(): set the mode through the Path object; CPython documents it as
 # os.chmod on the path, so we require the bits to actually stick (a silent
-# no-op kernel must be caught, not papered over — #573).
+# no-op kernel must be caught, not papered over — #573). Windows keeps one
+# read-only bit, so there the write bits are what is checked, as above.
 try:
-    ptxt.chmod(0o644)
-    chk("path_chmod", statmod.S_IMODE(ptxt.stat().st_mode) == 0o644,
-        "mode=%o" % statmod.S_IMODE(ptxt.stat().st_mode))
+    if sys.platform == "win32":
+        ptxt.chmod(0o444)
+        _pm = statmod.S_IMODE(ptxt.stat().st_mode)
+        chk("path_chmod", _pm & 0o222 == 0, "mode=%o" % _pm)
+        ptxt.chmod(0o644)
+    else:
+        ptxt.chmod(0o644)
+        chk("path_chmod", statmod.S_IMODE(ptxt.stat().st_mode) == 0o644,
+            "mode=%o" % statmod.S_IMODE(ptxt.stat().st_mode))
 except OSError as e:
     chk("path_chmod", False, "errno=%d" % e.errno)
 

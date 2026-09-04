@@ -9,8 +9,8 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/python/python.exe /suite/t22_net_devices.py"
-success_regex = ['(?m)^PY_NETDEV_OK']
+shell_init_cmd = "/python/python.exe /suite/run_all.py"
+success_regex = ['(?m)^TEST PASSED']
 fail_regex = [
     '(?i)Fatal Python error',
     '(?i)panic',

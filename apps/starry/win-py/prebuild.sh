@@ -73,3 +73,6 @@ done
 # in one interpreter instead.
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/suite_inproc.py" "$overlay_dir/python/suite_inproc.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_thread.py" "$overlay_dir/python/probe_thread.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/child_capture.py" "$overlay_dir/python/child_capture.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_gaps.py" "$overlay_dir/python/probe_gaps.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_wait.py" "$overlay_dir/python/probe_wait.py"
