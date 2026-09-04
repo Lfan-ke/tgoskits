@@ -1465,6 +1465,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             // think it reports to a completion port or is a pipe.
             iocp::unregister(&mut c, fd);
             pipe::forget(&mut c, fd);
+            file::close_temporary(&mut c, fd);
             match files.close(fd) {
                 Ok(_) => c.finish(TRUE),
                 Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
@@ -1666,6 +1667,9 @@ pub(crate) const PEB_PORT_FILES: usize = 0x3D0;
 /// Where the pipes this process has hang, the same way.
 pub(crate) const PEB_PIPES: usize = 0x3C8;
 
+/// Where the names that go when their handle closes hang, the same way.
+pub(crate) const PEB_TEMP_FILES: usize = 0x3C0;
+
 /// Where the process's error mode is kept: another reserved word of the PEB.
 pub(crate) const PEB_ERROR_MODE: usize = 0x3D8;
 
@@ -1686,7 +1690,14 @@ pub(crate) const PEB_SIGNAL_SEQ: usize = 0x3E0;
 // Each of these words is written for a different reason; sharing one would
 // let a signal rewrite the cookie under an encoded pointer.
 const _: () = assert!(
-    PEB_PIPES != PEB_PORT_FILES
+    PEB_TEMP_FILES != PEB_PIPES
+        && PEB_TEMP_FILES != PEB_PORT_FILES
+        && PEB_TEMP_FILES != PEB_ERROR_MODE
+        && PEB_TEMP_FILES != PEB_SIGNAL_SEQ
+        && PEB_TEMP_FILES != PEB_COOKIE
+        && PEB_TEMP_FILES != PEB_PENDING_ATTACH
+        && PEB_TEMP_FILES != PEB_EXCEPTION_FILTER
+        && PEB_PIPES != PEB_PORT_FILES
         && PEB_PIPES != PEB_ERROR_MODE
         && PEB_PIPES != PEB_SIGNAL_SEQ
         && PEB_PIPES != PEB_COOKIE

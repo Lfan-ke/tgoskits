@@ -1119,6 +1119,8 @@ mod tests {
         moded: RefCell<Option<(String, u32)>>,
         /// The descriptor whose times were set, and to what.
         stamped: RefCell<Option<(i32, Option<u64>, Option<u64>)>>,
+        /// The name that was unlinked, if one was.
+        unlinked: RefCell<Option<String>>,
         /// What this process ended with, if it did.
         ended: RefCell<Option<i32>>,
         /// Who was signalled, and with what.
@@ -1159,6 +1161,7 @@ mod tests {
                 sockets: RefCell::default(),
                 moded: RefCell::default(),
                 stamped: RefCell::default(),
+                unlinked: RefCell::default(),
                 ended: RefCell::default(),
                 killed: RefCell::default(),
                 kills: core::cell::Cell::new(true),
@@ -1620,6 +1623,10 @@ mod tests {
         }
         fn attributes_of(&self, _fd: i32) -> Result<Attributes, i32> {
             self.describes.clone().ok_or(ax_abi_port::EBADF)
+        }
+        fn unlink(&self, _at: At, path: &str) -> Result<(), i32> {
+            *self.unlinked.borrow_mut() = Some(String::from(path));
+            Ok(())
         }
         fn set_mode(&self, _at: At, path: &str, mode: u32, _follow: bool) -> Result<(), i32> {
             *self.moded.borrow_mut() = Some((String::from(path), mode));
@@ -3703,6 +3710,47 @@ mod tests {
             let mem = host.mem.borrow();
             assert_eq!(&mem[buffer..buffer + 5], b"hello");
         }
+    }
+
+    #[test]
+    fn a_file_opened_to_be_deleted_on_close_is_unlinked_when_it_is() {
+        use crate::win32;
+        const FILE_FLAG_DELETE_ON_CLOSE: usize = 0x0400_0000;
+        let host = MockHost {
+            opens_at: Ok(5),
+            has_paths: true,
+            ..MockHost::default()
+        };
+        let (teb, _) = process(&host);
+        put_wide(&host, 0x7000, "Z:\\tmp\\scratch\0");
+
+        // CREATE_ALWAYS with the flag that says the name goes with the handle.
+        let mut opened = call(
+            "CreateFileW",
+            [0x7000, 0xC000_0000, 0, 0, 2, FILE_FLAG_DELETE_ON_CLOSE],
+            teb,
+        );
+        win32::dispatch(&mut opened, &host);
+        let handle = opened.result.expect("a file");
+        assert!(host.unlinked.borrow().is_none(), "not while it is open");
+
+        let mut closed = call("CloseHandle", [handle, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut closed, &host);
+        assert_eq!(closed.result, Some(1));
+        assert_eq!(
+            host.unlinked.borrow().as_deref(),
+            Some("/tmp/scratch"),
+            "closing it takes the name with it"
+        );
+
+        // A file opened without the flag is left where it is.
+        let mut plain = call("CreateFileW", [0x7000, 0xC000_0000, 0, 0, 2, 0], teb);
+        win32::dispatch(&mut plain, &host);
+        let plain = plain.result.expect("a file");
+        *host.unlinked.borrow_mut() = None;
+        let mut closed = call("CloseHandle", [plain, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut closed, &host);
+        assert!(host.unlinked.borrow().is_none());
     }
 
     #[test]

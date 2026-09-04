@@ -39,6 +39,9 @@ const NT_DISPOSITION: [usize; 5] = [
 const SYNCHRONIZE: usize = 0x0010_0000;
 const FILE_READ_ATTRIBUTES: usize = 0x80;
 const FILE_FLAG_BACKUP_SEMANTICS: usize = 0x0200_0000;
+/// `FILE_FLAG_DELETE_ON_CLOSE`: the name goes when the last handle does,
+/// which is how a temporary file cleans up after itself.
+const FILE_FLAG_DELETE_ON_CLOSE: usize = 0x0400_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: usize = 0x0020_0000;
 const FILE_NON_DIRECTORY_FILE: usize = 0x40;
 const FILE_OPEN_REPARSE_POINT: usize = 0x0020_0000;
@@ -240,10 +243,82 @@ pub fn create_file(c: &mut Call<'_>) -> Dispatch {
             // OPEN_ALWAYS is not reported by the host, so the last error is
             // cleared rather than guessed at.
             c.set_last_error(0);
+            if attributes & FILE_FLAG_DELETE_ON_CLOSE != 0 {
+                remember_temporary(c, fd as i32, &path);
+            }
             let handle = Handle::from_slot(slot).0 as usize;
             c.finish(handle)
         }
         Err(errno) => c.fail_status(nt::status_from_errno(errno), INVALID_HANDLE_VALUE),
+    }
+}
+
+/// What a descriptor opened to be deleted on close remembers: which one it
+/// is, and the name to unlink.
+const TEMP_NEXT: usize = 0;
+const TEMP_FD: usize = 8;
+const TEMP_LEN: usize = 12;
+const TEMP_PATH: usize = 16;
+
+/// Remember that closing `fd` takes `path` with it.
+fn remember_temporary(c: &mut Call<'_>, fd: i32, path: &str) {
+    let (Some(peb), Some(heap)) = (
+        c.peb(),
+        c.peb()
+            .and_then(|peb| c.read_u64(peb + crate::teb_peb::PEB_PROCESS_HEAP))
+            .map(|heap| heap as usize),
+    ) else {
+        return;
+    };
+    let Some(block) = super::heap::alloc(c, heap, TEMP_PATH + path.len()) else {
+        return;
+    };
+    let head = c.read_u64(peb + super::PEB_TEMP_FILES).unwrap_or(0);
+    c.write_u64(block + TEMP_NEXT, head);
+    c.write_u32(block + TEMP_FD, fd as u32);
+    c.write_u32(block + TEMP_LEN, path.len() as u32);
+    if !c.write(block + TEMP_PATH, path.as_bytes()) {
+        return;
+    }
+    c.write_u64(peb + super::PEB_TEMP_FILES, block as u64);
+}
+
+/// Unlink what closing `fd` takes with it, if anything. Whether there was
+/// something is the caller's business only in that it happens before the
+/// number goes back to the host.
+pub(super) fn close_temporary(c: &mut Call<'_>, fd: i32) {
+    let Some(peb) = c.peb() else { return };
+    let mut at = c.read_u64(peb + super::PEB_TEMP_FILES).unwrap_or(0) as usize;
+    let mut previous = 0usize;
+    while at != 0 {
+        let next = c.read_u64(at + TEMP_NEXT).unwrap_or(0) as usize;
+        if c.read_u32(at + TEMP_FD) == Some(fd as u32) {
+            if previous == 0 {
+                c.write_u64(peb + super::PEB_TEMP_FILES, next as u64);
+            } else {
+                c.write_u64(previous + TEMP_NEXT, next as u64);
+            }
+            let len = c.read_u32(at + TEMP_LEN).unwrap_or(0) as usize;
+            let mut bytes = alloc::vec![0u8; len];
+            if c.host
+                .platform()
+                .read_user(at + TEMP_PATH, &mut bytes)
+                .is_ok()
+                && let Ok(path) = core::str::from_utf8(&bytes)
+                && let Some(paths) = c.host.paths()
+            {
+                let _ = paths.unlink(At::Cwd, path);
+            }
+            if let Some(heap) = c
+                .peb()
+                .and_then(|peb| c.read_u64(peb + crate::teb_peb::PEB_PROCESS_HEAP))
+            {
+                super::heap::mark_free(c, heap as usize, at);
+            }
+        } else {
+            previous = at;
+        }
+        at = next;
     }
 }
 
