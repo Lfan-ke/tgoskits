@@ -35,6 +35,17 @@ for label, flush in (("with an explicit flush", "True"), ("with no flush", "Fals
     r = subprocess.run([PY, "-c", CRT % flush], capture_output=True, text=True)
     print("  %s rc=%r out=%r err=%r" % (label, r.returncode, r.stdout, r.stderr[-200:]), flush=True)
 
+# How the process ends is the other half: the C runtime's own exit, Python's,
+# and the one that skips every cleanup.
+for _label, _ending in (("crt exit", "crt.exit(0)"),
+                        ("python exit", "sys.exit(0)"),
+                        ("raw exit", "import os; os._exit(0)")):
+    _program = ('import ctypes, sys\n'
+                'crt = ctypes.CDLL("ucrtbase.dll")\n'
+                'crt.puts(b"crt-puts")\n' + _ending + '\n')
+    _r = subprocess.run([PY, "-c", _program], capture_output=True, text=True)
+    print("  ends with %s rc=%r out=%r" % (_label, _r.returncode, _r.stdout), flush=True)
+
 print("=== into a file", flush=True)
 to_file("-V", ["-V"])
 to_file("-h", ["-h"])
