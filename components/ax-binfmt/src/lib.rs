@@ -21,6 +21,7 @@ pub use ax_dispatch::Abi;
 use bitflags::bitflags;
 pub use linkme;
 
+pub mod dyld;
 pub mod macho;
 pub mod pe;
 

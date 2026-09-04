@@ -5,9 +5,12 @@
 //! `ax-abi-windows` does for PE. This is the loader half: map `LC_SEGMENT_64`
 //! segments and find the `LC_MAIN` entry point, transcribed from
 //! `<mach-o/loader.h>` atop [`ax_binfmt::macho`]. Darwin binaries are dyld-based
-//! and position-independent; dyld and chained fixups (the Mach-O analogue of PE
-//! imports/relocations) arrive in a later phase. The BSD calls it services live
-//! in [`bsd`]; Mach traps belong to a layer that is not here yet.
+//! and position-independent; what dyld does for them - the rebase and bind
+//! opcode streams of `LC_DYLD_INFO_ONLY`, which is what the 3.14 binaries
+//! carry rather than chained fixups - is read by [`ax_binfmt::dyld`] and
+//! applied in a later phase, once there is a libSystem to bind against. The
+//! BSD calls it services live in [`bsd`]; Mach traps belong to a layer that
+//! is not here yet.
 
 #![cfg_attr(not(test), no_std)]
 #![feature(used_with_arg)]
