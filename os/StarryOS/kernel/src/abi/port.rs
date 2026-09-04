@@ -231,7 +231,14 @@ impl Paths for KernelHost {
         let dir = Directory::from_fd(fd).map_err(errno)?;
         let mut stop = false;
         dir.inner()
-            .read_dir(0, &mut |name: &str, _ino, node_type, _offset| {
+            .read_dir(
+                axfs_ng_vfs::DirectoryCursor::START,
+                &mut |name: &[u8], _ino, node_type, _cursor| {
+                // A name the filesystem holds as bytes may not be text; one
+                // that is not is skipped rather than guessed at.
+                let Ok(name) = core::str::from_utf8(name) else {
+                    return true;
+                };
                 if name == "." || name == ".." {
                     return true;
                 }
@@ -249,10 +256,75 @@ impl Paths for KernelHost {
                     return false;
                 }
                 true
-            })
+                },
+            )
             .map_err(|e| errno(e.into()))?;
         let _ = stop;
         Ok(())
+    }
+
+    fn umask(&self) -> u32 {
+        current().as_thread().proc_data.umask() as u32
+    }
+
+    fn set_mode(&self, at: At, path: &str, mode: u32, follow: bool) -> Result<(), i32> {
+        let flags = if follow { 0 } else { AT_SYMLINK_NOFOLLOW };
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let Some(location) = resolve_at(dirfd, Some(path), flags)
+            .map_err(errno)?
+            .into_file()
+        else {
+            return Err(errno(StarryError::NotADirectory));
+        };
+        location
+            .update_metadata(axfs_ng_vfs::MetadataUpdate {
+                mode: Some(NodePermission::from_bits_truncate(mode as u16)),
+                ..Default::default()
+            })
+            .map_err(|e| errno(e.into()))
+    }
+
+    fn set_mode_of(&self, fd: i32, mode: u32) -> Result<(), i32> {
+        let Some(location) = resolve_at(fd, None, AT_EMPTY_PATH)
+            .map_err(errno)?
+            .into_file()
+        else {
+            return Err(errno(StarryError::NotADirectory));
+        };
+        location
+            .update_metadata(axfs_ng_vfs::MetadataUpdate {
+                mode: Some(NodePermission::from_bits_truncate(mode as u16)),
+                ..Default::default()
+            })
+            .map_err(|e| errno(e.into()))
+    }
+
+    fn set_times(
+        &self,
+        at: At,
+        path: &str,
+        accessed: Option<u64>,
+        modified: Option<u64>,
+        follow: bool,
+    ) -> Result<(), i32> {
+        let flags = if follow { 0 } else { AT_SYMLINK_NOFOLLOW };
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        set_times(resolve_at(dirfd, Some(path), flags), accessed, modified)
+    }
+
+    fn set_times_of(
+        &self,
+        fd: i32,
+        accessed: Option<u64>,
+        modified: Option<u64>,
+    ) -> Result<(), i32> {
+        set_times(resolve_at(fd, None, AT_EMPTY_PATH), accessed, modified)
     }
 
     fn permitted(
@@ -299,6 +371,24 @@ fn access_mode(wants: Access) -> u32 {
 }
 
 /// Restate what the filesystem said in the neutral shape the port speaks.
+/// Stamp a resolved name with the times given, leaving out what was not.
+fn set_times(
+    resolved: StarryResult<ResolveAtResult>,
+    accessed: Option<u64>,
+    modified: Option<u64>,
+) -> Result<(), i32> {
+    let Some(location) = resolved.map_err(errno)?.into_file() else {
+        return Err(errno(StarryError::NotADirectory));
+    };
+    location
+        .update_metadata(axfs_ng_vfs::MetadataUpdate {
+            atime: accessed.map(Duration::from_nanos),
+            mtime: modified.map(Duration::from_nanos),
+            ..Default::default()
+        })
+        .map_err(|e| errno(e.into()))
+}
+
 fn describe(resolved: StarryResult<ResolveAtResult>) -> Result<Attributes, i32> {
     let stat = resolved.and_then(|r| r.stat()).map_err(errno)?;
     // The mode carries the node type in its top bits, which is where every

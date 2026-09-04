@@ -239,7 +239,7 @@ pub struct OpenHow {
 /// fields are in another order - while agreeing on what the facts are. The
 /// times are since the epoch, which is the one origin all three count from.
 #[cfg(feature = "paths")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Attributes {
     /// What kind of node this is.
     pub kind: NodeKind,
@@ -291,9 +291,10 @@ pub struct Access {
 /// The set every ABI distinguishes; one that does not care about a distinction
 /// simply does not look at it.
 #[cfg(feature = "paths")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NodeKind {
     /// An ordinary file.
+    #[default]
     File,
     /// A directory.
     Directory,
@@ -333,6 +334,47 @@ pub trait Paths: Sync {
 
     /// Describe what an open descriptor refers to.
     fn attributes_of(&self, fd: i32) -> Result<Attributes, i32>;
+
+    /// Change what a name permits, to the nine permission bits every one of
+    /// these systems keeps under some name of its own.
+    fn set_mode(&self, _at: At, _path: &str, _mode: u32, _follow: bool) -> Result<(), i32> {
+        Err(38)
+    }
+
+    /// Change what an open descriptor permits, the same nine bits.
+    fn set_mode_of(&self, _fd: i32, _mode: u32) -> Result<(), i32> {
+        Err(38)
+    }
+
+    /// Change when a name was last read and last written, in nanoseconds
+    /// since the epoch; a time left out is left as it is.
+    fn set_times(
+        &self,
+        _at: At,
+        _path: &str,
+        _accessed: Option<u64>,
+        _modified: Option<u64>,
+        _follow: bool,
+    ) -> Result<(), i32> {
+        Err(38)
+    }
+
+    /// The same for an open descriptor.
+    fn set_times_of(
+        &self,
+        _fd: i32,
+        _accessed: Option<u64>,
+        _modified: Option<u64>,
+    ) -> Result<(), i32> {
+        Err(38)
+    }
+
+    /// The permission bits this process withholds from what it creates. An
+    /// ABI with no such notion still has to respect it when it decides bits
+    /// on the caller's behalf.
+    fn umask(&self) -> u32 {
+        0
+    }
 
     /// Whether the caller may reach `path` in the ways `wants` names.
     ///
