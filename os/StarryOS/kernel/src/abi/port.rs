@@ -549,10 +549,10 @@ impl Files for KernelHost {
         Ok(0)
     }
 
-    fn pipe(&self) -> Result<(i32, i32), i32> {
+    fn pipe(&self, cloexec: bool) -> Result<(i32, i32), i32> {
         let (read_end, write_end) = Pipe::new();
-        let read_fd = read_end.add_to_fd_table(true).map_err(errno)?;
-        let write_fd = write_end.add_to_fd_table(true).map_err(|err| {
+        let read_fd = read_end.add_to_fd_table(cloexec).map_err(errno)?;
+        let write_fd = write_end.add_to_fd_table(cloexec).map_err(|err| {
             let _ = close_file_like(read_fd);
             errno(err)
         })?;

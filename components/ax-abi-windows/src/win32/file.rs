@@ -553,10 +553,13 @@ pub fn duplicate_handle(c: &mut Call<'_>) -> Dispatch {
         ));
         return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
     };
-    // Into another process the handle needs no new number: the child started
-    // with the descriptors its parent had, so the value the parent is about
-    // to send it already names the same thing there. Duplicating instead
-    // would hand it a number of the parent's that the child never got.
+    // Which process the handle is being read out of, or written into, does not
+    // change what it names: a child starts with the descriptors its parent
+    // had, so one number means one thing in both. That is what makes a spawn
+    // work in both directions - the parent sends the child a number and the
+    // child duplicates it out of the parent - and it is why crossing into
+    // another process hands back the same value rather than a new one, which
+    // would be a number of this process's that the other never got.
     let handle = if elsewhere(c, target) {
         source as u64
     } else {
@@ -1200,7 +1203,11 @@ pub fn create_pipe(c: &mut Call<'_>) -> Dispatch {
     let Some(files) = c.host.files() else {
         return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
     };
-    let (read_fd, write_fd) = match files.pipe() {
+    // Not close-on-exec: a child here starts with the descriptors its parent
+    // had, and that is how a handle reaches it - a spawn hands the child a
+    // number and has it duplicate what the number names. An end that went at
+    // exec would leave the child duplicating nothing.
+    let (read_fd, write_fd) = match files.pipe(false) {
         Ok(ends) => ends,
         Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
     };

@@ -36,6 +36,20 @@ for i, (handle, initial) in enumerate(made):
     print("  sem%d takes=%r want=%r %s"
           % (i, got, want, "ok" if got == want else "WRONG"), flush=True)
 
+print("== what multiprocessing sees, on the same objects", flush=True)
+import multiprocessing as mp
+
+ctx = mp.get_context("spawn")
+s0 = ctx.Semaphore(0)
+print("  Semaphore(0) handle=%#x" % s0._semlock.handle, flush=True)
+print("  its own acquire(False) = %r (want False)" % s0.acquire(False), flush=True)
+print("  a raw wait on the same handle = %d (want 258)"
+      % take(s0._semlock.handle), flush=True)
+ev = ctx.Event()
+print("  Event() flag handle=%#x raw wait=%d (want 258)"
+      % (ev._flag._semlock.handle, take(ev._flag._semlock.handle)), flush=True)
+print("  Event().is_set() = %r (want False)" % ev.is_set(), flush=True)
+
 print("== the same pipe through ctypes, no _winapi in the way", flush=True)
 PIPE_ACCESS_DUPLEX = 0x00000003
 FILE_FLAG_OVERLAPPED = 0x40000000

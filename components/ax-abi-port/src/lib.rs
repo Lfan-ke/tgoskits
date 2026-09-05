@@ -505,8 +505,10 @@ pub trait Files: Sync {
         Err(38)
     }
     fn dup(&self, fd: i32) -> SysResult;
-    /// A pipe: the read end and the write end, as descriptors.
-    fn pipe(&self) -> Result<(i32, i32), i32> {
+    /// A pipe: the read end and the write end, as descriptors. `cloexec` says
+    /// whether they go when the process runs a new image - which is the
+    /// caller's to decide, since one ABI's default is the other's flag.
+    fn pipe(&self, _cloexec: bool) -> Result<(i32, i32), i32> {
         Err(38)
     }
     fn seek(&self, fd: i32, to: SeekFrom) -> SysResult;
