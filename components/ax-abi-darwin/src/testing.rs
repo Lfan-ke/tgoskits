@@ -60,6 +60,8 @@ impl TrapEnv for Trap {
 pub struct MockHost {
     pub wrote: RefCell<Option<(i32, usize, usize)>>,
     pub closed: RefCell<Option<i32>>,
+    /// The status this process ended with, if it did.
+    pub ended: RefCell<Option<i32>>,
     /// The runs the last scatter-gather transfer named.
     pub gathered: RefCell<Vec<(usize, usize)>>,
     /// The name a permission question was asked about, what it wanted, and
@@ -213,7 +215,8 @@ impl Tasks for MockHost {
     fn exit(&self, _status: i32) -> SysResult {
         Ok(0)
     }
-    fn exit_group(&self, _status: i32) -> SysResult {
+    fn exit_group(&self, status: i32) -> SysResult {
+        *self.ended.borrow_mut() = Some(status);
         Ok(0)
     }
 }

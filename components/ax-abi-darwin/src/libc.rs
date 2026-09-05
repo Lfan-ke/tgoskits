@@ -21,6 +21,10 @@ use crate::{bsd::nr, system::DarwinCall};
 /// answers with.
 const ENOSYS: i32 = 78;
 
+/// The wait status of a program that aborted: killed by signal six, with no
+/// exit code of its own.
+const SIGABRT: i32 = 6;
+
 /// Service a call that came through one of the library's stubs.
 pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     let Ok(nr) = u32::try_from(env.nr()) else {
@@ -104,6 +108,14 @@ fn route(host: &dyn Host, call: DarwinCall, a: &[usize; 6]) -> Option<SysResult>
         // stdio to flush; until then it is the same as leaving.
         "_exit" => host.tasks()?.exit_group((a[0] as i32) << 8),
         "_dup" => host.files()?.dup(a[0] as i32),
+        // Both of these end the program on purpose and neither returns. The
+        // status is the one a shell reports for a process killed by SIGABRT,
+        // which is what a real abort turns into.
+        "_abort" | "___stack_chk_fail" => {
+            host.platform()
+                .trace(&alloc::format!("{name} ended the program"));
+            host.tasks()?.exit_group(SIGABRT)
+        }
         _ => return None,
     })
 }
@@ -166,6 +178,17 @@ mod tests {
         for (name, _) in CALLS {
             assert!(Library::call(name).is_some(), "{name} is an entry point");
         }
+    }
+
+    #[test]
+    fn abort_ends_the_program_rather_than_returning_to_it() {
+        let host = MockHost::default();
+        let mut env = Trap::at(nr("_abort"), [0; 6]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(*host.ended.borrow(), Some(SIGABRT));
+        let mut guard = Trap::at(nr("___stack_chk_fail"), [0; 6]);
+        assert_eq!(dispatch(&mut guard, &host), Dispatch::Handled);
+        assert_eq!(*host.ended.borrow(), Some(SIGABRT));
     }
 
     #[test]

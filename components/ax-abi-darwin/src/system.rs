@@ -494,6 +494,73 @@ impl Library {
 /// what the ABI lets it.
 pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
     Some(match call.name() {
+        // The ASCII case pair, which is what these are in the C locale.
+        "___toupper" => &[
+            0x89, 0xF8, // mov %edi,%eax
+            0x83, 0xF8, 0x61, 0x7C, 0x08, // cmp $'a'; jl out
+            0x83, 0xF8, 0x7A, 0x7F, 0x03, // cmp $'z'; jg out
+            0x83, 0xE8, 0x20, // sub $32,%eax
+            0xC3,
+        ],
+        "___tolower" => &[
+            0x89, 0xF8, 0x83, 0xF8, 0x41, 0x7C, 0x08, 0x83, 0xF8, 0x5A, 0x7F, 0x03, 0x83, 0xC0,
+            0x20, 0xC3,
+        ],
+        // Every byte is a character in the C locale, so only EOF is not one.
+        "_btowc" => &[
+            0x89, 0xF8, // mov %edi,%eax
+            0x83, 0xF8, 0xFF, // cmp $-1,%eax
+            0x74, 0x06, // je weof
+            0x25, 0xFF, 0x00, 0x00, 0x00, // and $0xff,%eax
+            0xC3, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // weof: mov $-1,%eax
+            0xC3,
+        ],
+        // Sixteen bytes repeated over the run, the pattern wrapping as it goes.
+        "_memset_pattern16" => &[
+            0x48, 0x85, 0xD2, // test %rdx,%rdx
+            0x74, 0x1A, // je out
+            0x31, 0xC9, // xor %ecx,%ecx - where in the pattern
+            0x8A, 0x04, 0x0E, // mov (%rsi,%rcx,1),%al
+            0x88, 0x07, // mov %al,(%rdi)
+            0x48, 0xFF, 0xC7, // inc %rdi
+            0x48, 0xFF, 0xC1, // inc %rcx
+            0x48, 0x83, 0xF9, 0x10, // cmp $16,%rcx
+            0x75, 0x02, // jne same
+            0x31, 0xC9, // xor %ecx,%ecx - back to the start of it
+            0x48, 0xFF, 0xCA, // same: dec %rdx
+            0x75, 0xE8, // jne back
+            0xC3, // out: ret
+        ],
+        // How far the string gets before one of the rejected bytes, and where
+        // the first accepted one is. r8 rather than rbx: the ABI lets a
+        // function keep only what it saves, and these save nothing.
+        "_strcspn" => &[
+            0x31, 0xC0, // xor %eax,%eax
+            0x0F, 0xB6, 0x0C, 0x07, // movzbl (%rdi,%rax,1),%ecx
+            0x84, 0xC9, 0x74, 0x1B, // test %cl,%cl; je done
+            0x48, 0x89, 0xF2, // mov %rsi,%rdx
+            0x44, 0x0F, 0xB6, 0x02, // movzbl (%rdx),%r8d
+            0x45, 0x84, 0xC0, 0x74, 0x0A, // test %r8b,%r8b; je next
+            0x44, 0x39, 0xC1, 0x74, 0x0A, // cmp %r8d,%ecx; je done
+            0x48, 0xFF, 0xC2, 0xEB, 0xED, // inc %rdx; jmp inner
+            0x48, 0xFF, 0xC0, 0xEB, 0xDD, // next: inc %rax; jmp outer
+            0xC3, // done: ret
+        ],
+        "_strpbrk" => &[
+            0x0F, 0xB6, 0x0F, // movzbl (%rdi),%ecx
+            0x84, 0xC9, 0x74, 0x1F, // test %cl,%cl; je miss
+            0x48, 0x89, 0xF2, // mov %rsi,%rdx
+            0x44, 0x0F, 0xB6, 0x02, // movzbl (%rdx),%r8d
+            0x45, 0x84, 0xC0, 0x74, 0x0A, // test %r8b,%r8b; je next
+            0x44, 0x39, 0xC1, 0x74, 0x0A, // cmp %r8d,%ecx; je found
+            0x48, 0xFF, 0xC2, 0xEB, 0xED, // inc %rdx; jmp inner
+            0x48, 0xFF, 0xC7, 0xEB, 0xDE, // next: inc %rdi; jmp outer
+            0x48, 0x89, 0xF8, 0xC3, // found: mov %rdi,%rax; ret
+            0x31, 0xC0, 0xC3, // miss: xor %eax,%eax; ret
+        ],
+        // The stack probe a large frame calls before touching it. Nothing to
+        // probe here: a stack is mapped in full, not grown a page at a time.
+        "____chkstk_darwin" => &[0xC3],
         // A constant the C library answers from its own head.
         "_getpagesize" => &[0xB8, 0x00, 0x10, 0x00, 0x00, 0xC3], // mov eax,4096; ret
         // `__error()` hands back where this thread's errno is, which is the
@@ -1092,6 +1159,81 @@ mod tests {
             .expect("__error offsets the block");
         assert_eq!(u64::from(stub[store + 2]), crate::start::TSD_ERRNO);
         assert_eq!(u64::from(error[add + 3]), crate::start::TSD_ERRNO);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_ctype_and_locale_entries_answer_for_the_c_locale() {
+        let toupper: extern "C" fn(i32) -> i32 =
+            unsafe { core::mem::transmute(code_for("___toupper")) };
+        let tolower: extern "C" fn(i32) -> i32 =
+            unsafe { core::mem::transmute(code_for("___tolower")) };
+        assert_eq!(toupper(b'a' as i32), b'A' as i32);
+        assert_eq!(toupper(b'z' as i32), b'Z' as i32);
+        assert_eq!(toupper(b'A' as i32), b'A' as i32);
+        assert_eq!(toupper(b'1' as i32), b'1' as i32);
+        assert_eq!(toupper(-1), -1, "EOF passes through");
+        assert_eq!(tolower(b'A' as i32), b'a' as i32);
+        assert_eq!(tolower(b'Z' as i32), b'z' as i32);
+        assert_eq!(tolower(b'a' as i32), b'a' as i32);
+        assert_eq!(tolower(-1), -1);
+
+        let btowc: extern "C" fn(i32) -> i32 = unsafe { core::mem::transmute(code_for("_btowc")) };
+        assert_eq!(btowc(b'x' as i32), b'x' as i32);
+        assert_eq!(
+            btowc(0xFF),
+            0xFF,
+            "every byte is a character in this locale"
+        );
+        assert_eq!(btowc(-1), -1, "EOF answers WEOF");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn memset_pattern16_repeats_and_wraps() {
+        let fill: extern "C" fn(*mut u8, *const u8, usize) =
+            unsafe { core::mem::transmute(code_for("_memset_pattern16")) };
+        let pattern: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let mut out = [0xEEu8; 20];
+        fill(out.as_mut_ptr(), pattern.as_ptr(), 18);
+        assert_eq!(&out[..16], &pattern);
+        assert_eq!(
+            &out[16..],
+            &[0, 1, 0xEE, 0xEE],
+            "it wraps, and stops on time"
+        );
+        // A run of nothing writes nothing.
+        let mut none = [0xEEu8; 2];
+        fill(none.as_mut_ptr(), pattern.as_ptr(), 0);
+        assert_eq!(none, [0xEE, 0xEE]);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn strcspn_and_strpbrk_answer_about_the_first_byte_from_a_set() {
+        let strcspn: extern "C" fn(*const u8, *const u8) -> usize =
+            unsafe { core::mem::transmute(code_for("_strcspn")) };
+        assert_eq!(strcspn(b"abcde\0".as_ptr(), b"cd\0".as_ptr()), 2);
+        assert_eq!(
+            strcspn(b"abc\0".as_ptr(), b"xyz\0".as_ptr()),
+            3,
+            "none of them"
+        );
+        assert_eq!(
+            strcspn(b"abc\0".as_ptr(), b"\0".as_ptr()),
+            3,
+            "an empty set"
+        );
+        assert_eq!(strcspn(b"\0".as_ptr(), b"a\0".as_ptr()), 0);
+
+        let strpbrk: extern "C" fn(*const u8, *const u8) -> *const u8 =
+            unsafe { core::mem::transmute(code_for("_strpbrk")) };
+        let s = b"abcde\0";
+        assert_eq!(strpbrk(s.as_ptr(), b"dc\0".as_ptr()), unsafe {
+            s.as_ptr().add(2)
+        });
+        assert!(strpbrk(s.as_ptr(), b"xyz\0".as_ptr()).is_null());
+        assert!(strpbrk(s.as_ptr(), b"\0".as_ptr()).is_null());
     }
 
     #[test]
