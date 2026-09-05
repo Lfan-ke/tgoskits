@@ -50,6 +50,16 @@ fi
 tar -xzf "$venv_src" -C "$overlay_dir/python/Lib" \
     --strip-components=2 "Python-3.14.7/Lib/venv"
 
+# venv copies a launcher into every environment it makes. An installed
+# Windows Python ships those built; the source release ships their C sources
+# and the embeddable distribution has none, so the interpreter itself stands
+# in - which is what venv copied before the launchers existed, and what the
+# environment's pyvenv.cfg points back at either way.
+install -d "$overlay_dir/python/Lib/venv/scripts/nt"
+for f in venvlauncher.exe venvwlauncher.exe; do
+    install -m 0755 "$dll_dir/python.exe" "$overlay_dir/python/Lib/venv/scripts/nt/$f"
+done
+
 # A python._pth beside the executable pins sys.path to exactly these entries
 # (each resolved relative to the executable's directory) and disables the
 # prefix landmark / realpath search that fails on this host. Lib holds the
