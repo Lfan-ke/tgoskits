@@ -671,6 +671,74 @@ pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
             0x48, 0x89, 0xF8, 0xC3, // found: mov %rdi,%rax; ret
             0x31, 0xC0, 0xC3, // miss: xor %eax,%eax; ret
         ],
+        "_wcschr" => &[
+            0x39, 0x37, // cmp %esi,(%rdi)
+            0x74, 0x0B, // je found
+            0x83, 0x3F, 0x00, // cmpl $0,(%rdi)
+            0x74, 0x0A, // je miss
+            0x48, 0x83, 0xC7, 0x04, // add $4,%rdi
+            0xEB, 0xF1, // jmp back
+            0x48, 0x89, 0xF8, 0xC3, // found: mov %rdi,%rax; ret
+            0x31, 0xC0, 0xC3, // miss: xor %eax,%eax; ret
+        ],
+        "_wcsrchr" => &[
+            0x31, 0xC0, // xor %eax,%eax
+            0x39, 0x37, // cmp %esi,(%rdi)
+            0x75, 0x03, // jne skip
+            0x48, 0x89, 0xF8, // mov %rdi,%rax
+            0x83, 0x3F, 0x00, // skip: cmpl $0,(%rdi)
+            0x74, 0x06, // je done
+            0x48, 0x83, 0xC7, 0x04, // add $4,%rdi
+            0xEB, 0xEE, // jmp back
+            0xC3,
+        ],
+        "_wcsncmp" => &[
+            0x31, 0xC0, // xor %eax,%eax
+            0x48, 0x85, 0xD2, // test %rdx,%rdx
+            0x74, 0x17, // je equal
+            0x48, 0xFF, 0xCA, // dec %rdx
+            0x8B, 0x07, // mov (%rdi),%eax
+            0x8B, 0x0E, // mov (%rsi),%ecx
+            0x48, 0x83, 0xC7, 0x04, // add $4,%rdi
+            0x48, 0x83, 0xC6, 0x04, // add $4,%rsi
+            0x39, 0xC8, // cmp %ecx,%eax
+            0x75, 0x07, // jne differ
+            0x85, 0xC0, // test %eax,%eax
+            0x75, 0xE4, // jne back
+            0x31, 0xC0, 0xC3, // equal: xor %eax,%eax; ret
+            0xB8, 0x01, 0x00, 0x00, 0x00, // differ: mov $1,%eax
+            0x7F, 0x05, // jg out
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov $-1,%eax
+            0xC3, // out: ret
+        ],
+        "_wcscpy" => &[
+            0x48, 0x89, 0xF8, // mov %rdi,%rax
+            0x8B, 0x0E, // mov (%rsi),%ecx
+            0x89, 0x0F, // mov %ecx,(%rdi)
+            0x48, 0x83, 0xC7, 0x04, // add $4,%rdi
+            0x48, 0x83, 0xC6, 0x04, // add $4,%rsi
+            0x85, 0xC9, // test %ecx,%ecx
+            0x75, 0xF0, // jne back
+            0xC3,
+        ],
+        "_wmemcmp" => &[
+            0x31, 0xC0, // xor %eax,%eax
+            0x48, 0x85, 0xD2, // test %rdx,%rdx
+            0x74, 0x15, // je equal
+            0x48, 0xFF, 0xCA, // dec %rdx
+            0x8B, 0x07, // mov (%rdi),%eax
+            0x8B, 0x0E, // mov (%rsi),%ecx
+            0x48, 0x83, 0xC7, 0x04, // add $4,%rdi
+            0x48, 0x83, 0xC6, 0x04, // add $4,%rsi
+            0x39, 0xC8, // cmp %ecx,%eax
+            0x75, 0x05, // jne differ
+            0xEB, 0xE6, // jmp back
+            0x31, 0xC0, 0xC3, // equal: xor %eax,%eax; ret
+            0xB8, 0x01, 0x00, 0x00, 0x00, // differ: mov $1,%eax
+            0x7F, 0x05, // jg out
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov $-1,%eax
+            0xC3, // out: ret
+        ],
         _ => return None,
     })
 }
@@ -936,6 +1004,45 @@ mod tests {
         });
         assert!(wmemchr(wide.as_ptr(), 9, 2).is_null());
         assert!(wmemchr(wide.as_ptr(), 7, 0).is_null());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_rest_of_the_wide_entries_walk_four_bytes_at_a_time() {
+        let wcschr: extern "C" fn(*const u32, u32) -> *const u32 =
+            unsafe { core::mem::transmute(code_for("_wcschr")) };
+        let s = [1u32, 2, 1, 0];
+        assert_eq!(wcschr(s.as_ptr(), 2), unsafe { s.as_ptr().add(1) });
+        assert_eq!(wcschr(s.as_ptr(), 0), unsafe { s.as_ptr().add(3) });
+        assert!(wcschr(s.as_ptr(), 9).is_null());
+
+        let wcsrchr: extern "C" fn(*const u32, u32) -> *const u32 =
+            unsafe { core::mem::transmute(code_for("_wcsrchr")) };
+        assert_eq!(wcsrchr(s.as_ptr(), 1), unsafe { s.as_ptr().add(2) });
+        assert!(wcsrchr(s.as_ptr(), 9).is_null());
+
+        let wcsncmp: extern "C" fn(*const u32, *const u32, usize) -> i32 =
+            unsafe { core::mem::transmute(code_for("_wcsncmp")) };
+        assert_eq!(wcsncmp([1u32, 9, 0].as_ptr(), [1u32, 8, 0].as_ptr(), 1), 0);
+        assert!(wcsncmp([1u32, 8, 0].as_ptr(), [1u32, 9, 0].as_ptr(), 2) < 0);
+        assert_eq!(wcsncmp([1u32].as_ptr(), [2u32].as_ptr(), 0), 0);
+        assert_eq!(wcsncmp([1u32, 0].as_ptr(), [1u32, 0].as_ptr(), 8), 0);
+
+        let wcscpy: extern "C" fn(*mut u32, *const u32) -> *mut u32 =
+            unsafe { core::mem::transmute(code_for("_wcscpy")) };
+        let mut out = [9u32; 4];
+        assert_eq!(
+            wcscpy(out.as_mut_ptr(), [5u32, 6, 0].as_ptr()),
+            out.as_mut_ptr()
+        );
+        assert_eq!(out, [5, 6, 0, 9]);
+
+        let wmemcmp: extern "C" fn(*const u32, *const u32, usize) -> i32 =
+            unsafe { core::mem::transmute(code_for("_wmemcmp")) };
+        assert_eq!(wmemcmp([0u32, 0].as_ptr(), [0u32, 0].as_ptr(), 2), 0);
+        assert_eq!(wmemcmp([1u32].as_ptr(), [2u32].as_ptr(), 0), 0);
+        assert!(wmemcmp([1u32, 0].as_ptr(), [1u32, 5].as_ptr(), 2) < 0);
+        assert!(wmemcmp([1u32, 9].as_ptr(), [1u32, 5].as_ptr(), 2) > 0);
     }
 
     #[test]
