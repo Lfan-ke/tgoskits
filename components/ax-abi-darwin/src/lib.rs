@@ -20,6 +20,7 @@ pub mod heap;
 pub mod libc;
 pub mod link;
 pub mod start;
+pub mod stdio;
 pub mod system;
 
 #[cfg(test)]
@@ -407,6 +408,21 @@ impl ImageFormat for MachoFormat {
             system.private() + system::PRIVATE_EXEC_PATH,
             &stack.exec_path.to_le_bytes(),
         )?;
+        // The three streams a program starts with, and the variables that
+        // name them, so `stdout` is a usable pointer from the first
+        // instruction rather than a null one.
+        env.write(
+            system.private() + system::PRIVATE_STREAMS,
+            &stdio::initial(),
+        )?;
+        for (which, name) in ["___stdinp", "___stdoutp", "___stderrp"]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(at) = system.address(name) {
+                env.write(at, &stdio::standard(system, which as u64).to_le_bytes())?;
+            }
+        }
         let start = start::code(start::Entry { main, exit }, &inits, &stack);
         env.map_region(
             start_va,

@@ -141,6 +141,24 @@ fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) ->
         // wants to replace the whole environment rather than read it.
         "__NSGetEnviron" => Ok(library.address("_environ")? as isize),
         "__NSGetExecutablePath" => exec_path(host, &library, a[0], a[1]),
+        // The stream family. Nothing is buffered, so `fflush` has nothing to
+        // do and `setvbuf` has nothing to change.
+        "_fwrite" => crate::stdio::fwrite(host, a),
+        "_fread" => crate::stdio::fread(host, a),
+        "_fputs" => crate::stdio::fputs(host, a),
+        "_puts" => crate::stdio::puts(host, &library, a),
+        "_fputc" => crate::stdio::fputc(host, a),
+        // `putchar` is `fputc` with the stream already decided.
+        "_putchar" => {
+            let out = crate::stdio::standard(&library, 1) as usize;
+            crate::stdio::fputc(host, &[a[0], out, 0, 0, 0, 0])
+        }
+        "_fileno" => crate::stdio::fileno(host, a[0]),
+        "_feof" => crate::stdio::status(host, a[0], 1),
+        "_ferror" => crate::stdio::status(host, a[0], 2),
+        "_clearerr" => crate::stdio::clearerr(host, a[0]),
+        "_fclose" => crate::stdio::fclose(host, a[0]),
+        "_fflush" | "_setvbuf" | "_flockfile" | "_funlockfile" => Ok(0),
         // Both of these end the program on purpose and neither returns. The
         // status is the one a shell reports for a process killed by SIGABRT,
         // which is what a real abort turns into.
