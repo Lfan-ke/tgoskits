@@ -1418,7 +1418,12 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                 },
             }
         }
-        "WaitForMultipleObjects" => wait_for_multiple_objects(&mut c),
+        // The Ex form takes one more argument, whether the wait may be ended
+        // by an APC. Nothing here queues APCs, so such a wait can never end
+        // that way and the two are the same call. CPython's `_winapi` only
+        // ever calls the Ex form, so leaving it unbound left multiprocessing
+        // waiting on a call that answered "not implemented".
+        "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" => wait_for_multiple_objects(&mut c),
         // Winsock.
         "socket" | "WSASocketA" | "WSASocketW" => sock::socket(&mut c),
         "closesocket" => sock::close(&mut c),

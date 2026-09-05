@@ -4276,6 +4276,32 @@ mod tests {
     }
 
     #[test]
+    fn the_alertable_form_of_the_wait_is_the_same_wait() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let quiet = created(&host, teb, "CreateEventW", [0, 1, 0, 0, 0, 0]);
+        let ready = created(&host, teb, "CreateEventW", [0, 1, 1, 0, 0, 0]);
+        let handles = 0x7300usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[handles..handles + 8].copy_from_slice(&(quiet as u64).to_le_bytes());
+            mem[handles + 8..handles + 16].copy_from_slice(&(ready as u64).to_le_bytes());
+        }
+        // WaitForMultipleObjectsEx(count, handles, waitAll, ms, alertable).
+        // Nothing here queues APCs, so the last argument changes nothing and
+        // the call answers like the plain form rather than refusing. CPython's
+        // `_winapi` calls only this form, so leaving it unbound left
+        // multiprocessing waiting on a call that said "not implemented".
+        // Asking about two objects and signalling the second is what tells the
+        // two apart: a refused call answers zero, and so does a wait on one
+        // object that is ready.
+        let mut waited = call("WaitForMultipleObjectsEx", [2, handles, 0, 0, 1, 0], teb);
+        win32::dispatch(&mut waited, &host);
+        assert_eq!(waited.result, Some(1), "the second object is the ready one");
+    }
+
+    #[test]
     fn a_pipe_does_not_reach_a_child_unless_something_puts_it_there() {
         use crate::win32;
         let host = MockHost::default();
