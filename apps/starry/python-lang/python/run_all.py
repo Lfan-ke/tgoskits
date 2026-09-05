@@ -76,7 +76,12 @@ for index, f in enumerate(files):
     print("  [%s] %-28s rc=%s | %s" % ("PASS" if ok else "FAIL", name, rc, tail))
     if not ok:
         fails.append(name)
-        for ln in lines[-30:]:
+        # The failing checks first, wherever in the run they were, then the
+        # tail. A module that ends in a wall of skips would otherwise push the
+        # one line that says why off the top.
+        why = [ln for ln in lines if "FAIL" in ln][:20]
+        rest = [ln for ln in lines[-15:] if ln not in why]
+        for ln in why + rest:
             print("    | " + ln)
 
 passed = len(files) - len(fails)
