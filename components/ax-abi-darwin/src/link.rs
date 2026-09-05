@@ -29,9 +29,10 @@ use ax_binfmt::{
 
 use crate::{PAGE, system::Library};
 
-/// How deep a chain of libraries the walk follows before it decides the set
-/// loops. Nothing sane nests this far; a cycle is what this bounds.
-const DEPTH_LIMIT: usize = 32;
+/// How many images one program may bring in. The walk already refuses to
+/// place a library twice, so a cycle cannot run away; this is what stops an
+/// image that names thousands of libraries from being placed at all.
+const MODULE_LIMIT: usize = 128;
 
 /// One image in the process: the program, or a library it reached.
 #[derive(Debug)]
@@ -144,7 +145,8 @@ pub fn link(bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> AbiResult<Link
 
     let mut at = 0;
     while at < modules.len() {
-        if at == DEPTH_LIMIT {
+        if modules.len() > MODULE_LIMIT {
+            env.trace("the program names more libraries than this loader places");
             return Err(AbiError::Unsupported);
         }
         for lib in modules[at].libs.clone() {
