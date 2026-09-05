@@ -23,6 +23,9 @@ pub struct Trap {
     pub args: [usize; 6],
     pub result: Option<usize>,
     pub failed: Option<bool>,
+    /// Where the calling thread's block is, for a domain that keeps state
+    /// where the thread itself can reach it.
+    pub tsd: usize,
 }
 impl Trap {
     /// A trap that arrived under `nr`.
@@ -32,7 +35,14 @@ impl Trap {
             args,
             result: None,
             failed: None,
+            tsd: 0,
         }
+    }
+
+    /// The same trap, arriving on a thread whose block is at `tsd`.
+    pub fn on_thread(mut self, tsd: usize) -> Self {
+        self.tsd = tsd;
+        self
     }
 
     /// What the domain answered with, and whether it called it a failure.
@@ -54,6 +64,9 @@ impl TrapEnv for Trap {
     fn set_error(&mut self, failed: bool) {
         self.failed = Some(failed);
     }
+    fn thread_pointer(&self) -> usize {
+        self.tsd
+    }
 }
 
 #[derive(Default)]
@@ -62,6 +75,8 @@ pub struct MockHost {
     pub closed: RefCell<Option<i32>>,
     /// The status this process ended with, if it did.
     pub ended: RefCell<Option<i32>>,
+    /// Where the next mapping goes in the flat buffer.
+    pub mapped_next: RefCell<usize>,
     /// The runs the last scatter-gather transfer named.
     pub gathered: RefCell<Vec<(usize, usize)>>,
     /// The name a permission question was asked about, what it wanted, and
@@ -180,7 +195,19 @@ impl Mem for MockHost {
     }
     fn map(&self, req: &MapRequest) -> SysResult {
         *self.mapped.borrow_mut() = Some(*req);
-        Ok(0x9000)
+        // Hand out a run inside the flat buffer this host calls user memory,
+        // so what a caller maps is memory it can then read and write.
+        let mut next = self.mapped_next.borrow_mut();
+        if *next == 0 {
+            *next = 0x1_0000;
+        }
+        let at = *next;
+        *next += req.len;
+        let mut mem = self.mem.borrow_mut();
+        if mem.len() < *next {
+            mem.resize(*next, 0);
+        }
+        Ok(at as isize)
     }
     fn unmap(&self, _a: usize, _l: usize) -> SysResult {
         Ok(0)

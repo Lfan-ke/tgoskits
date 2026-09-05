@@ -15,7 +15,10 @@
 use ax_abi_port::{Host, SysResult};
 use ax_dispatch::{Dispatch, TrapEnv};
 
-use crate::{bsd::nr, system::DarwinCall};
+use crate::{
+    bsd::nr,
+    system::{DarwinCall, Library},
+};
 
 /// `ENOSYS`, which is what an entry point that is bound but not written yet
 /// answers with.
@@ -41,7 +44,20 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         env.arg(4),
         env.arg(5),
     ];
-    let outcome = route(host, call, &a).unwrap_or_else(|| {
+    // The library's own address, which the thread block carries because a
+    // trap arrives with nothing else that could name it.
+    let mut base = [0u8; 8];
+    let tsd = env.thread_pointer();
+    if tsd == 0
+        || host
+            .platform()
+            .read_user(tsd + crate::start::TSD_LIBRARY as usize, &mut base)
+            .is_err()
+    {
+        return Dispatch::Passthrough;
+    }
+    let library = Library::new(u64::from_le_bytes(base));
+    let outcome = route(host, library, call, &a).unwrap_or_else(|| {
         host.platform()
             .trace(&alloc::format!("{} is not implemented", call.name()));
         Err(ENOSYS)
@@ -98,7 +114,10 @@ const CALLS: &[(&str, usize)] = &[
 ];
 
 /// What one call does, or `None` for one this layer does not serve yet.
-fn route(host: &dyn Host, call: DarwinCall, a: &[usize; 6]) -> Option<SysResult> {
+///
+/// `library` is where the synthesized library was placed, which the entries
+/// that keep state - the allocator - need to find their own words.
+fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) -> Option<SysResult> {
     let name = call.name();
     if let Ok(at) = CALLS.binary_search_by_key(&name, |entry| entry.0) {
         return crate::bsd::route(host, CALLS[at].1, a);
@@ -108,6 +127,12 @@ fn route(host: &dyn Host, call: DarwinCall, a: &[usize; 6]) -> Option<SysResult>
         // stdio to flush; until then it is the same as leaving.
         "_exit" => host.tasks()?.exit_group((a[0] as i32) << 8),
         "_dup" => host.files()?.dup(a[0] as i32),
+        // The allocator: the code is here, but every byte it hands out and
+        // every word it remembers is the program's own.
+        "_malloc" => crate::heap::malloc(host, &library, a[0]),
+        "_calloc" => crate::heap::calloc(host, &library, a[0], a[1]),
+        "_realloc" => crate::heap::realloc(host, &library, a[0], a[1]),
+        "_free" => crate::heap::free(host, &library, a[0]),
         // Both of these end the program on purpose and neither returns. The
         // status is the one a shell reports for a process killed by SIGABRT,
         // which is what a real abort turns into.
@@ -132,6 +157,25 @@ mod tests {
         Library::call(name).expect("the table names it").nr() as usize
     }
 
+    /// Where the thread block goes in the mock's memory, and where the
+    /// library it names goes. Every call arrives on a thread, and the ones
+    /// that keep state find the library through it.
+    const TSD: usize = 0x100;
+    const LIBRARY: u64 = 0x8000;
+
+    /// A trap on a thread whose block names a library, with room in the
+    /// mock's memory for both.
+    fn call(name: &str, host: &MockHost, args: [usize; 6]) -> Trap {
+        let mut mem = host.mem.borrow_mut();
+        if mem.len() < 0x1_0000 {
+            mem.resize(0x1_0000, 0);
+        }
+        let at = TSD + crate::start::TSD_LIBRARY as usize;
+        mem[at..at + 8].copy_from_slice(&LIBRARY.to_le_bytes());
+        drop(mem);
+        Trap::at(nr(name), args).on_thread(TSD)
+    }
+
     #[test]
     fn a_number_from_another_layer_is_left_alone() {
         let host = MockHost::default();
@@ -144,7 +188,7 @@ mod tests {
     #[test]
     fn write_reaches_the_files_port() {
         let host = MockHost::default();
-        let mut env = Trap::at(nr("_write"), [1, 0x200, 12, 0, 0, 0]);
+        let mut env = call("_write", &host, [1, 0x200, 12, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.answer(), (Some(12), Some(false)));
         assert_eq!(*host.wrote.borrow(), Some((1, 0x200, 12)));
@@ -153,7 +197,7 @@ mod tests {
     #[test]
     fn a_failing_call_reports_the_errno_and_raises_the_carry_flag() {
         let host = MockHost::default();
-        let mut env = Trap::at(nr("_write"), [-1i32 as usize, 0x200, 4, 0, 0, 0]);
+        let mut env = call("_write", &host, [-1i32 as usize, 0x200, 4, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(
             env.answer(),
@@ -165,7 +209,7 @@ mod tests {
     #[test]
     fn the_calls_that_are_only_a_system_call_reach_the_bsd_half() {
         let host = MockHost::default();
-        let mut env = Trap::at(nr("_close"), [7, 0, 0, 0, 0, 0]);
+        let mut env = call("_close", &host, [7, 0, 0, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(*host.closed.borrow(), Some(7));
     }
@@ -183,10 +227,10 @@ mod tests {
     #[test]
     fn abort_ends_the_program_rather_than_returning_to_it() {
         let host = MockHost::default();
-        let mut env = Trap::at(nr("_abort"), [0; 6]);
+        let mut env = call("_abort", &host, [0; 6]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(*host.ended.borrow(), Some(SIGABRT));
-        let mut guard = Trap::at(nr("___stack_chk_fail"), [0; 6]);
+        let mut guard = call("___stack_chk_fail", &host, [0; 6]);
         assert_eq!(dispatch(&mut guard, &host), Dispatch::Handled);
         assert_eq!(*host.ended.borrow(), Some(SIGABRT));
     }
@@ -194,7 +238,7 @@ mod tests {
     #[test]
     fn an_entry_point_with_no_body_yet_says_so_rather_than_answer() {
         let host = MockHost::default();
-        let mut env = Trap::at(nr("_fprintf"), [0; 6]);
+        let mut env = call("_fprintf", &host, [0; 6]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.answer(), (Some(ENOSYS as usize), Some(true)));
     }

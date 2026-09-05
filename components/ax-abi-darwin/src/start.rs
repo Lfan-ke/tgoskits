@@ -31,14 +31,22 @@ pub const TSD_SELF: u64 = 0;
 /// hands out its address must agree, which is what [`crate::system`] asserts.
 pub const TSD_ERRNO: u64 = 8;
 
-/// How big the block is. Only two words are spoken for; the rest is room for
-/// what the pthread family will need.
+/// Where the thread keeps the address of the synthesized library. A trap
+/// arrives with nothing but its number and its arguments, so the entries that
+/// have state of their own - the allocator - find it from here.
+pub const TSD_LIBRARY: u64 = 16;
+
+/// How big the block is. Only three words are spoken for; the rest is room
+/// for what the pthread family will need.
 pub const TSD_LEN: u64 = 64;
 
-/// The block a thread reaches through `gs`, placed at `at`.
-pub fn tsd(at: u64) -> Vec<u8> {
+/// The block a thread reaches through `gs`, placed at `at`, for a process
+/// whose synthesized library is at `library`.
+pub fn tsd(at: u64, library: u64) -> Vec<u8> {
     let mut out = alloc::vec![0u8; TSD_LEN as usize];
-    out[TSD_SELF as usize..TSD_SELF as usize + 8].copy_from_slice(&at.to_le_bytes());
+    for (off, value) in [(TSD_SELF, at), (TSD_LIBRARY, library)] {
+        out[off as usize..off as usize + 8].copy_from_slice(&value.to_le_bytes());
+    }
     out
 }
 

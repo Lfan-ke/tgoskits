@@ -25,6 +25,10 @@ pub const STUB_LEN: usize = 48;
 /// decides the next one's alignment.
 const SLOT_ALIGN: u64 = 16;
 
+/// How much room past the variables this layer keeps for itself - the
+/// allocator's three words, and whatever comes after.
+pub const PRIVATE_LEN: u64 = 64;
+
 /// One thing the library exports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
@@ -439,7 +443,14 @@ impl Library {
 
     /// Where the stubs begin, relative to `base`.
     pub fn code_off(&self) -> u64 {
-        page_up(vars_len())
+        page_up(vars_len() + PRIVATE_LEN)
+    }
+
+    /// Where this layer's own words are: what it has to remember about the
+    /// process rather than about a thread, kept in the process's memory so a
+    /// second process has a second set by construction.
+    pub fn private(&self) -> u64 {
+        self.base + vars_len().next_multiple_of(SLOT_ALIGN)
     }
 
     /// How much address space the whole library takes.

@@ -737,8 +737,9 @@ mod tests {
             ..Trap::default()
         };
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
-        assert_eq!(env.result, Some(0x9000));
+        assert_eq!(env.failed, Some(false), "the mapping was made");
         let request = host.mapped.borrow().unwrap();
+        assert_eq!(request.len, 0x3000);
         assert_eq!(request.prot, Prot::READ | Prot::WRITE);
         assert_eq!(request.source, MapSource::Anonymous);
         assert!(!request.shared);

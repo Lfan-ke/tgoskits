@@ -16,6 +16,7 @@
 #![feature(used_with_arg)]
 
 pub mod bsd;
+pub mod heap;
 pub mod libc;
 pub mod link;
 pub mod start;
@@ -415,7 +416,7 @@ impl ImageFormat for MachoFormat {
             tsd_va,
             start::TSD_LEN,
             Prot::READ | Prot::WRITE,
-            Some(&start::tsd(tsd_va)),
+            Some(&start::tsd(tsd_va, system.base)),
         )?;
         // The host already mapped a stack; what goes on it is written, not
         // mapped over.
