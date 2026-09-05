@@ -169,6 +169,9 @@ def cohort_introspect():
 # ===========================================================================
 _CTX = None
 _CTX_NAME = None
+# Why each start method was turned down, so "no usable start context" says
+# which call failed and with what instead of only that none worked.
+_CTX_WHY = []
 
 def _probe_ctx(name):
     """Return a context whose Process actually starts+joins, else None."""
@@ -177,22 +180,31 @@ def _probe_ctx(name):
             ctx = mp
         else:
             ctx = mp.get_context(name)
-    except (ValueError, OSError, RuntimeError):
+    except (ValueError, OSError, RuntimeError) as e:
+        _CTX_WHY.append("%s: get_context %s: %s" % (name, type(e).__name__, e))
         return None
+    step = "Queue()"
     try:
         q = ctx.Queue()
+        step = "Process()"
         p = ctx.Process(target=_proc_target, args=(q, 21))
+        step = "start()"
         p.start()
+        step = "get()"
         got = q.get(timeout=20)
+        step = "join()"
         p.join(timeout=20)
         if p.is_alive():
             p.terminate()
+            _CTX_WHY.append("%s: child still alive after join" % name)
             return None
         if got[1] != 42:
+            _CTX_WHY.append("%s: child sent %r" % (name, got))
             return None
         return ctx
     except (OSError, NotImplementedError, AttributeError, ValueError,
             EOFError, RuntimeError, PermissionError) as e:
+        _CTX_WHY.append("%s: %s %s: %s" % (name, step, type(e).__name__, e))
         return None
 
 def _pick_context():
@@ -783,7 +795,7 @@ def _main():
     _pick_context()
     chk("usable_start_context", _CTX is not None,
         ("ctx=%s" % _CTX_NAME) if _CTX
-        else "(skip: no start-method can spawn a child)")
+        else ("no start method could spawn a child: " + "; ".join(_CTX_WHY)))
     if _CTX is None:
         _no_context_skips()
     else:
