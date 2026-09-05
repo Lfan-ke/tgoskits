@@ -557,6 +557,8 @@ fn inline(
             c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, 0);
             if ready {
                 wake(c, overlapped);
+            } else {
+                remember_pending(c, overlapped, fd);
             }
         }
         if transferred_out != 0 {
@@ -660,7 +662,7 @@ fn winsock_kind(kind: u32) -> bool {
 
 /// Signal the event an `OVERLAPPED` carries, which is what a caller with no
 /// completion port waits on.
-fn wake(c: &mut Call<'_>, overlapped: usize) {
+fn wake(c: &Call<'_>, overlapped: usize) {
     let event = c.read_u64(overlapped + OVERLAPPED_EVENT).unwrap_or(0) as usize;
     if event != 0 {
         sync::signal(c, event);
@@ -834,6 +836,7 @@ pub fn cancel(c: &mut Call<'_>) -> Dispatch {
             );
             c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, 0);
             wake(c, overlapped);
+            forget_pending(c, overlapped);
             sync::announce_signal(c);
             c.set_last_error(0);
             return c.finish(TRUE);
@@ -859,6 +862,89 @@ pub fn cancel(c: &mut Call<'_>) -> Dispatch {
     c.finish(TRUE)
 }
 
+/// What an outstanding operation with no port to report to remembers: which
+/// OVERLAPPED is waiting and which descriptor it is waiting on.
+const WAITING_NEXT: usize = 0;
+const WAITING_OVERLAPPED: usize = 8;
+const WAITING_FD: usize = 16;
+const WAITING_SIZE: usize = 24;
+
+/// Remember that `overlapped` is outstanding on `fd` with no port behind it.
+pub(super) fn remember_pending(c: &Call<'_>, overlapped: usize, fd: i32) {
+    let (Some(peb), Some(heap)) = (c.peb(), heap_of(c)) else {
+        return;
+    };
+    let Some(block) = heap::alloc(c, heap, WAITING_SIZE) else {
+        return;
+    };
+    let head = c.read_u64(peb + super::PEB_PENDING_IO).unwrap_or(0);
+    c.write_u64(block + WAITING_NEXT, head);
+    c.write_u64(block + WAITING_OVERLAPPED, overlapped as u64);
+    c.write_u32(block + WAITING_FD, fd as u32);
+    c.write_u64(peb + super::PEB_PENDING_IO, block as u64);
+}
+
+/// Take `overlapped` off the outstanding list, if it is on it.
+pub(super) fn forget_pending(c: &Call<'_>, overlapped: usize) {
+    let Some(peb) = c.peb() else { return };
+    let mut at = c.read_u64(peb + super::PEB_PENDING_IO).unwrap_or(0) as usize;
+    let mut previous = 0usize;
+    while at != 0 {
+        let next = c.read_u64(at + WAITING_NEXT).unwrap_or(0) as usize;
+        if c.read_u64(at + WAITING_OVERLAPPED) == Some(overlapped as u64) {
+            if previous == 0 {
+                c.write_u64(peb + super::PEB_PENDING_IO, next as u64);
+            } else {
+                c.write_u64(previous + WAITING_NEXT, next as u64);
+            }
+            if let Some(heap) = heap_of(c) {
+                heap::mark_free(c, heap, at);
+            }
+            return;
+        }
+        previous = at;
+        at = next;
+    }
+}
+
+/// Finish every outstanding operation whose descriptor has something to give,
+/// and say whether any are still waiting.
+///
+/// An operation with a completion port is finished by the thread that asks
+/// the port; one without has nobody, so whoever waits does the looking. That
+/// is what makes a wait on such an OVERLAPPED's event end when the data it
+/// was waiting for turns up.
+pub(super) fn poll_pending(c: &Call<'_>) -> bool {
+    let Some(peb) = c.peb() else { return false };
+    let mut at = c.read_u64(peb + super::PEB_PENDING_IO).unwrap_or(0) as usize;
+    let mut ready: Vec<usize> = Vec::new();
+    let mut waiting = false;
+    while at != 0 {
+        let (Some(overlapped), Some(fd)) = (
+            c.read_u64(at + WAITING_OVERLAPPED),
+            c.read_u32(at + WAITING_FD),
+        ) else {
+            break;
+        };
+        if super::pipe::waiting_on(c, fd as i32) != 0 {
+            ready.push(overlapped as usize);
+        } else {
+            waiting = true;
+        }
+        at = c.read_u64(at + WAITING_NEXT).unwrap_or(0) as usize;
+    }
+    for overlapped in ready {
+        c.write_u64(
+            overlapped + OVERLAPPED_INTERNAL,
+            u64::from(super::pipe::ERROR_MORE_DATA),
+        );
+        c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, 0);
+        wake(c, overlapped);
+        forget_pending(c, overlapped);
+    }
+    waiting
+}
+
 /// GetOverlappedResult(hFile, lpOverlapped, lpNumberOfBytesTransferred,
 /// bWait): what an operation ended with, once it has.
 pub fn result(c: &mut Call<'_>) -> Dispatch {
@@ -872,7 +958,10 @@ pub fn result(c: &mut Call<'_>) -> Dispatch {
             if event == 0 {
                 return c.fail(ERROR_ABANDONED_WAIT_0, FALSE);
             }
-            sync::wait_object(c, event, sync::INFINITE);
+            // An operation with no port is finished by whoever waits for it,
+            // so the wait is in slices with a look between them.
+            poll_pending(c);
+            sync::wait_object(c, event, POLL_MS);
         }
     }
     let status = c.read_u64(overlapped + OVERLAPPED_INTERNAL).unwrap_or(0);

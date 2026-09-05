@@ -1735,6 +1735,10 @@ pub(crate) const PEB_DETACHING: usize = 0xF58;
 /// Where the process-wide table of FLS callbacks hangs.
 pub(crate) const PEB_FLS_CALLBACKS: usize = 0xF60;
 
+/// Where the operations still outstanding with no completion port to report
+/// to hang, the same way.
+pub(crate) const PEB_PENDING_IO: usize = 0xF68;
+
 /// Where the section objects this process has made hang, the same way.
 pub(crate) const PEB_MAPPINGS: usize = 0xF10;
 
@@ -1743,7 +1747,7 @@ pub(crate) const PEB_MAPPINGS: usize = 0xF10;
 // let a named pipe write its list head over the FLS callback table and take
 // the C runtime's per-thread data with it. Every word this layer keeps past
 // the real PEB belongs in this list, wherever it is used from.
-const PEB_WORDS: [usize; 11] = [
+const PEB_WORDS: [usize; 12] = [
     PEB_TEMP_FILES,
     PEB_PIPES,
     PEB_PORT_FILES,
@@ -1755,6 +1759,7 @@ const PEB_WORDS: [usize; 11] = [
     PEB_EXCEPTION_FILTER,
     PEB_DETACHING,
     PEB_FLS_CALLBACKS,
+    PEB_PENDING_IO,
 ];
 
 /// The bitmap `PEB.TlsBitmap` points at is the one other thing kept past the
@@ -2186,6 +2191,10 @@ fn wait_for_multiple_objects(c: &mut Call<'_>) -> Dispatch {
                 elsewhere |= sync::is_shared(c, handle);
             }
         }
+        // An operation with no completion port has nothing to finish it but a
+        // look at the descriptor, and what a caller waits on for one is the
+        // event in its OVERLAPPED - so the looking happens here.
+        elsewhere |= iocp::poll_pending(c);
         if elsewhere {
             left = left.min(SHARED_SWEEP_MS);
         }

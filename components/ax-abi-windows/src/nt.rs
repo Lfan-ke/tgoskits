@@ -5408,6 +5408,78 @@ mod tests {
     }
 
     #[test]
+    fn a_pipe_that_had_nothing_finishes_its_wait_once_it_does() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let name: Vec<u8> = "\\\\.\\pipe\\later\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let name_at = 0x7D00usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[name_at..name_at + name.len()].copy_from_slice(&name);
+        }
+        let mut made = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("CreateNamedPipeW").unwrap(),
+            [name_at, 3, 4, 1, 8192, 8192],
+            teb,
+            &[0xFFFF_FFFF, 0],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut made, &host);
+        let handle = made.result.expect("a pipe");
+        let fd = crate::handle::Handle(handle as u32).slot().unwrap() as i32;
+
+        // Nothing there yet, so the question is left outstanding.
+        let (over, into) = (0x7D80usize, 0x7E00usize);
+        let event = created(&host, teb, "CreateEventW", [0, 1, 0, 0, 0, 0]);
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[over + 24..over + 32].copy_from_slice(&(event as u64).to_le_bytes());
+        }
+        let mut ask = call("ReadFile", [handle, into, 0, 0, over, 0], teb);
+        win32::dispatch(&mut ask, &host);
+        let last = |()| {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(
+                mem[teb + crate::teb_peb::TEB_LAST_ERROR..][..4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(last(()), 997, "ERROR_IO_PENDING: nothing to report yet");
+        assert_eq!(
+            waited(&host, teb, event, 0),
+            WAIT_TIMEOUT,
+            "and not signalled"
+        );
+
+        // Once the descriptor has something, whoever waits finishes it - which
+        // is what a wait on the event this OVERLAPPED carries depends on.
+        host.socket(fd).unwrap().queued.extend_from_slice(b"x");
+        let set = 0x7E80usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[set..set + 8].copy_from_slice(&(event as u64).to_le_bytes());
+        }
+        let mut wait = call("WaitForMultipleObjects", [1, set, 0, 500, 0, 0], teb);
+        win32::dispatch(&mut wait, &host);
+        assert_eq!(
+            wait.result,
+            Some(WAIT_OBJECT_0),
+            "the wait ended on its own"
+        );
+        let status = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[over..over + 8].try_into().unwrap())
+        };
+        assert_eq!(status, 234, "and the OVERLAPPED says a message is there");
+    }
+
+    #[test]
     fn making_a_named_pipe_leaves_the_runtime_its_thread_data() {
         use crate::win32;
         let host = MockHost::default();
