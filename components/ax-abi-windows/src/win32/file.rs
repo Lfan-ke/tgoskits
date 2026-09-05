@@ -541,8 +541,7 @@ pub fn get_file_information_by_handle(c: &mut Call<'_>) -> Dispatch {
 /// lpTargetHandle, dwDesiredAccess, bInheritHandle, dwOptions): within this
 /// process, another handle on the same file.
 pub fn duplicate_handle(c: &mut Call<'_>) -> Dispatch {
-    let (source, target, target_out, options) =
-        (c.arg(1), c.arg(2), c.arg(3), c.arg(6) as u32 as usize);
+    let (from, source, target, options) = (c.arg(0), c.arg(1), c.arg(2), c.arg(6) as u32 as usize);
     let (Ok(fd), Some(files)) = (descriptor(source), c.host.files()) else {
         // Only a descriptor can be duplicated: it is the child's too, since
         // a child here starts with the descriptors its parent had. A block
@@ -553,26 +552,57 @@ pub fn duplicate_handle(c: &mut Call<'_>) -> Dispatch {
         ));
         return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
     };
-    // Which process the handle is being read out of, or written into, does not
-    // change what it names: a child starts with the descriptors its parent
-    // had, so one number means one thing in both. That is what makes a spawn
-    // work in both directions - the parent sends the child a number and the
-    // child duplicates it out of the parent - and it is why crossing into
-    // another process hands back the same value rather than a new one, which
-    // would be a number of this process's that the other never got.
-    let handle = if elsewhere(c, target) {
-        source as u64
-    } else {
-        match files.dup(fd) {
-            Ok(new) if new >= 0 => Handle::from_slot(new as usize).0 as u64,
-            Ok(_) => return c.fail_status(Ntstatus::UNSUCCESSFUL, FALSE),
-            Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
+    // Where the handle is read from and where it lands are both the caller's
+    // to name, and the three combinations differ:
+    //
+    // Out of another process into this one, the number belongs to that
+    // process's table and is fetched from it - a spawned child stealing the
+    // pipe its parent left for it.
+    //
+    // Into another process, the number needs no copy: a child starts with the
+    // descriptors its parent had, so the value the parent sends already names
+    // the same thing there. Duplicating instead would hand it a number of the
+    // parent's that the child never got.
+    //
+    // Within this process it is an ordinary copy.
+    // `DUPLICATE_CLOSE_SOURCE` means the source handle goes with the copy.
+    // The source is only this process's to close when it was read from here;
+    // the number a fetch from another process names is that process's, and
+    // closing the same number here would let go of something else entirely.
+    let mut close_source = options & DUPLICATE_CLOSE_SOURCE != 0;
+    let taken = match (elsewhere(c, from), elsewhere(c, target)) {
+        (true, false) => {
+            let Some(pid) = super::process::pid_of(from) else {
+                return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
+            };
+            close_source = false;
+            files.steal(pid, fd)
         }
+        (_, true) => return finish_duplicate(c, source as u64, fd, close_source, files),
+        (false, false) => files.dup(fd),
     };
-    if target_out != 0 && !c.write_u64(target_out, handle) {
+    let handle = match taken {
+        Ok(new) if new >= 0 => Handle::from_slot(new as usize).0 as u64,
+        Ok(_) => return c.fail_status(Ntstatus::UNSUCCESSFUL, FALSE),
+        Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
+    };
+    finish_duplicate(c, handle, fd, close_source, files)
+}
+
+/// Report the handle the duplicate came out as, and let the source go if the
+/// caller asked for that.
+fn finish_duplicate(
+    c: &mut Call<'_>,
+    handle: u64,
+    fd: i32,
+    close_source: bool,
+    files: &dyn ax_abi_port::Files,
+) -> Dispatch {
+    let out = c.arg(3);
+    if out != 0 && !c.write_u64(out, handle) {
         return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
     }
-    if options & DUPLICATE_CLOSE_SOURCE != 0 {
+    if close_source {
         let _ = files.close(fd);
     }
     c.finish(TRUE)

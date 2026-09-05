@@ -565,6 +565,12 @@ impl Files for KernelHost {
         Ok(new_fd as isize)
     }
 
+    fn steal(&self, pid: u32, fd: i32) -> SysResult {
+        let file = crate::file::file_of_process(pid, fd).map_err(errno)?;
+        let new_fd = add_file_like(file, false).map_err(errno)?;
+        Ok(new_fd as isize)
+    }
+
     fn pread(&self, fd: i32, uaddr: usize, len: usize, offset: u64) -> SysResult {
         port_result(syscall::read_at_fd(fd, uaddr as *mut u8, len, offset))
     }

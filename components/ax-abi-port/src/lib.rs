@@ -505,6 +505,15 @@ pub trait Files: Sync {
         Err(38)
     }
     fn dup(&self, fd: i32) -> SysResult;
+    /// Install a copy of another process's descriptor in this one: `fd` is a
+    /// number in the table of `pid`, and what comes back is a number in this
+    /// process's. A descriptor means nothing outside the table it belongs to,
+    /// so an ABI whose handles cross processes - Windows `DuplicateHandle`
+    /// reading one out of another process - needs this rather than `dup`.
+    /// `pidfd_getfd(2)` is the same operation.
+    fn steal(&self, _pid: u32, _fd: i32) -> SysResult {
+        Err(38)
+    }
     /// A pipe: the read end and the write end, as descriptors. `cloexec` says
     /// whether they go when the process runs a new image - which is the
     /// caller's to decide, since one ABI's default is the other's flag.

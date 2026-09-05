@@ -537,6 +537,33 @@ pub fn close_file_like(fd: c_int) -> StarryResult {
     Err(StarryError::BadFileDescriptor)
 }
 
+/// The file another process has open at `fd`.
+///
+/// A descriptor is a number in one process's table and means nothing in
+/// another's, so a personality whose ABI hands one process a copy of another's
+/// - Windows `DuplicateHandle` across processes - has to reach into that
+/// table. This is `pidfd_getfd(2)`'s half of the work: find the file, and let
+/// the caller install it in its own table.
+pub fn file_of_process(pid: u32, fd: c_int) -> StarryResult<Arc<dyn FileLike>> {
+    for task in tasks() {
+        if task.state() == TaskState::Exited {
+            continue;
+        }
+        let thread = task.as_thread();
+        if thread.proc_data.proc.pid().get() != pid {
+            continue;
+        }
+        let scope = thread.scope.read();
+        let table = FD_TABLE.scope(&scope);
+        let table = table.read();
+        return table
+            .get(fd as usize)
+            .map(|entry| entry.inner.clone())
+            .ok_or(StarryError::BadFileDescriptor);
+    }
+    Err(StarryError::NoSuchProcess)
+}
+
 pub(crate) fn fd_tables_contain_file(file: &Arc<dyn FileLike>) -> bool {
     !fd_table_file_refs(file).is_empty()
 }

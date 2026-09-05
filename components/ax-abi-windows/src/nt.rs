@@ -1143,6 +1143,8 @@ mod tests {
         /// How long the last park was asked to last, or nothing for one with
         /// no deadline.
         parked: RefCell<Option<Option<u64>>>,
+        /// The process and descriptor the last steal named.
+        stolen: RefCell<Option<(u32, i32)>>,
     }
 
     /// Where the first section a mock host makes is mapped: past the heap
@@ -1191,6 +1193,7 @@ mod tests {
                 section_fds: core::cell::Cell::new(SECTION_FD),
                 section_sizes: RefCell::default(),
                 parked: RefCell::default(),
+                stolen: RefCell::default(),
             }
         }
     }
@@ -1550,6 +1553,10 @@ mod tests {
         fn close(&self, fd: i32) -> ax_abi_port::SysResult {
             *self.closed.borrow_mut() = Some(fd);
             Ok(0)
+        }
+        fn steal(&self, pid: u32, fd: i32) -> ax_abi_port::SysResult {
+            *self.stolen.borrow_mut() = Some((pid, fd));
+            Ok(99)
         }
         fn dup(&self, _fd: i32) -> ax_abi_port::SysResult {
             Ok(0)
@@ -3734,6 +3741,47 @@ mod tests {
             u64::from_le_bytes(mem[out..out + 8].try_into().unwrap()) as usize
         };
         assert_ne!(copy, semaphore, "a copy of one's own is a new number");
+    }
+
+    #[test]
+    fn a_handle_read_out_of_another_process_is_fetched_from_it() {
+        use crate::win32;
+        const PROCESS_TAG: usize = 0x2000_0000;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let out = 0x7900usize;
+        let parent = PROCESS_TAG | 4242;
+        let handle = crate::handle::Handle::from_slot(7).0 as usize;
+        let mut across = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("DuplicateHandle").unwrap(),
+            [
+                parent,
+                handle,
+                crate::handle::Handle::CURRENT_PROCESS.0 as usize,
+                out,
+                0,
+                0,
+            ],
+            teb,
+            // DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS, which is what a
+            // spawned child asks for when it takes the pipe its parent left.
+            &[3],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut across, &host);
+        assert_eq!(across.result, Some(1));
+        // The number belongs to the other process's table, so it is fetched
+        // from there rather than copied here.
+        assert_eq!(*host.stolen.borrow(), Some((4242, 7)));
+        let handed = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[out..out + 8].try_into().unwrap()) as usize
+        };
+        assert_eq!(handed, crate::handle::Handle::from_slot(99).0 as usize);
+        // And nothing of this process's was closed: the source named a
+        // descriptor of the other one's.
+        assert_eq!(*host.closed.borrow(), None);
     }
 
     #[test]
