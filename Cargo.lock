@@ -726,6 +726,7 @@ dependencies = [
  "ax-binfmt",
  "ax-crate-interface",
  "ax-dispatch",
+ "libc",
 ]
 
 [[package]]
