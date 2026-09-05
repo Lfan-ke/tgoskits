@@ -1125,6 +1125,8 @@ mod tests {
         space: Option<ax_abi_port::Space>,
         /// What this process ended with, if it did.
         ended: RefCell<Option<i32>>,
+        /// How the last pipe was asked for, and what it was handed.
+        piped: RefCell<Option<bool>>,
         /// Who was signalled, and with what.
         killed: RefCell<Vec<(u32, u32)>>,
         /// Whether there is a process to signal at all.
@@ -1186,6 +1188,7 @@ mod tests {
                 unlinked: RefCell::default(),
                 space: None,
                 ended: RefCell::default(),
+                piped: RefCell::default(),
                 killed: RefCell::default(),
                 kills: core::cell::Cell::new(true),
                 exits: RefCell::default(),
@@ -1512,6 +1515,14 @@ mod tests {
     }
 
     impl ax_abi_port::Files for MockHost {
+        fn pipe(&self, cloexec: bool) -> Result<(i32, i32), i32> {
+            *self.piped.borrow_mut() = Some(cloexec);
+            let mut table = self.sockets.borrow_mut();
+            table.push(MockSocket::default());
+            table.push(MockSocket::default());
+            Ok((table.len() as i32 + 1, table.len() as i32 + 2))
+        }
+
         fn poll(
             &self,
             interest: &mut [(i32, ax_abi_port::Ready)],
@@ -4262,6 +4273,26 @@ mod tests {
         let mut len = call("SysStringLen", [0, 0, 0, 0, 0, 0], teb);
         win32::dispatch(&mut len, &host);
         assert_eq!(len.result, Some(0), "a null string is empty");
+    }
+
+    #[test]
+    fn a_pipe_does_not_reach_a_child_unless_something_puts_it_there() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        // CreatePipe(hReadPipe, hWritePipe, lpPipeAttributes, nSize).
+        let mut made = call("CreatePipe", [0x7000, 0x7008, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut made, &host);
+        assert_eq!(made.result, Some(1), "the pipe was made");
+        // Windows hands a child the handles a spawn names and nothing else.
+        // A pipe whose ends came along by themselves is a pipe the child
+        // holds the writing end of, so the reading end never reaches an end
+        // of file - which is how `subprocess.run(input=...)` hangs.
+        assert_eq!(
+            *host.piped.borrow(),
+            Some(true),
+            "both ends are close-on-exec until a duplicate makes one inheritable"
+        );
     }
 
     #[test]

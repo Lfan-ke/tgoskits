@@ -1232,11 +1232,13 @@ pub fn create_pipe(c: &mut Call<'_>) -> Dispatch {
     let Some(files) = c.host.files() else {
         return c.fail(super::ERROR_CALL_NOT_IMPLEMENTED, FALSE);
     };
-    // Not close-on-exec: a child here starts with the descriptors its parent
-    // had, and that is how a handle reaches it - a spawn hands the child a
-    // number and has it duplicate what the number names. An end that went at
-    // exec would leave the child duplicating nothing.
-    let (read_fd, write_fd) = match files.pipe(false) {
+    // Close-on-exec, because a Windows child gets the handles a spawn names
+    // and nothing else. Both ends coming along by themselves would leave a
+    // child holding the writing end of its own standard input, which never
+    // then reaches an end of file. What a child is meant to have arrives
+    // another way: the three the startup info names, or a handle it takes
+    // from its parent by duplicating one.
+    let (read_fd, write_fd) = match files.pipe(true) {
         Ok(ends) => ends,
         Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
     };
