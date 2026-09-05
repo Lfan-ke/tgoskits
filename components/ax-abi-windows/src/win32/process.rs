@@ -408,10 +408,21 @@ pub fn open_process(c: &mut Call<'_>) -> Dispatch {
 
 /// What a child was told to exit with, until it has.
 ///
-/// `TerminateProcess` names the code the process is to report, and the host
-/// ends it with a signal, which is a different thing to report; this is what
-/// keeps the two apart.
+/// What a process is to be reported as having exited with, when that is not
+/// what the host can carry.
+///
+/// Two calls put something here. `TerminateProcess` names a code and the host
+/// ends the process with a signal, which is a different thing to report;
+/// `ExitProcess` names a full 32-bit code and the host's wait status keeps
+/// only the low byte of it - and a Windows program does exit with more than a
+/// byte, `STATUS_CONTROL_C_EXIT` being the one CPython uses for an
+/// unhandled interrupt.
 static TERMINATED: SpinLock<BTreeMap<u32, u32>> = SpinLock::new(BTreeMap::new());
+
+/// Remember the code `pid` is to be reported as having exited with.
+pub(super) fn ending(pid: u32, code: u32) {
+    TERMINATED.lock().insert(pid, code);
+}
 
 /// TerminateProcess on a child: end it, and remember what it is to be
 /// reported as having exited with.

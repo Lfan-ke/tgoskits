@@ -925,7 +925,14 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             let Some(tasks) = host.tasks() else {
                 return c.fail(ERROR_CALL_NOT_IMPLEMENTED, FALSE);
             };
-            let _ = tasks.exit_group(c.arg(0) as i32);
+            let code = c.arg(0) as u32;
+            // The host's wait status carries a byte and a Windows exit code is
+            // a word, so what the whole of it was is left where whoever waits
+            // for this process will look.
+            if let Ok(pid) = tasks.getpid() {
+                process::ending(pid as u32, code);
+            }
+            let _ = tasks.exit_group(code as i32);
             c.finish(FALSE)
         }
         // TerminateProcess ends the process the handle names, which is this
@@ -1398,8 +1405,16 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                     Some(result) => c.finish(result),
                     // A handle that names no object of ours is taken as
                     // already signalled, which is what it was before any
-                    // object existed.
-                    None => c.finish(sync::WAIT_OBJECT_0),
+                    // object existed - and is worth saying out loud, since a
+                    // wait that answers "ready" for a reason like this is a
+                    // wrong answer wearing a right one's clothes.
+                    None => {
+                        c.host.platform().trace(&alloc::format!(
+                            "WaitForSingleObject: {handle:#x} names no object here, reporting it \
+                             signalled"
+                        ));
+                        c.finish(sync::WAIT_OBJECT_0)
+                    }
                 },
             }
         }
@@ -1713,12 +1728,18 @@ pub(crate) const PEB_SIGNAL_SEQ: usize = 0xF48;
 /// over.
 pub(crate) const PEB_DETACHING: usize = 0xF58;
 
+/// Where the process-wide table of FLS callbacks hangs.
+pub(crate) const PEB_FLS_CALLBACKS: usize = 0xF60;
+
 /// Where the section objects this process has made hang, the same way.
 pub(crate) const PEB_MAPPINGS: usize = 0xF10;
 
-// Each of these words is written for a different reason; sharing one would
-// let a signal rewrite the cookie under an encoded pointer.
-const PEB_WORDS: [usize; 10] = [
+// Each of these words is written for a different reason; sharing one would let
+// a signal rewrite the cookie under an encoded pointer - or, as happened once,
+// let a named pipe write its list head over the FLS callback table and take
+// the C runtime's per-thread data with it. Every word this layer keeps past
+// the real PEB belongs in this list, wherever it is used from.
+const PEB_WORDS: [usize; 11] = [
     PEB_TEMP_FILES,
     PEB_PIPES,
     PEB_PORT_FILES,
@@ -1729,6 +1750,7 @@ const PEB_WORDS: [usize; 10] = [
     PEB_PENDING_ATTACH,
     PEB_EXCEPTION_FILTER,
     PEB_DETACHING,
+    PEB_FLS_CALLBACKS,
 ];
 
 /// The bitmap `PEB.TlsBitmap` points at is the one other thing kept past the

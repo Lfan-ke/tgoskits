@@ -5245,6 +5245,61 @@ mod tests {
     }
 
     #[test]
+    fn making_a_named_pipe_leaves_the_runtime_its_thread_data() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let call_it = |name: &str, args: [usize; 6]| {
+            let mut c = call(name, args, teb);
+            win32::dispatch(&mut c, &host);
+            c.result
+        };
+        let first = call_it("FlsAlloc", [0; 6]).expect("an index");
+        let second = call_it("FlsAlloc", [0; 6]).expect("another index");
+        assert_ne!(first, second);
+        assert_eq!(call_it("FlsSetValue", [first, 0xDEAD, 0, 0, 0, 0]), Some(1));
+        assert_eq!(
+            call_it("FlsSetValue", [second, 0xBEEF, 0, 0, 0, 0]),
+            Some(1)
+        );
+
+        // The pipe keeps a list of its own past the real PEB, as several other
+        // things here do. Sharing a word with the FLS table would leave the
+        // runtime unable to keep its per-thread data, which it answers by
+        // aborting the process.
+        let name: Vec<u8> = "\\\\.\\pipe\\t\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let name_at = 0x7800usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[name_at..name_at + name.len()].copy_from_slice(&name);
+        }
+        let mut made = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("CreateNamedPipeW").unwrap(),
+            [name_at, 3, 4, 1, 8192, 8192],
+            teb,
+            &[0xFFFF_FFFF, 0],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut made, &host);
+        assert_ne!(made.result, Some(usize::MAX), "the pipe was made");
+
+        assert_eq!(call_it("FlsGetValue", [first, 0, 0, 0, 0, 0]), Some(0xDEAD));
+        assert_eq!(
+            call_it("FlsGetValue", [second, 0, 0, 0, 0, 0]),
+            Some(0xBEEF)
+        );
+        let third = call_it("FlsAlloc", [0; 6]).expect("a third index");
+        assert!(
+            third != first && third != second,
+            "and the next index is a new one, not one already handed out"
+        );
+    }
+
+    #[test]
     fn the_temporary_directory_is_what_the_environment_says_it_is() {
         use crate::win32;
         let host = MockHost::default();

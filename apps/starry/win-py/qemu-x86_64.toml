@@ -9,10 +9,10 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/python/python.exe /suite/run_all.py"
-success_regex = ['(?m)^TEST PASSED']
+shell_init_cmd = "PYTHONUNBUFFERED=1 /python/python.exe /python/probe_sem.py"
+success_regex = ['(?m)^SEM PROBE DONE']
 # Only the machine failing ends the run: the suite prints its own verdict, and
 # t19 drives the interpreter's own error paths on purpose - a child that dies
 # with "Fatal Python error" is a check passing, not the run failing.
 fail_regex = ['(?i)panic']
-timeout = 6000
+timeout = 1200

@@ -266,6 +266,7 @@ fn socket(c: &Call<'_>) -> Option<i32> {
 /// into the connection, which is what Windows does with the same handle.
 pub fn create_named_pipe(c: &mut Call<'_>) -> Dispatch {
     let (name_at, instances) = (c.arg(0), c.arg(3) as u32);
+    c.host.platform().trace("XXTRACE CreateNamedPipeW entry");
     let Some(path) = super::file::name_at_arg(c, name_at) else {
         return c.fail(super::ERROR_INVALID_PARAMETER, INVALID_HANDLE);
     };
@@ -287,6 +288,7 @@ pub fn create_named_pipe(c: &mut Call<'_>) -> Dispatch {
     }
     remember(c, fd);
     c.set_last_error(0);
+    c.host.platform().trace("XXTRACE CreateNamedPipeW leaving");
     c.finish(Handle::from_slot(fd as usize).0 as usize)
 }
 
@@ -343,6 +345,7 @@ pub(super) fn open_client(c: &mut Call<'_>, path: &str) -> Dispatch {
     }
     remember(c, fd);
     c.set_last_error(0);
+    c.host.platform().trace("XXTRACE CreateNamedPipeW leaving");
     c.finish(Handle::from_slot(fd as usize).0 as usize)
 }
 

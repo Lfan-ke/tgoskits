@@ -20,7 +20,7 @@ use crate::{
     nt::Ntstatus,
     teb_peb::{
         LDR_DLL_BASE, LDR_IN_LOAD_ORDER, LDR_SIZE_OF_IMAGE, PEB_IMAGE_BASE, PEB_LDR, PEB_OS_MAJOR,
-        PEB_PRIVATE, PEB_PROCESS_HEAP, TEB_FLS_SLOTS,
+        PEB_PROCESS_HEAP, TEB_FLS_SLOTS,
     },
 };
 
@@ -35,7 +35,7 @@ const NO_CALLBACK: u64 = u64::MAX;
 
 /// Where the process-wide FLS tables are recorded: the callback table's
 /// address, in the PEB's private area.
-const PEB_FLS_CALLBACKS: usize = PEB_PRIVATE + 0x20;
+use super::PEB_FLS_CALLBACKS;
 
 /// The callback table, made on first use.
 fn fls_callbacks(c: &Call<'_>) -> Option<usize> {

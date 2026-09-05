@@ -1,4 +1,4 @@
-"""Why the C runtime's exit does not flush what was written before it.
+"""What the C runtime does with the output written before it exits.
 
 `exit()` in ucrtbase runs one table of registered handlers and then ends the
 process with TerminateProcess - which, unlike ExitProcess, runs no
@@ -73,24 +73,5 @@ for name, body in WAYS.items():
     code = "import ctypes; c = ctypes.CDLL('ucrtbase.dll'); " + body
     p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     print("%-30s rc=%d out=%r err=%r" % (name, p.returncode, p.stdout, p.stderr[-120:]), flush=True)
-
-# The hypothesis: with no AppModel API to ask, common_exit takes the
-# ExitProcess branch, and on Windows ExitProcess is what runs every loaded
-# module's DllMain(DLL_PROCESS_DETACH) - which is where ucrtbase flushes. We
-# do not run those, so nothing flushes. Calling ucrtbase's own entry point by
-# hand should therefore make the text appear.
-DETACH = (
-    "import ctypes;"
-    "k = ctypes.CDLL('kernel32.dll');"
-    "k.GetModuleHandleW.restype = ctypes.c_void_p;"
-    "b = k.GetModuleHandleW('ucrtbase.dll');"
-    "c = ctypes.CDLL('ucrtbase.dll');"
-    "c.puts(b'MARK');"
-    "f = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p)(b + 0x63c80);"
-    "f(b, 0, None);"
-    "c._exit(0)"
-)
-p = subprocess.run([sys.executable, "-c", DETACH], capture_output=True, text=True)
-print("%-30s rc=%d out=%r err=%r" % ("detach by hand then _exit", p.returncode, p.stdout, p.stderr[-200:]), flush=True)
 
 print("EXIT PROBE DONE", flush=True)
