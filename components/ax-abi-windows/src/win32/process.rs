@@ -57,6 +57,16 @@ pub(super) fn pid_of(handle: usize) -> Option<u32> {
         .then_some((handle & !TAG_MASK) as u32)
 }
 
+/// The same, for the process handle only.
+///
+/// A spawn is handed one handle for the child and one for its first thread,
+/// and closes the thread's straight away. What the child exited with is the
+/// process handle's to hold, so the two have to be told apart before anything
+/// is let go of.
+pub(super) fn process_pid_of(handle: usize) -> Option<u32> {
+    (handle != 0 && handle & TAG_MASK == PROCESS_TAG).then_some((handle & !TAG_MASK) as u32)
+}
+
 /// A Windows command line as `CommandLineToArgvW` splits it: whitespace
 /// separates arguments, double quotes group, and a run of backslashes before
 /// a quote halves, an odd one escaping the quote.

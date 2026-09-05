@@ -1472,10 +1472,15 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         // No thread here was converted to a fiber.
         "IsThreadAFiber" => c.finish(FALSE),
         "CloseHandle" => {
-            // A process or thread pseudo-handle holds nothing but what the
-            // child exited with, which nobody can ask for once it is closed.
-            if let Some(pid) = process::pid_of(c.arg(0)) {
+            // A process pseudo-handle holds nothing but what the child exited
+            // with, which nobody can ask for once it is closed. A thread's
+            // holds nothing at all, and closing it - which a spawn does the
+            // moment it has the pair - must not take the exit code with it.
+            if let Some(pid) = process::process_pid_of(c.arg(0)) {
                 process::forget(pid);
+                return c.finish(TRUE);
+            }
+            if process::pid_of(c.arg(0)).is_some() {
                 return c.finish(TRUE);
             }
             // An event or mutex is a block of the process heap, which goes

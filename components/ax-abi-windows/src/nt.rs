@@ -3744,6 +3744,42 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_thread_handle_leaves_the_exit_code_where_it_was() {
+        use crate::win32;
+        const PROCESS_TAG: usize = 0x2000_0000;
+        const THREAD_TAG: usize = 0x3000_0000;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        host.exits.borrow_mut().insert(51, 9);
+        let code_at = 0x7A00usize;
+        let read_code = || {
+            let mut asked = call(
+                "GetExitCodeProcess",
+                [PROCESS_TAG | 51, code_at, 0, 0, 0, 0],
+                teb,
+            );
+            win32::dispatch(&mut asked, &host);
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[code_at..code_at + 4].try_into().unwrap())
+        };
+        assert_eq!(read_code(), 9);
+
+        // A spawn closes the thread handle the moment it has the pair, and
+        // what the child exited with is the process handle's to hold.
+        let mut shut = call("CloseHandle", [THREAD_TAG | 51, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut shut, &host);
+        assert_eq!(shut.result, Some(1));
+        assert_eq!(read_code(), 9, "the code is still there");
+
+        // Closing the process handle is what lets it go, so a later child
+        // taking the same number is not reported as this one.
+        let mut done = call("CloseHandle", [PROCESS_TAG | 51, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut done, &host);
+        host.exits.borrow_mut().remove(&51);
+        assert_eq!(read_code(), 259, "STILL_ACTIVE once nothing is remembered");
+    }
+
+    #[test]
     fn a_handle_read_out_of_another_process_is_fetched_from_it() {
         use crate::win32;
         const PROCESS_TAG: usize = 0x2000_0000;
