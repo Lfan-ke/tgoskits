@@ -56,7 +56,7 @@ const AT_FDCWD: i32 = -2;
 /// The longest path this ABI resolves, matching XNU's `PATH_MAX`.
 const PATH_MAX: usize = 1024;
 
-mod nr {
+pub(crate) mod nr {
     pub const EXIT: usize = 1;
     pub const READ: usize = 3;
     pub const WRITE: usize = 4;
@@ -288,7 +288,7 @@ fn mach(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     }
 }
 
-fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
+pub(crate) fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysResult> {
     let fd = a[0] as i32;
     Some(match call {
         // XNU's `exit` encodes the status the same way, through W_EXITCODE.

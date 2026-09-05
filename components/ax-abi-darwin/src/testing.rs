@@ -59,6 +59,7 @@ impl TrapEnv for Trap {
 #[derive(Default)]
 pub struct MockHost {
     pub wrote: RefCell<Option<(i32, usize, usize)>>,
+    pub closed: RefCell<Option<i32>>,
     pub mapped: RefCell<Option<MapRequest>>,
     pub advised: RefCell<Option<Advice>>,
     /// User memory, as one flat buffer starting at address zero.
@@ -114,7 +115,8 @@ impl Files for MockHost {
         *self.wrote.borrow_mut() = Some((fd, uaddr, len));
         Ok(len as isize)
     }
-    fn close(&self, _fd: i32) -> SysResult {
+    fn close(&self, fd: i32) -> SysResult {
+        *self.closed.borrow_mut() = Some(fd);
         Ok(0)
     }
     fn dup(&self, _fd: i32) -> SysResult {

@@ -15,7 +15,7 @@
 use ax_abi_port::{Host, SysResult};
 use ax_dispatch::{Dispatch, TrapEnv};
 
-use crate::system::DarwinCall;
+use crate::{bsd::nr, system::DarwinCall};
 
 /// `ENOSYS`, which is what an entry point that is bound but not written yet
 /// answers with.
@@ -58,18 +58,48 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     Dispatch::Handled
 }
 
+/// The entry points that are a system call and nothing else. libSystem's own
+/// are the same shape - a few instructions that move the arguments and trap -
+/// so what they do is what the BSD half already does.
+const CALLS: &[(&str, usize)] = &[
+    ("__exit", nr::EXIT),
+    ("_close", nr::CLOSE),
+    ("_dup2", nr::DUP2),
+    ("_fstat$INODE64", nr::FSTAT64),
+    ("_fsync", nr::FSYNC),
+    ("_ftruncate", nr::FTRUNCATE),
+    ("_getegid", nr::GETEGID),
+    ("_geteuid", nr::GETEUID),
+    ("_getgid", nr::GETGID),
+    ("_getpid", nr::GETPID),
+    ("_getppid", nr::GETPPID),
+    ("_getuid", nr::GETUID),
+    ("_lseek", nr::LSEEK),
+    ("_lstat$INODE64", nr::LSTAT64),
+    ("_madvise", nr::MADVISE),
+    ("_mmap", nr::MMAP),
+    ("_mprotect", nr::MPROTECT),
+    ("_munmap", nr::MUNMAP),
+    ("_open", nr::OPEN),
+    ("_openat", nr::OPENAT),
+    ("_pread", nr::PREAD),
+    ("_pwrite", nr::PWRITE),
+    ("_read", nr::READ),
+    ("_stat$INODE64", nr::STAT64),
+    ("_write", nr::WRITE),
+];
+
 /// What one call does, or `None` for one this layer does not serve yet.
 fn route(host: &dyn Host, call: DarwinCall, a: &[usize; 6]) -> Option<SysResult> {
-    let fd = a[0] as i32;
-    Some(match call.name() {
+    let name = call.name();
+    if let Ok(at) = CALLS.binary_search_by_key(&name, |entry| entry.0) {
+        return crate::bsd::route(host, CALLS[at].1, a);
+    }
+    Some(match name {
         // `exit(3)`. Flushing what stdio holds belongs here once there is
         // stdio to flush; until then it is the same as leaving.
-        "_exit" | "__exit" => host.tasks()?.exit_group((a[0] as i32) << 8),
-        "_read" => host.files()?.read(fd, a[1], a[2]),
-        "_write" => host.files()?.write(fd, a[1], a[2]),
-        "_close" => host.files()?.close(fd),
-        "_getpid" => host.tasks()?.getpid(),
-        "_getppid" => host.tasks()?.getppid(),
+        "_exit" => host.tasks()?.exit_group((a[0] as i32) << 8),
+        "_dup" => host.files()?.dup(a[0] as i32),
         _ => return None,
     })
 }
@@ -114,6 +144,24 @@ mod tests {
             (Some(9), Some(true)),
             "EBADF, not its negation"
         );
+    }
+
+    #[test]
+    fn the_calls_that_are_only_a_system_call_reach_the_bsd_half() {
+        let host = MockHost::default();
+        let mut env = Trap::at(nr("_close"), [7, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(*host.closed.borrow(), Some(7));
+    }
+
+    #[test]
+    fn the_delegated_table_is_sorted_so_the_search_finds_them() {
+        for pair in CALLS.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "{} then {}", pair[0].0, pair[1].0);
+        }
+        for (name, _) in CALLS {
+            assert!(Library::call(name).is_some(), "{name} is an entry point");
+        }
     }
 
     #[test]
