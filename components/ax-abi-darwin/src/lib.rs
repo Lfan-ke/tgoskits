@@ -16,6 +16,7 @@
 #![feature(used_with_arg)]
 
 pub mod bsd;
+pub mod link;
 pub mod system;
 
 extern crate alloc;

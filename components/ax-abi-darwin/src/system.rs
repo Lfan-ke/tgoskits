@@ -391,6 +391,10 @@ pub const TABLE: &[Entry] = &[
     text("_wmemcmp"),
     text("_write"),
     text("_writev"),
+    // Lazy binding never happens here - every bind is resolved before the
+    // program runs - but an image still names the binder, so it is one more
+    // entry point, and one that should never be reached.
+    text("dyld_stub_binder"),
 ];
 
 /// A call this layer serves: a position in [`TABLE`].
