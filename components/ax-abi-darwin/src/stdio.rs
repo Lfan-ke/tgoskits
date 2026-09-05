@@ -34,6 +34,10 @@ const ERROR_SEEN: u32 = 2;
 const EOF: isize = -1;
 /// `EBADF`.
 const EBADF: i32 = 9;
+/// `EINVAL`.
+const EINVAL: i32 = 22;
+/// `ENOMEM`.
+const ENOMEM: i32 = 12;
 
 /// Where the stream numbered `which` is: 0 in, 1 out, 2 error.
 pub fn standard(at: &Library, which: u64) -> u64 {
@@ -280,8 +284,104 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_can_be_made_over_a_descriptor_and_over_a_name() {
+        let (host, at) = ready();
+        let file = fdopen(&host, &at, 7).unwrap() as usize;
+        assert_ne!(file, 0);
+        assert_eq!(fileno(&host, file).unwrap(), 7);
+        assert_eq!(status(&host, file, 1).unwrap(), 0, "a new stream is clean");
+
+        host.write_user(0x400, b"/tmp/f\0").unwrap();
+        host.write_user(0x420, b"w\0").unwrap();
+        let made = fopen(&host, &at, 0x400, 0x420).unwrap() as usize;
+        assert_ne!(made, 0);
+        let (_, name, how) = host.opened.borrow().clone().expect("the name was opened");
+        assert_eq!(name, "/tmp/f");
+        assert!(how.write && how.truncate && !how.read);
+        assert_eq!(how.create, ax_abi_port::Create::IfAbsent);
+    }
+
+    #[test]
+    fn a_mode_string_says_which_way_the_stream_goes() {
+        let read = mode(b"r").unwrap();
+        assert!(read.read && !read.write && !read.truncate);
+        assert_eq!(read.create, ax_abi_port::Create::Never);
+        let update = mode(b"r+").unwrap();
+        assert!(update.read && update.write && !update.truncate);
+        let append = mode(b"a").unwrap();
+        assert!(append.append && !append.truncate);
+        let exclusive = mode(b"wx").unwrap();
+        assert_eq!(exclusive.create, ax_abi_port::Create::Exclusive);
+        // `b` is allowed and changes nothing; a mode that names no direction
+        // is not a mode.
+        assert!(mode(b"rb").unwrap().read);
+        assert!(mode(b"z").is_none());
+        assert!(mode(b"").is_none());
+    }
+
+    #[test]
     fn a_stream_with_no_descriptor_behind_it_is_refused() {
         let (host, _) = ready();
         assert_eq!(fileno(&host, 0), Err(EBADF));
     }
+}
+
+/// A stream over an already-open descriptor. The stream itself comes from the
+/// heap, so `fclose` on it leaves a block the caller can no longer name -
+/// which is what closing a stream does to its own storage anyway.
+pub fn fdopen(host: &dyn Host, at: &Library, fd: i32) -> SysResult {
+    let file = crate::heap::malloc(host, at, FILE_LEN as usize)? as usize;
+    if file == 0 {
+        return Err(ENOMEM);
+    }
+    host.platform()
+        .write_user(file, &[0u8; FILE_LEN as usize])?;
+    host.platform().write_user(file, &fd.to_le_bytes())?;
+    Ok(file as isize)
+}
+
+/// `fopen(path, mode)`: the name opened the way the mode word asks, then a
+/// stream over it.
+pub fn fopen(host: &dyn Host, at: &Library, path_at: usize, mode_at: usize) -> SysResult {
+    let mut name = [0u8; 1024];
+    let len = host.platform().read_user_cstr(path_at, &mut name)? as usize;
+    let name = core::str::from_utf8(&name[..len]).map_err(|_| EINVAL)?;
+    let mut spelled = [0u8; 16];
+    let len = host.platform().read_user_cstr(mode_at, &mut spelled)? as usize;
+    let how = mode(&spelled[..len]).ok_or(EINVAL)?;
+    let fd = host
+        .paths()
+        .ok_or(EBADF)?
+        .open(ax_abi_port::At::Cwd, name, &how)? as i32;
+    fdopen(host, at, fd)
+}
+
+/// What a mode string asks for, or `None` for one that says nothing valid.
+/// The first letter decides; `+` adds the other direction, and the modifiers
+/// after it are `b` (which changes nothing here), `x` and `e`.
+fn mode(spelled: &[u8]) -> Option<ax_abi_port::OpenHow> {
+    let (first, rest) = spelled.split_first()?;
+    let plus = rest.contains(&b'+');
+    let mut how = ax_abi_port::OpenHow {
+        read: *first == b'r' || plus,
+        write: *first != b'r' || plus,
+        append: *first == b'a',
+        truncate: *first == b'w',
+        create: if *first == b'r' {
+            ax_abi_port::Create::Never
+        } else {
+            ax_abi_port::Create::IfAbsent
+        },
+        directory: false,
+        follow: true,
+        close_on_exec: rest.contains(&b'e'),
+        mode: 0o666,
+    };
+    if !matches!(*first, b'r' | b'w' | b'a') {
+        return None;
+    }
+    if rest.contains(&b'x') {
+        how.create = ax_abi_port::Create::Exclusive;
+    }
+    Some(how)
 }

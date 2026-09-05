@@ -158,6 +158,8 @@ fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) ->
         "_ferror" => crate::stdio::status(host, a[0], 2),
         "_clearerr" => crate::stdio::clearerr(host, a[0]),
         "_fclose" => crate::stdio::fclose(host, a[0]),
+        "_fopen" | "_fopen$DARWIN_EXTSN" => crate::stdio::fopen(host, &library, a[0], a[1]),
+        "_fdopen$DARWIN_EXTSN" => crate::stdio::fdopen(host, &library, a[0] as i32),
         "_fflush" | "_setvbuf" | "_flockfile" | "_funlockfile" => Ok(0),
         // Both of these end the program on purpose and neither returns. The
         // status is the one a shell reports for a process killed by SIGABRT,
