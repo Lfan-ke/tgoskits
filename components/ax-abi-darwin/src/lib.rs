@@ -21,6 +21,9 @@ pub mod link;
 pub mod start;
 pub mod system;
 
+#[cfg(test)]
+mod testing;
+
 extern crate alloc;
 
 /// The page a Darwin x86_64 image is laid out in.

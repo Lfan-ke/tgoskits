@@ -468,18 +468,18 @@ mod tests {
         let host = MockHost::default();
         // MADV_FREE is 5 on Darwin and 8 on Linux; passing the number through
         // would mean something else entirely on the host.
-        let mut env = Trap::at(nr::MADVISE, [0x1000, 0x1000, 5, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::MADVISE), [0x1000, 0x1000, 5, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(*host.advised.borrow(), Some(Advice::Free));
 
         // The values above the shared range are Darwin's own and have no
         // action here, which is not a failure.
-        let mut reuse = Trap::at(nr::MADVISE, [0x1000, 0x1000, 7, 0, 0, 0]);
+        let mut reuse = Trap::at(unix_call(nr::MADVISE), [0x1000, 0x1000, 7, 0, 0, 0]);
         assert_eq!(dispatch(&mut reuse, &host), Dispatch::Handled);
         assert_eq!(*host.advised.borrow(), Some(Advice::Ignored));
 
         // Anything past what Darwin defines is refused.
-        let mut bad = Trap::at(nr::MADVISE, [0x1000, 0x1000, 99, 0, 0, 0]);
+        let mut bad = Trap::at(unix_call(nr::MADVISE), [0x1000, 0x1000, 99, 0, 0, 0]);
         assert_eq!(dispatch(&mut bad, &host), Dispatch::Handled);
         assert_eq!(bad.failed, Some(true));
     }
@@ -488,14 +488,14 @@ mod tests {
     fn msync_takes_darwins_flag_values() {
         let host = MockHost::default();
         // MS_SYNC is 0x10 here, where Linux writes 4.
-        let mut ok = Trap::at(nr::MSYNC, [0x1000, 0x1000, 0x10, 0, 0, 0]);
+        let mut ok = Trap::at(unix_call(nr::MSYNC), [0x1000, 0x1000, 0x10, 0, 0, 0]);
         assert_eq!(dispatch(&mut ok, &host), Dispatch::Handled);
         assert_eq!(ok.failed, Some(false));
 
         // Both kinds of sync at once is a contradiction, and an undefined bit
         // is refused rather than ignored.
         for flags in [0x1 | 0x10, 0x40] {
-            let mut bad = Trap::at(nr::MSYNC, [0x1000, 0x1000, flags, 0, 0, 0]);
+            let mut bad = Trap::at(unix_call(nr::MSYNC), [0x1000, 0x1000, flags, 0, 0, 0]);
             assert_eq!(dispatch(&mut bad, &host), Dispatch::Handled);
             assert_eq!(bad.failed, Some(true), "flags {flags:#x}");
         }
@@ -504,314 +504,20 @@ mod tests {
     #[test]
     fn munmap_wants_a_page_aligned_address() {
         let host = MockHost::default();
-        let mut bad = Trap::at(nr::MUNMAP, [0x1001, 0x1000, 0, 0, 0, 0]);
+        let mut bad = Trap::at(unix_call(nr::MUNMAP), [0x1001, 0x1000, 0, 0, 0, 0]);
         assert_eq!(dispatch(&mut bad, &host), Dispatch::Handled);
         assert_eq!(bad.failed, Some(true));
     }
 
-    use alloc::{
-        string::{String, ToString},
-        vec,
-        vec::Vec,
-    };
+    use alloc::vec;
     use core::cell::RefCell;
 
-    use ax_abi_port::{Creds, EFAULT, Files, Mem, Paths, Platform, Tasks};
-
     use super::*;
+    use crate::testing::{MockHost, Trap};
 
     /// A BSD call as it arrives: the class in the top byte, the number below.
     fn unix_call(nr: usize) -> usize {
         (CLASS_UNIX << CLASS_SHIFT) | nr
-    }
-
-    #[derive(Default)]
-    struct Trap {
-        nr: usize,
-        args: [usize; 6],
-        result: Option<usize>,
-        failed: Option<bool>,
-    }
-    impl Trap {
-        /// A BSD call, with the class the number carries.
-        fn at(call: usize, args: [usize; 6]) -> Self {
-            Self {
-                nr: unix_call(call),
-                args,
-                result: None,
-                failed: None,
-            }
-        }
-    }
-
-    impl TrapEnv for Trap {
-        fn nr(&self) -> usize {
-            self.nr
-        }
-        fn arg(&self, i: usize) -> usize {
-            self.args[i]
-        }
-        fn set_result(&mut self, value: usize) {
-            self.result = Some(value);
-        }
-        fn set_error(&mut self, failed: bool) {
-            self.failed = Some(failed);
-        }
-    }
-
-    #[derive(Default)]
-    struct MockHost {
-        wrote: RefCell<Option<(i32, usize, usize)>>,
-        mapped: RefCell<Option<MapRequest>>,
-        advised: RefCell<Option<Advice>>,
-        /// User memory, as one flat buffer starting at address zero.
-        mem: RefCell<Vec<u8>>,
-        opened: RefCell<Option<(At, String, OpenHow)>>,
-        asked: RefCell<Option<(String, bool)>>,
-        describes: Option<Attributes>,
-    }
-    // Single-threaded tests; the ports ask for Sync on a real host.
-    unsafe impl Sync for MockHost {}
-
-    impl Platform for MockHost {
-        fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
-            let mem = self.mem.borrow();
-            let end = uaddr + out.len();
-            if end > mem.len() {
-                return Err(EFAULT);
-            }
-            out.copy_from_slice(&mem[uaddr..end]);
-            Ok(0)
-        }
-        fn write_user(&self, uaddr: usize, data: &[u8]) -> SysResult {
-            let mut mem = self.mem.borrow_mut();
-            let end = uaddr + data.len();
-            if end > mem.len() {
-                return Err(EFAULT);
-            }
-            mem[uaddr..end].copy_from_slice(data);
-            Ok(0)
-        }
-        fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
-            // Reads one byte at a time so it stops at the terminator, which
-            // is what a host with real mappings has to do anyway.
-            for (i, slot) in out.iter_mut().enumerate() {
-                let mut byte = [0u8; 1];
-                self.read_user(uaddr + i, &mut byte)?;
-                if byte[0] == 0 {
-                    return Ok(i as isize);
-                }
-                *slot = byte[0];
-            }
-            Ok(out.len() as isize)
-        }
-    }
-    impl Files for MockHost {
-        fn read(&self, _fd: i32, _u: usize, len: usize) -> SysResult {
-            Ok(len as isize)
-        }
-        fn write(&self, fd: i32, uaddr: usize, len: usize) -> SysResult {
-            if fd < 0 {
-                return Err(EBADF);
-            }
-            *self.wrote.borrow_mut() = Some((fd, uaddr, len));
-            Ok(len as isize)
-        }
-        fn close(&self, _fd: i32) -> SysResult {
-            Ok(0)
-        }
-        fn dup(&self, _fd: i32) -> SysResult {
-            Ok(5)
-        }
-        fn seek(&self, _fd: i32, to: ax_abi_port::SeekFrom) -> SysResult {
-            Ok(match to {
-                ax_abi_port::SeekFrom::Start(at) => at as isize,
-                ax_abi_port::SeekFrom::Current(by) | ax_abi_port::SeekFrom::End(by) => by as isize,
-            })
-        }
-        fn validate(&self, _fd: i32) -> SysResult {
-            Ok(0)
-        }
-        fn seekable(&self, _fd: i32) -> SysResult {
-            Ok(0)
-        }
-        fn readv(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> SysResult {
-            Ok(0)
-        }
-        fn preadv(&self, _fd: i32, _segs: &[ax_abi_port::Segment], _offset: u64) -> SysResult {
-            Ok(0)
-        }
-        fn writev(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> SysResult {
-            Ok(0)
-        }
-        fn pwritev(&self, _fd: i32, _segs: &[ax_abi_port::Segment], _offset: u64) -> SysResult {
-            Ok(0)
-        }
-        fn pread(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> SysResult {
-            Ok(len as isize)
-        }
-        fn pwrite(&self, _fd: i32, _u: usize, len: usize, _o: u64) -> SysResult {
-            Ok(len as isize)
-        }
-        fn dup_onto(&self, _old: i32, new: i32, _cloexec: bool) -> SysResult {
-            Ok(new as isize)
-        }
-        fn fsync(&self, _fd: i32, _datasync: bool) -> SysResult {
-            Ok(0)
-        }
-        fn ftruncate(&self, _fd: i32, _len: u64) -> SysResult {
-            Ok(0)
-        }
-    }
-    impl Mem for MockHost {
-        fn brk(&self) -> usize {
-            0
-        }
-        fn set_brk(&self, _addr: usize) -> SysResult {
-            Ok(0)
-        }
-        fn map(&self, req: &MapRequest) -> SysResult {
-            *self.mapped.borrow_mut() = Some(*req);
-            Ok(0x9000)
-        }
-        fn unmap(&self, _a: usize, _l: usize) -> SysResult {
-            Ok(0)
-        }
-        fn protect(&self, _a: usize, _l: usize, _p: Prot) -> SysResult {
-            Ok(0)
-        }
-        fn advise(&self, _a: usize, _l: usize, adv: Advice) -> SysResult {
-            *self.advised.borrow_mut() = Some(adv);
-            Ok(0)
-        }
-        fn writeback(&self, _a: usize, _l: usize) -> SysResult {
-            Ok(0)
-        }
-    }
-    impl Tasks for MockHost {
-        fn getpid(&self) -> SysResult {
-            Ok(77)
-        }
-        fn getppid(&self) -> SysResult {
-            Ok(1)
-        }
-        fn gettid(&self) -> u32 {
-            77
-        }
-        fn set_tid_address(&self, _t: usize) -> SysResult {
-            Ok(77)
-        }
-        fn sched_yield(&self) -> SysResult {
-            Ok(0)
-        }
-        fn exit(&self, _status: i32) -> SysResult {
-            Ok(0)
-        }
-        fn exit_group(&self, _status: i32) -> SysResult {
-            Ok(0)
-        }
-    }
-    impl Creds for MockHost {
-        fn uids(&self) -> (u32, u32, u32) {
-            (501, 501, 0)
-        }
-        fn gids(&self) -> (u32, u32, u32) {
-            (20, 20, 0)
-        }
-    }
-    type SysResultAttr = Result<Attributes, i32>;
-
-    impl Paths for MockHost {
-        fn open(&self, at: At, path: &str, how: &OpenHow) -> SysResult {
-            *self.opened.borrow_mut() = Some((at, path.to_string(), *how));
-            Ok(5)
-        }
-        fn attributes(&self, _at: At, path: &str, follow: bool) -> SysResultAttr {
-            *self.asked.borrow_mut() = Some((path.to_string(), follow));
-            self.describes.clone().ok_or(ax_abi_port::ENOENT)
-        }
-        fn attributes_of(&self, _fd: i32) -> SysResultAttr {
-            self.describes.clone().ok_or(ax_abi_port::EBADF)
-        }
-
-        fn permitted(
-            &self,
-            _at: ax_abi_port::At,
-            _path: &str,
-            _wants: ax_abi_port::Access,
-            _follow: bool,
-            _real_ids: bool,
-        ) -> Result<(), i32> {
-            Ok(())
-        }
-
-        fn permitted_of(
-            &self,
-            _fd: i32,
-            _wants: ax_abi_port::Access,
-            _real_ids: bool,
-        ) -> Result<(), i32> {
-            Ok(())
-        }
-    }
-
-    impl Host for MockHost {
-        fn platform(&self) -> &dyn Platform {
-            self
-        }
-        fn paths(&self) -> Option<&dyn Paths> {
-            Some(self)
-        }
-        fn files(&self) -> Option<&dyn Files> {
-            Some(self)
-        }
-        fn mem(&self) -> Option<&dyn Mem> {
-            Some(self)
-        }
-        fn tasks(&self) -> Option<&dyn Tasks> {
-            Some(self)
-        }
-        fn creds(&self) -> Option<&dyn Creds> {
-            Some(self)
-        }
-    }
-
-    // The personality resolves its host through the platform binding, so the
-    // test binary provides one; these tests pass their own host directly.
-    struct StaticHost;
-    impl Platform for StaticHost {
-        fn read_user(&self, _u: usize, _o: &mut [u8]) -> SysResult {
-            Ok(0)
-        }
-        fn write_user(&self, _u: usize, _d: &[u8]) -> SysResult {
-            Ok(0)
-        }
-        fn read_user_cstr(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
-            // Reads one byte at a time so it stops at the terminator, which
-            // is what a host with real mappings has to do anyway.
-            for (i, slot) in out.iter_mut().enumerate() {
-                let mut byte = [0u8; 1];
-                self.read_user(uaddr + i, &mut byte)?;
-                if byte[0] == 0 {
-                    return Ok(i as isize);
-                }
-                *slot = byte[0];
-            }
-            Ok(out.len() as isize)
-        }
-    }
-    impl Host for StaticHost {
-        fn platform(&self) -> &dyn Platform {
-            self
-        }
-    }
-    struct Binding;
-    #[ax_crate_interface::impl_interface]
-    impl ax_abi_port::CurrentHost for Binding {
-        fn current() -> &'static dyn Host {
-            static HOST: StaticHost = StaticHost;
-            &HOST
-        }
     }
 
     #[test]
@@ -911,7 +617,10 @@ mod tests {
     fn open_resolves_a_name_through_the_paths_port() {
         let (host, at) = host_with_path("/lib/python3.14/os.py");
         // open(path, O_RDONLY | O_CLOEXEC, 0)
-        let mut env = Trap::at(nr::OPEN, [at, oflag::RDONLY | oflag::CLOEXEC, 0, 0, 0, 0]);
+        let mut env = Trap::at(
+            unix_call(nr::OPEN),
+            [at, oflag::RDONLY | oflag::CLOEXEC, 0, 0, 0, 0],
+        );
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.result, Some(5));
         assert_eq!(env.failed, Some(false));
@@ -928,7 +637,7 @@ mod tests {
     fn openat_names_the_directory_it_is_relative_to() {
         let (host, at) = host_with_path("os.py");
         // openat(9, path, O_RDWR, 0)
-        let mut env = Trap::at(nr::OPENAT, [9, at, oflag::RDWR, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::OPENAT), [9, at, oflag::RDWR, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         let opened = host.opened.borrow();
         let (dir, name, how) = opened.as_ref().unwrap();
@@ -939,7 +648,10 @@ mod tests {
         // AT_FDCWD is -2 here, not the -100 other systems use, and names the
         // working directory rather than a descriptor.
         let (host, at) = host_with_path("os.py");
-        let mut env = Trap::at(nr::OPENAT, [AT_FDCWD as usize, at, oflag::RDONLY, 0, 0, 0]);
+        let mut env = Trap::at(
+            unix_call(nr::OPENAT),
+            [AT_FDCWD as usize, at, oflag::RDONLY, 0, 0, 0],
+        );
         dispatch(&mut env, &host);
         assert_eq!(host.opened.borrow().as_ref().unwrap().0, At::Cwd);
     }
@@ -950,7 +662,7 @@ mod tests {
         // 0x80: reading them with the wrong table would create the wrong file.
         let (host, at) = host_with_path("/tmp/new");
         let flags = oflag::WRONLY | oflag::CREAT | oflag::EXCL | oflag::TRUNC;
-        let mut env = Trap::at(nr::OPEN, [at, flags, 0o644, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::OPEN), [at, flags, 0o644, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         let opened = host.opened.borrow();
         let how = &opened.as_ref().unwrap().2;
@@ -962,7 +674,7 @@ mod tests {
     #[test]
     fn refuses_an_access_mode_that_names_nothing() {
         let (host, at) = host_with_path("/tmp/f");
-        let mut env = Trap::at(nr::OPEN, [at, oflag::ACCMODE, 0, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::OPEN), [at, oflag::ACCMODE, 0, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.failed, Some(true));
         assert_eq!(env.result, Some(EINVAL as usize));
@@ -992,7 +704,7 @@ mod tests {
     fn stat_lays_the_answer_out_the_way_darwin_reads_it() {
         let (mut host, at) = host_with_path("/lib/python3.14/os.py");
         host.describes = Some(sample_attributes());
-        let mut env = Trap::at(nr::STAT64, [at, 0x80, 0, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::STAT64), [at, 0x80, 0, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.failed, Some(false));
 
@@ -1025,7 +737,7 @@ mod tests {
     fn lstat_asks_about_the_link_itself() {
         let (mut host, at) = host_with_path("/tmp/link");
         host.describes = Some(sample_attributes());
-        let mut env = Trap::at(nr::LSTAT64, [at, 0x80, 0, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::LSTAT64), [at, 0x80, 0, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert!(!host.asked.borrow().as_ref().unwrap().1);
     }
@@ -1033,7 +745,7 @@ mod tests {
     #[test]
     fn a_name_that_is_not_there_is_reported_as_such() {
         let (host, at) = host_with_path("/nope");
-        let mut env = Trap::at(nr::STAT64, [at, 0x80, 0, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::STAT64), [at, 0x80, 0, 0, 0, 0]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.failed, Some(true));
         assert_eq!(env.result, Some(ax_abi_port::ENOENT as usize));
@@ -1046,7 +758,7 @@ mod tests {
         dir.kind = NodeKind::Directory;
         dir.mode = 0o755;
         host.describes = Some(dir);
-        let mut env = Trap::at(nr::STAT64, [at, 0x80, 0, 0, 0, 0]);
+        let mut env = Trap::at(unix_call(nr::STAT64), [at, 0x80, 0, 0, 0, 0]);
         dispatch(&mut env, &host);
         let mem = host.mem.borrow();
         let mode = u32::from_le_bytes(mem[0x84..0x88].try_into().unwrap()) & 0xFFFF;

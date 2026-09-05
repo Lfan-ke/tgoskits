@@ -73,3 +73,54 @@ fn route(host: &dyn Host, call: DarwinCall, a: &[usize; 6]) -> Option<SysResult>
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        system::Library,
+        testing::{MockHost, Trap},
+    };
+
+    fn nr(name: &str) -> usize {
+        Library::call(name).expect("the table names it").nr() as usize
+    }
+
+    #[test]
+    fn a_number_from_another_layer_is_left_alone() {
+        let host = MockHost::default();
+        // A BSD call carries its class in the top byte and belongs to `bsd`.
+        let mut env = Trap::at(2 << 24 | 4, [1, 0x200, 12, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Passthrough);
+        assert_eq!(env.answer(), (None, None));
+    }
+
+    #[test]
+    fn write_reaches_the_files_port() {
+        let host = MockHost::default();
+        let mut env = Trap::at(nr("_write"), [1, 0x200, 12, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.answer(), (Some(12), Some(false)));
+        assert_eq!(*host.wrote.borrow(), Some((1, 0x200, 12)));
+    }
+
+    #[test]
+    fn a_failing_call_reports_the_errno_and_raises_the_carry_flag() {
+        let host = MockHost::default();
+        let mut env = Trap::at(nr("_write"), [-1i32 as usize, 0x200, 4, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(
+            env.answer(),
+            (Some(9), Some(true)),
+            "EBADF, not its negation"
+        );
+    }
+
+    #[test]
+    fn an_entry_point_with_no_body_yet_says_so_rather_than_answer() {
+        let host = MockHost::default();
+        let mut env = Trap::at(nr("_fprintf"), [0; 6]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.answer(), (Some(ENOSYS as usize), Some(true)));
+    }
+}
