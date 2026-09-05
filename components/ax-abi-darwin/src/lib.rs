@@ -16,6 +16,7 @@
 #![feature(used_with_arg)]
 
 pub mod bsd;
+pub mod environ;
 pub mod heap;
 pub mod libc;
 pub mod link;

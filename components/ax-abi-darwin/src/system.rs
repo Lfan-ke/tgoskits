@@ -37,6 +37,11 @@ pub const PRIVATE_EXEC_PATH: u64 = 24;
 /// Where the three streams every program starts with are, one after another.
 pub const PRIVATE_STREAMS: u64 = 32;
 
+/// How many entries the environment's array has room for, once this layer has
+/// taken it over. Zero means it is still the run the kernel left on the stack,
+/// which has no room to grow.
+pub const PRIVATE_ENVIRON_ROOM: u64 = 80;
+
 /// One thing the library exports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {

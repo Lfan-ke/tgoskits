@@ -142,6 +142,8 @@ fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) ->
         "__NSGetEnviron" => Ok(library.address("_environ")? as isize),
         "__NSGetExecutablePath" => exec_path(host, &library, a[0], a[1]),
         "_getenv" => getenv(host, &library, a[0]),
+        "_setenv" => crate::environ::set(host, &library, a),
+        "_unsetenv" => crate::environ::unset(host, &library, a[0]),
         // The stream family. Nothing is buffered, so `fflush` has nothing to
         // do and `setvbuf` has nothing to change.
         "_fwrite" => crate::stdio::fwrite(host, a),
