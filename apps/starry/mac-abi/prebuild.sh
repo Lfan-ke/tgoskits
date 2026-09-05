@@ -19,3 +19,5 @@ fi
 install -d "$overlay_dir/usr/bin"
 python3 "$app_dir/make-macho.py" "$overlay_dir/usr/bin/hello.macho"
 chmod 0755 "$overlay_dir/usr/bin/hello.macho"
+python3 "$app_dir/make-dyld-macho.py" "$overlay_dir/usr/bin/hello-dyld.macho"
+chmod 0755 "$overlay_dir/usr/bin/hello-dyld.macho"

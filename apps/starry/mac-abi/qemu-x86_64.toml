@@ -9,8 +9,8 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/usr/bin/hello.macho"
-success_regex = ['(?m)^MAC-ABI-OK\s*$']
+shell_init_cmd = "/usr/bin/hello.macho; /usr/bin/hello-dyld.macho"
+success_regex = ['(?s)MAC-ABI-OK.*MAC-DYLD-OK']
 fail_regex = [
     '(?i)\bpanic(?:ked)?\b',
     '(?i)not (?:yet )?runnable',

@@ -16,6 +16,7 @@
 #![feature(used_with_arg)]
 
 pub mod bsd;
+pub mod libc;
 pub mod link;
 pub mod start;
 pub mod system;
@@ -41,10 +42,13 @@ impl SysAbi for DarwinAbi {
     }
 
     fn handle_syscall(&self, env: &mut dyn TrapEnv) -> Dispatch {
-        bsd::dispatch(
-            env,
-            ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current),
-        )
+        let host = ax_crate_interface::call_interface!(ax_abi_port::CurrentHost::current);
+        // The library's own stubs carry numbers outside every Darwin class,
+        // so which of the two layers a trap belongs to is the number itself.
+        match libc::dispatch(env, host) {
+            Dispatch::Passthrough => bsd::dispatch(env, host),
+            handled => handled,
+        }
     }
 }
 
