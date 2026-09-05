@@ -169,6 +169,17 @@ def cohort_introspect():
 # ===========================================================================
 _CTX = None
 _CTX_NAME = None
+# What one child costs here, measured rather than assumed. A start method that
+# re-executes the interpreter pays a whole interpreter start per child, and on
+# one emulated core that is seconds; children started together share that core.
+# Every wait below is a multiple of this, so the numbers say "enough for N
+# children" instead of holding only on fast hardware.
+_CHILD_COST = 1.0
+
+
+def _wait(children=1):
+    return max(20.0, _CHILD_COST * children * 3.0 + 10.0)
+
 # Why each start method was turned down, so "no usable start context" says
 # which call failed and with what instead of only that none worked.
 _CTX_WHY = []
@@ -184,16 +195,19 @@ def _probe_ctx(name):
         _CTX_WHY.append("%s: get_context %s: %s" % (name, type(e).__name__, e))
         return None
     step = "Queue()"
+    global _CHILD_COST
     try:
         q = ctx.Queue()
         step = "Process()"
         p = ctx.Process(target=_proc_target, args=(q, 21))
         step = "start()"
+        started = time.monotonic()
         p.start()
         step = "get()"
-        got = q.get(timeout=20)
+        got = q.get(timeout=60)
         step = "join()"
-        p.join(timeout=20)
+        p.join(timeout=60)
+        _CHILD_COST = max(_CHILD_COST, time.monotonic() - started)
         if p.is_alive():
             p.terminate()
             _CTX_WHY.append("%s: child still alive after join" % name)
@@ -263,7 +277,7 @@ def cohort_process_lifecycle():
     chk("process_name_pid", p.name == "kid" and p.pid is None)  # pid None pre-start
     chk("process_pre_alive", p.is_alive() is False)
     p.start()
-    got = q.get(timeout=20)
+    got = q.get(timeout=_wait())
     # sentinel is an OS handle (int fd on POSIX) usable for waiting; available
     # only after start() (docs: Process.sentinel, 3.3+). Must be a non-negative int.
     if hasattr(p, "sentinel"):
@@ -271,7 +285,7 @@ def cohort_process_lifecycle():
             "sentinel=%r" % p.sentinel)
     else:
         chk("process_sentinel", True, "(skip: no sentinel)")
-    p.join(timeout=20)
+    p.join(timeout=_wait())
     chk("process_start_join", got[1] == 10 and not p.is_alive())
     chk("process_pid_set", isinstance(p.pid, int) and p.pid > 0)
     chk("process_exitcode", p.exitcode == 0, "ec=%r" % p.exitcode)
@@ -296,18 +310,18 @@ def cohort_process_daemon():
     p.daemon = True
     chk("process_daemon", p.daemon is True)
     p.start()
-    p.join(timeout=20)
+    p.join(timeout=_wait())
 
 def cohort_process_exitcode_codes():
     # sys.exit(N) in child -> exitcode N
     p = _CTX.Process(target=_exit_with, args=(7,))
     p.start()
-    p.join(timeout=20)
+    p.join(timeout=_wait())
     chk("process_exception_code_exit", p.exitcode == 7, "ec=%r" % p.exitcode)
     # uncaught exception in child -> nonzero exitcode (CPython uses 1)
     p2 = _CTX.Process(target=_raise_in_child)
     p2.start()
-    p2.join(timeout=20)
+    p2.join(timeout=_wait())
     chk("process_exception_code", p2.exitcode is not None and p2.exitcode != 0,
         "ec=%r" % p2.exitcode)
     # terminate() (SIGTERM) -> child killed by signal; exitcode == -SIGTERM.
@@ -316,7 +330,7 @@ def cohort_process_exitcode_codes():
     p3.start()
     time.sleep(0.1)
     p3.terminate()
-    p3.join(timeout=20)
+    p3.join(timeout=_wait())
     chk("process_terminate", p3.exitcode == -_sig.SIGTERM, "ec=%r" % p3.exitcode)
     # kill() (SIGKILL) -> exitcode == -SIGKILL (docs: Process.kill, 3.7+).
     if hasattr(_CTX.Process, "kill"):
@@ -324,7 +338,7 @@ def cohort_process_exitcode_codes():
         p4.start()
         time.sleep(0.1)
         p4.kill()
-        p4.join(timeout=20)
+        p4.join(timeout=_wait())
         chk("process_kill", p4.exitcode == -_sig.SIGKILL, "ec=%r" % p4.exitcode)
     else:
         chk("process_kill", True, "(skip: no Process.kill)")
@@ -342,9 +356,9 @@ def cohort_queue():
     ps = [_CTX.Process(target=_proc_target, args=(q, i)) for i in range(3)]
     for p in ps:
         p.start()
-    received = sorted(q.get(timeout=20)[1] for _ in range(3))
+    received = sorted(q.get(timeout=_wait(3))[1] for _ in range(3))
     for p in ps:
-        p.join(timeout=20)
+        p.join(timeout=_wait(3))
     chk("queue_send_recv", received == [0, 2, 4], repr(received))
     # empty()/qsize() semantics on a drained queue.
     q2 = _CTX.Queue()
@@ -352,7 +366,7 @@ def cohort_queue():
     q2.put("b")
     time.sleep(0.05)  # let feeder thread flush before qsize (best-effort)
     chk("queue_empty_qsize",
-        q2.get(timeout=20) == "a" and q2.get(timeout=20) == "b")
+        q2.get(timeout=_wait()) == "a" and q2.get(timeout=_wait()) == "b")
     # After draining every item, the local feeder is idle: empty() must be True.
     time.sleep(0.05)
     chk("queue_empty_after_drain", q2.empty() is True)
@@ -400,7 +414,7 @@ def cohort_queue():
         p = _CTX.Process(target=_jq_worker, args=(jq,))
         p.start()
         jq.join()            # blocks until task_done() balances the put()
-        p.join(timeout=20)
+        p.join(timeout=_wait())
         chk("joinable_queue_taskdone", p.exitcode == 0, "ec=%r" % p.exitcode)
     else:
         chk("joinable_queue_taskdone", True, "(skip: no JoinableQueue)")
@@ -420,7 +434,7 @@ def cohort_pipe_duplex():
     p.start()
     parent.send([1, 2, 3])
     reply = parent.recv()
-    p.join(timeout=20)
+    p.join(timeout=_wait())
     chk("pipe_duplex", reply == ("echo", [1, 2, 3]), repr(reply))
     parent.close()
 
@@ -430,7 +444,7 @@ def cohort_pipe_simplex():
     # poll(): False with nothing pending; True once data is available (docs).
     chk("pipe_poll_empty", recv_c.poll() is False)
     send_c.send("one-way")
-    chk("pipe_poll_ready", recv_c.poll(timeout=20) is True)
+    chk("pipe_poll_ready", recv_c.poll(timeout=_wait()) is True)
     chk("pipe_simplex", recv_c.recv() == "one-way")
     chk("pipe_poll_drained", recv_c.poll() is False)
     # fileno(): connections expose their underlying OS fd (docs: Connection.fileno).
@@ -463,7 +477,7 @@ def cohort_value():
     for p in ps:
         p.start()
     for p in ps:
-        p.join(timeout=30)
+        p.join(timeout=_wait(4))
     chk("value_shared", v.value == 4 * N, "got=%d" % v.value)
     # get_lock() returns the wrapping lock for a lock=True Value (docs).
     glk = v.get_lock()
@@ -479,7 +493,7 @@ def cohort_array():
     arr = _CTX.Array("i", 5)
     p = _CTX.Process(target=_array_fill, args=(arr, 100))
     p.start()
-    p.join(timeout=20)
+    p.join(timeout=_wait())
     chk("array_shared", list(arr[:]) == [100, 101, 102, 103, 104], str(list(arr[:])))
     chk("array_len", len(arr) == 5)
     # Element + slice access semantics (docs: Array supports indexing/slicing).
@@ -530,8 +544,8 @@ def cohort_event():
     chk("event_initial", ev.is_set() is False)
     p = _CTX.Process(target=_ev_setter, args=(ev,))
     p.start()
-    fired = ev.wait(timeout=20)
-    p.join(timeout=20)
+    fired = ev.wait(timeout=_wait())
+    p.join(timeout=_wait())
     chk("event", fired is True and ev.is_set() is True)
     ev.clear()
     chk("event_clear", ev.is_set() is False)
@@ -619,27 +633,27 @@ def cohort_pool():
         chk("pool_map", pool.map(_square, range(6)) == [0, 1, 4, 9, 16, 25])
         chk("pool_apply", pool.apply(_addpair, (3, 4)) == 7)
         ar = pool.apply_async(_addpair, (10, 5))
-        chk("pool_apply_async", ar.get(timeout=20) == 15)
+        chk("pool_apply_async", ar.get(timeout=_wait(2)) == 15)
         chk("pool_starmap",
             pool.starmap(_addpair, [(1, 2), (3, 4), (5, 6)]) == [3, 7, 11])
         chk("pool_imap", list(pool.imap(_square, range(5))) == [0, 1, 4, 9, 16])
         chk("pool_imap_unordered",
             sorted(pool.imap_unordered(_square, range(5))) == [0, 1, 4, 9, 16])
         ma = pool.map_async(_square, range(4))
-        chk("pool_map_async", ma.get(timeout=20) == [0, 1, 4, 9])
+        chk("pool_map_async", ma.get(timeout=_wait(2)) == [0, 1, 4, 9])
         # map with explicit chunksize must yield identical ordered results.
         chk("pool_map_chunksize",
             pool.map(_square, range(8), chunksize=2) == [0, 1, 4, 9, 16, 25, 36, 49])
         # AsyncResult.ready()/successful() state transitions (docs).
         ar2 = pool.apply_async(_square, (9,))
-        ar2.wait(timeout=20)
+        ar2.wait(timeout=_wait())
         chk("pool_async_ready", ar2.ready() is True and ar2.successful() is True)
-        chk("pool_async_value", ar2.get(timeout=20) == 81)
+        chk("pool_async_value", ar2.get(timeout=_wait(2)) == 81)
         # error_callback path: a worker exception surfaces via apply_async.get().
         aerr = pool.apply_async(_raise_in_child)
         err_raised = False
         try:
-            aerr.get(timeout=20)
+            aerr.get(timeout=_wait(2))
         except ValueError:
             err_raised = True
         chk("pool_async_error", err_raised is True)
@@ -678,7 +692,7 @@ def cohort_manager():
         for p in ps:
             p.start()
         for p in ps:
-            p.join(timeout=20)
+            p.join(timeout=_wait())
         chk("manager_dict", dict(d) == {"k0": 0, "k1": 1, "k2": 2}, str(dict(d)))
 
         lst = mgr.list()
@@ -687,7 +701,7 @@ def cohort_manager():
         for p in ps:
             p.start()
         for p in ps:
-            p.join(timeout=20)
+            p.join(timeout=_wait())
         chk("manager_list", sorted(lst) == [0, 1, 2, 3], str(list(lst)))
 
         ns = mgr.Namespace()
