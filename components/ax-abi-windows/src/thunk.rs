@@ -29,7 +29,11 @@ pub const MODULE_HEADER: usize = 0x4000;
 /// How much address space library `lib` takes: its header, then a stub per
 /// entry, rounded to a page so the next library starts on one.
 pub fn system_size(lib: usize) -> usize {
-    let trampoline = if lib == 0 { ATTACH_LEN + THREAD_LEN } else { 0 };
+    let trampoline = if lib == 0 {
+        ATTACH_LEN + THREAD_LEN + DETACH_LEN
+    } else {
+        0
+    };
     (MODULE_HEADER + win32::LIBRARIES[lib].exports.len() * STUB_LEN + trampoline)
         .next_multiple_of(0x1000)
 }
@@ -38,11 +42,114 @@ pub fn system_size(lib: usize) -> usize {
 pub const ATTACH_LEN: usize = 0x80;
 /// The room the thread trampoline takes past the attach trampoline.
 pub const THREAD_LEN: usize = 0x60;
+/// The room the detach trampoline takes past the thread trampoline, with room
+/// to spare over what it emits: running off the end of it would be running
+/// into whatever follows.
+pub const DETACH_LEN: usize = 0xC0;
 
 /// Where the thread trampoline sits: past kernel32's stubs and the attach
 /// trampoline. A thread starts here with its block in the first argument.
 pub const fn thread_trampoline_offset() -> usize {
     MODULE_HEADER + win32::LIBRARIES[0].exports.len() * STUB_LEN + ATTACH_LEN
+}
+
+/// Where the detach trampoline sits: past the thread trampoline. Every
+/// `ExitProcess` stub jumps here.
+pub const fn detach_trampoline_offset() -> usize {
+    thread_trampoline_offset() + THREAD_LEN
+}
+
+/// The code `ExitProcess` runs before the process ends: every module's entry
+/// point called as `DllMain(base, DLL_PROCESS_DETACH, non-NULL)`, in reverse
+/// initialization order, then the trap that really ends it.
+///
+/// This is the difference between `ExitProcess` and `TerminateProcess`, and it
+/// is not a detail: a C runtime flushes its streams from that notification, so
+/// without it everything written and not yet flushed is lost - which is what
+/// `exit()` looked like here before, since the UCRT reaches `ExitProcess`
+/// whenever the application-model policy cannot be asked.
+///
+/// The walk is the loader's own list, read out of the PEB the way a debugger
+/// reads it, backwards from the head's `Blink`. A module's entry point sits at
+/// `LDR_ENTRY_POINT` and its base at `LDR_DLL_BASE`, both measured from the
+/// entry, while the links the list threads through sit at `LDR_INIT_LINKS` -
+/// hence the fixed offsets from the cursor.
+pub fn detach_trampoline() -> [u8; DETACH_LEN] {
+    use crate::teb_peb::{
+        LDR_DLL_BASE, LDR_ENTRY_POINT, LDR_IN_INIT_ORDER, LDR_INIT_LINKS, PEB_LDR,
+    };
+    // The cursor walks the links, and a module's fields are measured from the
+    // entry those links sit inside.
+    const TO_ENTRY: u8 = (LDR_ENTRY_POINT - LDR_INIT_LINKS) as u8;
+    const TO_BASE: u8 = (LDR_DLL_BASE - LDR_INIT_LINKS) as u8;
+    let nr = win32::Win32Call::named("ExitProcess")
+        .expect("ExitProcess is in the table")
+        .nr()
+        .to_le_bytes();
+    let flag = (win32::PEB_DETACHING as u32).to_le_bytes();
+
+    let mut code: Vec<u8> = Vec::new();
+    let mut sites: Vec<(usize, u8)> = Vec::new();
+    let mut labels = [0usize; 5];
+    const LOOP: u8 = 0;
+    const STEP: u8 = 1;
+    const END: u8 = 2;
+    const DONE: u8 = 3;
+    const SKIP: u8 = 4;
+
+    macro_rules! put {
+        ($($bytes:expr),* $(,)?) => {{ $(code.extend_from_slice(&$bytes);)* }};
+    }
+    macro_rules! jump {
+        ($op:expr, $to:expr) => {{
+            code.extend_from_slice(&$op);
+            sites.push((code.len(), $to));
+            code.extend_from_slice(&[0; 4]);
+        }};
+    }
+
+    put!([0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0, 0, 0]); // mov rax, gs:[0x60]
+    put!([0x48, 0x83, 0xB8], flag, [0x00]); // cmp qword [rax+flag], 0
+    jump!([0x0F, 0x85], SKIP); // jne skip
+    put!([0x48, 0xC7, 0x80], flag, [0x01, 0, 0, 0]); // mov qword [rax+flag], 1
+    put!([0x49, 0x89, 0xCD]); // mov r13, rcx          ; the exit code
+    put!([0x48, 0x8B, 0x40, PEB_LDR as u8]); // mov rax, [rax+Ldr]
+    put!([0x48, 0x85, 0xC0]); // test rax, rax
+    jump!([0x0F, 0x84], DONE); // jz done
+    put!([0x48, 0x8D, 0x78, LDR_IN_INIT_ORDER as u8]); // lea rdi, [rax+list]
+    put!([0x48, 0x8B, 0x5F, 0x08]); // mov rbx, [rdi+8]     ; the last one
+    put!([0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    labels[LOOP as usize] = code.len();
+    put!([0x48, 0x39, 0xFB]); // cmp rbx, rdi
+    jump!([0x0F, 0x84], END); // je end
+    put!([0x4C, 0x8B, 0x73, 0x08]); // mov r14, [rbx+8]     ; the next one
+    put!([0x48, 0x8B, 0x43, TO_ENTRY]); // mov rax, [rbx+entry]
+    put!([0x48, 0x85, 0xC0]); // test rax, rax
+    jump!([0x0F, 0x84], STEP); // jz step
+    put!([0x48, 0x8B, 0x4B, TO_BASE]); // mov rcx, [rbx+base]
+    put!([0x31, 0xD2]); // xor edx, edx          ; DLL_PROCESS_DETACH
+    put!([0x41, 0xB8, 0x01, 0, 0, 0]); // mov r8d, 1  ; the process is ending
+    put!([0xFF, 0xD0]); // call rax
+    labels[STEP as usize] = code.len();
+    put!([0x4C, 0x89, 0xF3]); // mov rbx, r14
+    jump!([0xE9], LOOP); // jmp loop
+    labels[END as usize] = code.len();
+    put!([0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    labels[DONE as usize] = code.len();
+    put!([0x44, 0x89, 0xE9]); // mov ecx, r13d
+    labels[SKIP as usize] = code.len();
+    put!([0x89, 0xCF]); // mov edi, ecx
+    put!([0xB8, nr[0], nr[1], nr[2], nr[3]]); // mov eax, <ExitProcess nr>
+    put!([0x0F, 0x05]); // syscall
+    put!([0x0F, 0x0B]); // ud2
+
+    for (at, label) in sites {
+        let rel = labels[label as usize] as i64 - (at + 4) as i64;
+        code[at..at + 4].copy_from_slice(&(rel as i32).to_le_bytes());
+    }
+    let mut out = [0xCC_u8; DETACH_LEN];
+    out[..code.len()].copy_from_slice(&code);
+    out
 }
 
 /// The code a thread starts in: with its block `{proc, param, callbacks}` in
@@ -263,6 +370,19 @@ pub fn stub(call: Win32Call) -> [u8; STUB_LEN] {
         out[at..at + part.len()].copy_from_slice(part);
         at += part.len();
     }
+    // Ending the process runs every module's detach notification first, which
+    // is where a C runtime flushes its streams, so this stub is a jump to the
+    // trampoline that does that and traps at the end of it.
+    if call.symbol() == "ExitProcess" {
+        let (lib, index) = call.place();
+        debug_assert_eq!(lib, 0, "the trampoline follows kernel32's stubs");
+        let count = win32::LIBRARIES[0].exports.len();
+        let to = ((count - index) * STUB_LEN + ATTACH_LEN + THREAD_LEN) as i64;
+        out.fill(0xCC);
+        out[0] = 0xE9;
+        out[1..5].copy_from_slice(&((to - 5) as i32).to_le_bytes());
+        return out;
+    }
     // A library load returns through the attach trampoline instead, so the
     // entry points of what it brought in run before the caller goes on.
     if matches!(
@@ -471,5 +591,57 @@ mod tests {
         // It follows the attach trampoline rather than overlapping it.
         let attach = MODULE_HEADER + win32::LIBRARIES[0].exports.len() * STUB_LEN;
         assert_eq!(thread_trampoline_offset(), attach + ATTACH_LEN);
+    }
+
+    #[test]
+    fn ending_the_process_goes_by_way_of_the_detach_trampoline() {
+        let call = Win32Call::named("ExitProcess").expect("in the table");
+        let code = stub(call);
+        // The stub is the jump and nothing else: whatever a caller does with
+        // ExitProcess has to run the detach notifications first.
+        assert_eq!(code[0], 0xE9, "the stub jumps");
+        let rel = i32::from_le_bytes(code[1..5].try_into().unwrap()) as i64;
+        let (_, index) = call.place();
+        let from = MODULE_HEADER + index * STUB_LEN;
+        assert_eq!(
+            (from as i64 + 5 + rel) as usize,
+            detach_trampoline_offset(),
+            "and lands on the trampoline"
+        );
+        assert!(
+            detach_trampoline_offset() + DETACH_LEN <= system_size(0),
+            "which kernel32 has room for"
+        );
+    }
+
+    #[test]
+    fn the_detach_trampoline_tells_each_module_the_process_is_ending() {
+        let code = detach_trampoline();
+        let has = |bytes: &[u8]| code.windows(bytes.len()).any(|w| w == bytes);
+        // DllMain(base, DLL_PROCESS_DETACH, non-NULL): the reason is zero and
+        // the reserved argument is not, which is how Windows says the process
+        // is going rather than one library being let go.
+        assert!(has(&[0x31, 0xD2]), "reason is DLL_PROCESS_DETACH");
+        assert!(has(&[0x41, 0xB8, 0x01, 0, 0, 0]), "reserved is not null");
+        assert!(has(&[0xFF, 0xD0]), "and the entry point is called");
+        // Backwards through the initialization order, which is Blink.
+        assert!(has(&[0x4C, 0x8B, 0x73, 0x08]), "the walk goes backwards");
+        // It ends in the trap it stands in front of, so the process still
+        // ends however the walk went.
+        let nr = Win32Call::named("ExitProcess")
+            .expect("in the table")
+            .nr()
+            .to_le_bytes();
+        assert!(
+            has(&[0xB8, nr[0], nr[1], nr[2], nr[3], 0x0F, 0x05]),
+            "the trap follows the walk"
+        );
+        // Everything it emits fits, with the tail left as breakpoints.
+        let used = code
+            .iter()
+            .rposition(|byte| *byte != 0xCC)
+            .expect("it emits something")
+            + 1;
+        assert!(used <= DETACH_LEN, "it fits in what is reserved");
     }
 }

@@ -214,6 +214,7 @@ pub fn link(pe: PeInfo, bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> Ab
         if lib == 0 {
             image.extend_from_slice(&thunk::attach_trampoline());
             image.extend_from_slice(&thunk::thread_trampoline());
+            image.extend_from_slice(&thunk::detach_trampoline());
         }
         image.resize(module.len as usize, 0xCC);
         stubs.extend_from_slice(&image);

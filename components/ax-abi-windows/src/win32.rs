@@ -1708,12 +1708,17 @@ pub(crate) const PEB_PENDING_ATTACH: usize = 0xF40;
 /// looks over its own objects again.
 pub(crate) const PEB_SIGNAL_SEQ: usize = 0xF48;
 
+/// Set once the process is on its way out, so an `ExitProcess` from inside a
+/// module's own detach notification ends it rather than starting the walk
+/// over.
+pub(crate) const PEB_DETACHING: usize = 0xF58;
+
 /// Where the section objects this process has made hang, the same way.
 pub(crate) const PEB_MAPPINGS: usize = 0xF10;
 
 // Each of these words is written for a different reason; sharing one would
 // let a signal rewrite the cookie under an encoded pointer.
-const PEB_WORDS: [usize; 9] = [
+const PEB_WORDS: [usize; 10] = [
     PEB_TEMP_FILES,
     PEB_PIPES,
     PEB_PORT_FILES,
@@ -1723,6 +1728,7 @@ const PEB_WORDS: [usize; 9] = [
     PEB_COOKIE,
     PEB_PENDING_ATTACH,
     PEB_EXCEPTION_FILTER,
+    PEB_DETACHING,
 ];
 
 /// The bitmap `PEB.TlsBitmap` points at is the one other thing kept past the
