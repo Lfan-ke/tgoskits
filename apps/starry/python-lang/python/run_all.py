@@ -19,7 +19,11 @@ files = sorted(glob.glob(os.path.join(base, "t[0-9][0-9]_*.py")))
 smoke = os.path.join(base, "test_lang.py")
 if os.path.exists(smoke):
     files.append(smoke)
-streamed_modules = {"t19_cli.py"}
+# Modules whose output goes straight to the console instead of into a file.
+# Both of these run for many minutes and drive dozens of child interpreters, so
+# a run that stops inside one has to say where it stopped - a captured file is
+# never read if the machine is killed first.
+streamed_modules = {"t10_multiprocessing.py", "t19_cli.py"}
 
 print(
     "PYLANG-SUITE python %d.%d.%d (%s) on %s — %d modules"
