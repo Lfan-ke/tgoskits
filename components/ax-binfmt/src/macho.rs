@@ -34,8 +34,16 @@ const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
 const LC_REEXPORT_DYLIB: u32 = 0x8000_001F;
 const LC_LOAD_UPWARD_DYLIB: u32 = 0x8000_0023;
 
+/// `S_MOD_INIT_FUNC_POINTERS`: a section of function pointers to call before
+/// a program's `main`, which is what a C++ constructor at file scope and a
+/// `__attribute__((constructor))` compile to.
+const S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
+
 // `mach_header_64` is 32 bytes; load commands follow it.
 const HEADER_LEN: usize = 32;
+// `section_64` is 80 bytes, and a segment's sections follow its command.
+const SECTION_LEN: usize = 80;
+const SEGMENT_LEN: usize = 72;
 
 /// Parsed Mach-O header: enough to walk load commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +78,22 @@ impl MachoInfo {
     pub fn dylibs<'a>(&self, image: &'a [u8]) -> Dylibs<'a> {
         Dylibs {
             image,
+            next: self.commands_off,
+            end: self.commands_off + self.sizeofcmds as usize,
+            remaining: self.ncmds,
+        }
+    }
+
+    /// The initializers the image wants run before `main`, each reported as
+    /// the address of a section of function pointers and its byte length.
+    ///
+    /// dyld runs these after binding and before the entry point, in the order
+    /// the sections appear, and hands each one the same four arguments `main`
+    /// gets (`dyld3::MachOAnalyzer::forEachInitializer`).
+    pub fn initializers<'a>(&self, image: &'a [u8]) -> Initializers<'a> {
+        Initializers {
+            image,
+            sect: 0,
             next: self.commands_off,
             end: self.commands_off + self.sizeofcmds as usize,
             remaining: self.ncmds,
@@ -205,6 +229,66 @@ impl<'a> Iterator for Dylibs<'a> {
     }
 }
 
+/// One run of function pointers an image wants called before `main`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Initializer {
+    /// Where the pointers are, as the image names the address.
+    pub vmaddr: u64,
+    /// How many bytes of them there are.
+    pub len: u64,
+}
+
+/// Iterator over an image's `__mod_init_func` sections.
+pub struct Initializers<'a> {
+    image: &'a [u8],
+    /// The load command being read, and how far into its sections the walk is.
+    next: usize,
+    sect: u32,
+    end: usize,
+    remaining: u32,
+}
+
+impl Iterator for Initializers<'_> {
+    type Item = Initializer;
+
+    fn next(&mut self) -> Option<Initializer> {
+        while self.remaining > 0 && self.next + 8 <= self.end {
+            let off = self.next;
+            let cmd = read_u32(self.image, off)?;
+            let size = read_u32(self.image, off + 4)? as usize;
+            if size < 8 {
+                return None;
+            }
+            // segment_command_64: nsects@64, with the sections after it.
+            let nsects = if cmd == LC_SEGMENT_64 {
+                read_u32(self.image, off + 64)?
+            } else {
+                0
+            };
+            while self.sect < nsects {
+                let sect = off + SEGMENT_LEN + self.sect as usize * SECTION_LEN;
+                self.sect += 1;
+                if sect + SECTION_LEN > off + size {
+                    break;
+                }
+                // section_64: addr@32, size@40, flags@64; a section's kind is
+                // the low byte of its flags.
+                if read_u32(self.image, sect + 64)? & 0xFF != S_MOD_INIT_FUNC_POINTERS {
+                    continue;
+                }
+                return Some(Initializer {
+                    vmaddr: read_u64(self.image, sect + 32)?,
+                    len: read_u64(self.image, sect + 40)?,
+                });
+            }
+            self.next = off + size;
+            self.sect = 0;
+            self.remaining -= 1;
+        }
+        None
+    }
+}
+
 /// Iterator over a Mach-O image's `LC_SEGMENT_64` commands, skipping others.
 pub struct Segments<'a> {
     image: &'a [u8],
@@ -300,6 +384,64 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use super::*;
+
+    // A segment command carrying `count` sections, the `init`-th of which is
+    // a __mod_init_func run of pointers at `addr`.
+    fn segment_with_sections(count: u32, init: u32, addr: u64, len: u64) -> Vec<u8> {
+        let size = SEGMENT_LEN + count as usize * SECTION_LEN;
+        let mut cmd = vec![0u8; size];
+        cmd[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        cmd[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        cmd[64..68].copy_from_slice(&count.to_le_bytes());
+        for at in 0..count as usize {
+            let sect = SEGMENT_LEN + at * SECTION_LEN;
+            let kind = if at as u32 == init {
+                S_MOD_INIT_FUNC_POINTERS
+            } else {
+                0
+            };
+            cmd[sect + 32..sect + 40].copy_from_slice(&addr.to_le_bytes());
+            cmd[sect + 40..sect + 48].copy_from_slice(&len.to_le_bytes());
+            cmd[sect + 64..sect + 68].copy_from_slice(&kind.to_le_bytes());
+        }
+        cmd
+    }
+
+    #[test]
+    fn finds_every_run_of_initializers_across_segments() {
+        let first = segment_with_sections(3, 1, 0x1000, 0x8);
+        let second = segment_with_sections(2, 1, 0x2000, 0x10);
+        let sizeofcmds = first.len() + second.len();
+        let mut b = vec![0u8; HEADER_LEN + sizeofcmds];
+        b[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+        b[16..20].copy_from_slice(&2u32.to_le_bytes());
+        b[20..24].copy_from_slice(&(sizeofcmds as u32).to_le_bytes());
+        b[HEADER_LEN..HEADER_LEN + first.len()].copy_from_slice(&first);
+        b[HEADER_LEN + first.len()..].copy_from_slice(&second);
+
+        let info = parse(&b).expect("a thin image");
+        let found: Vec<Initializer> = info.initializers(&b).collect();
+        assert_eq!(
+            found,
+            [
+                Initializer {
+                    vmaddr: 0x1000,
+                    len: 0x8
+                },
+                Initializer {
+                    vmaddr: 0x2000,
+                    len: 0x10
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_with_no_initializers_reports_none() {
+        let b = synth(0x1_0000_0000, 0x40);
+        let info = parse(&b).expect("a thin image");
+        assert_eq!(info.initializers(&b).count(), 0);
+    }
 
     // Build a thin Mach-O with one __TEXT segment and an LC_MAIN command.
     fn synth(text_vmaddr: u64, entryoff: u64) -> Vec<u8> {
