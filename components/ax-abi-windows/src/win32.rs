@@ -2183,9 +2183,25 @@ fn wait_for_multiple_objects(c: &mut Call<'_>) -> Dispatch {
             match sync::wait_object(c, handle, 0) {
                 // Not one of ours to wait on, which a single wait answers as
                 // signalled; answering differently here would hang a caller
-                // on a handle this layer simply does not model.
-                None if !all => return c.finish(sync::WAIT_OBJECT_0 + i),
-                None => ready += 1,
+                // on a handle this layer simply does not model. It is said
+                // out loud for the same reason the single wait says it: a
+                // caller that is told "ready" and then finds nothing there
+                // asks again straight away, so a handle nothing models turns
+                // into a spin with no other sign of itself.
+                None if !all => {
+                    c.host.platform().trace(&alloc::format!(
+                        "WaitForMultipleObjects: {handle:#x} names no object here, reporting it \
+                         signalled"
+                    ));
+                    return c.finish(sync::WAIT_OBJECT_0 + i);
+                }
+                None => {
+                    c.host.platform().trace(&alloc::format!(
+                        "WaitForMultipleObjects: {handle:#x} names no object here, counting it \
+                         signalled"
+                    ));
+                    ready += 1;
+                }
                 Some(sync::WAIT_OBJECT_0) if !all => return c.finish(sync::WAIT_OBJECT_0 + i),
                 Some(sync::WAIT_OBJECT_0) => ready += 1,
                 Some(_) => {}
