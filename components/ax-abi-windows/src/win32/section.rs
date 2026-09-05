@@ -140,7 +140,10 @@ pub fn create_file_mapping(c: &mut Call<'_>) -> Dispatch {
         match super::file::descriptor(file)
             .and_then(|fd| files.dup(fd).map_err(nt::status_from_errno))
         {
-            Ok(fd) => (fd as i32, true),
+            // Nothing was found rather than made here: a section over the
+            // caller's own file has no name to have existed already, and
+            // saying otherwise is what a named one says.
+            Ok(fd) => (fd as i32, false),
             Err(status) => return c.fail_status(status, 0),
         }
     } else {
