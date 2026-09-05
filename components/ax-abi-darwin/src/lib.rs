@@ -17,6 +17,7 @@
 
 pub mod bsd;
 pub mod link;
+pub mod start;
 pub mod system;
 
 extern crate alloc;
