@@ -80,7 +80,7 @@ def parent():
     say("child rc", out.returncode)
     say("what the child wrote (want %#x)" % (PATTERN ^ 0xFFFF), hex(word_at(at)[1]))
     say("count after the child took one (want 258)", wait())
-    print("PROBE DONE", flush=True)
+    print("SHM PROBE DONE", flush=True)
 
 
 if os.environ.get("PROBE_CHILD"):

@@ -60,15 +60,12 @@ for f in venvlauncher.exe venvwlauncher.exe; do
     install -m 0755 "$dll_dir/python.exe" "$overlay_dir/python/Lib/venv/scripts/nt/$f"
 done
 
-# A python._pth beside the executable pins sys.path to exactly these entries
-# (each resolved relative to the executable's directory) and disables the
-# prefix landmark / realpath search that fails on this host. Lib holds the
-# expanded stdlib, so `encodings` resolves during interpreter startup.
-cat > "$overlay_dir/python/python._pth" <<'PTH'
-Lib
-.
-python314.zip
-PTH
+# No python._pth: one beside the executable pins sys.path to what it lists and,
+# as a side effect, turns on safe_path - so neither the working directory nor
+# PYTHONPATH reaches sys.path, and `python -m <module beside me>` cannot find
+# its module. It was here because the prefix landmark search once failed on
+# this host; it no longer does, and the search finds Lib, the zip and
+# site-packages by itself.
 
 # Stage the extended python-lang suite (shared with the Linux personality)
 # so the Windows python.exe runs the same t01..t22 modules.
