@@ -102,3 +102,4 @@ install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_mp.py" "$ov
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_sem.py" "$overlay_dir/python/probe_sem.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_exit.py" "$overlay_dir/python/probe_exit.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_queue.py" "$overlay_dir/python/probe_queue.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_t19.py" "$overlay_dir/python/probe_t19.py"

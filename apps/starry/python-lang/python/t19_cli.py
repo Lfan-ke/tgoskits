@@ -731,12 +731,16 @@ chk("exit_syntax_error", rc == 1 and "SyntaxError" in e, "rc=%d" % rc)
 # os._exit bypasses cleanup with the literal code.
 rc, o, e = run(["-c", "import os; os._exit(5)"])
 chk("exit_os_exit", rc == 5, "rc=%d" % rc)
-# EDGE: the OS exit status is 8-bit; sys.exit(256) wraps to 0 (256 & 0xff). This
-# is the documented waitpid() truncation, a place a guest wait4() could diverge.
+# EDGE: how much of the code survives is the platform's answer, not Python's.
+# POSIX keeps eight bits - waitpid() truncation, so sys.exit(256) is a status
+# of 0 - while a Windows exit code is a whole DWORD and 256 stays 256
+# (GetExitCodeProcess). Asserting the POSIX answer everywhere would call a
+# correct Windows result a bug.
+_wide_exit = sys.platform == "win32"
 rc, o, e = run(["-c", "import sys; sys.exit(256)"])
-chk("exit_code_wraps_8bit", rc == 0, "rc=%d" % rc)
+chk("exit_code_wraps_8bit", rc == (256 if _wide_exit else 0), "rc=%d" % rc)
 rc, o, e = run(["-c", "import sys; sys.exit(257)"])
-chk("exit_code_wraps_257", rc == 1, "rc=%d" % rc)
+chk("exit_code_wraps_257", rc == (257 if _wide_exit else 1), "rc=%d" % rc)
 # EDGE: bool is an int subclass — sys.exit(True)->1, sys.exit(False)->0.
 rc, o, e = run(["-c", "import sys; sys.exit(True)"])
 chk("exit_bool_true", rc == 1, "rc=%d" % rc)
