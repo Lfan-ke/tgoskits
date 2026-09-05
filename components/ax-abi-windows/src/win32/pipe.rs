@@ -95,11 +95,28 @@ fn pipe_at(c: &Call<'_>, fd: i32) -> Option<usize> {
 /// Whether a descriptor is one end of a pipe, which decides whether a read of
 /// it keeps message boundaries.
 pub(super) fn is_pipe(c: &Call<'_>, fd: i32) -> bool {
-    pipe_at(c, fd).is_some()
+    if pipe_at(c, fd).is_some() {
+        return true;
+    }
+    // Being a pipe is a property of the descriptor, not of the list this
+    // process keeps: a child handed one across a spawn has the pipe and none
+    // of the list, and reading it as a plain byte stream would lose the
+    // message boundaries everything over it depends on. A named pipe here is
+    // a local sequenced-packet socket, so meeting one is what puts it on the
+    // list.
+    let sequenced = c
+        .host
+        .sockets()
+        .and_then(|sockets| sockets.option(fd, ax_abi_port::SocketOption::Kind).ok())
+        .is_some_and(|kind| kind == ax_abi_port::SocketKind::SeqPacket as u32);
+    if sequenced {
+        remember(c, fd);
+    }
+    sequenced
 }
 
 /// Remember that `fd` is one end of a pipe.
-fn remember(c: &mut Call<'_>, fd: i32) {
+fn remember(c: &Call<'_>, fd: i32) {
     if pipe_at(c, fd).is_some() {
         return;
     }
@@ -266,7 +283,6 @@ fn socket(c: &Call<'_>) -> Option<i32> {
 /// into the connection, which is what Windows does with the same handle.
 pub fn create_named_pipe(c: &mut Call<'_>) -> Dispatch {
     let (name_at, instances) = (c.arg(0), c.arg(3) as u32);
-    c.host.platform().trace("XXTRACE CreateNamedPipeW entry");
     let Some(path) = super::file::name_at_arg(c, name_at) else {
         return c.fail(super::ERROR_INVALID_PARAMETER, INVALID_HANDLE);
     };
@@ -288,7 +304,6 @@ pub fn create_named_pipe(c: &mut Call<'_>) -> Dispatch {
     }
     remember(c, fd);
     c.set_last_error(0);
-    c.host.platform().trace("XXTRACE CreateNamedPipeW leaving");
     c.finish(Handle::from_slot(fd as usize).0 as usize)
 }
 
@@ -345,7 +360,6 @@ pub(super) fn open_client(c: &mut Call<'_>, path: &str) -> Dispatch {
     }
     remember(c, fd);
     c.set_last_error(0);
-    c.host.platform().trace("XXTRACE CreateNamedPipeW leaving");
     c.finish(Handle::from_slot(fd as usize).0 as usize)
 }
 

@@ -1594,16 +1594,15 @@ fn write_file(c: &mut Call<'_>) -> Dispatch {
     if written != 0 && !c.write_u32(written, 0) {
         return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
     }
-    // An OVERLAPPED asks for asynchronous delivery, which a handle reporting
-    // to a completion port gets; any other handle is refused rather than
-    // quietly served synchronously.
+    // An OVERLAPPED asks for asynchronous delivery. A handle reporting to a
+    // completion port is served through it; one that is not still gets its
+    // answer through the OVERLAPPED it was given, which is how a named pipe
+    // is written - and Windows is free to finish such a call before it
+    // returns, which is what happens here.
     if overlapped != 0 {
         let Ok(fd) = file::descriptor(handle) else {
             return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
         };
-        if !iocp::registered(c, fd) {
-            return c.fail_status(Ntstatus::NOT_IMPLEMENTED, FALSE);
-        }
         return iocp::start(
             c,
             iocp::OP_WRITE,

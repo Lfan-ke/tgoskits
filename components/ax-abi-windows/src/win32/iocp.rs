@@ -918,12 +918,6 @@ pub(super) fn unregister(c: &mut Call<'_>, fd: i32) {
     }
 }
 
-/// Whether a descriptor has a port to report to, which is what decides
-/// whether an overlapped call on it can be started.
-pub(super) fn registered(c: &Call<'_>, fd: i32) -> bool {
-    port_of(c, fd).is_some()
-}
-
 /// The kinds a caller of [`start`] names.
 pub(super) const OP_RECV: u32 = RECV;
 pub(super) const OP_SEND: u32 = SEND;

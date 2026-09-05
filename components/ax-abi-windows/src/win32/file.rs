@@ -336,12 +336,11 @@ pub fn read_file(c: &mut Call<'_>) -> Dispatch {
         Ok(fd) => fd,
         Err(status) => return c.fail_status(status, FALSE),
     };
-    // A handle that reports to a completion port reads through it, which is
-    // what an overlapped read on one means.
+    // A handle that reports to a completion port reads through it; one that
+    // does not reports through the OVERLAPPED it was given, which is how
+    // `multiprocessing` reads a pipe - it hands over an OVERLAPPED with an
+    // event and waits on that, with no port anywhere.
     if overlapped != 0 {
-        if !super::iocp::registered(c, fd) {
-            return c.fail_status(Ntstatus::NOT_IMPLEMENTED, FALSE);
-        }
         return super::iocp::start(
             c,
             super::iocp::OP_READ,

@@ -2445,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn a_win32_write_asking_for_overlapped_delivery_is_refused() {
+    fn a_win32_write_reports_through_the_overlapped_it_was_given() {
         use crate::win32::{self, Win32Call};
 
         let host = MockHost {
@@ -2455,18 +2455,22 @@ mod tests {
         let teb = 0xC0;
         // The fifth argument is the OVERLAPPED; the stub lifted it off the
         // caller's stack into the fifth trap register.
-        let mut env = Win32Trap::new(Win32Call::WRITE_FILE, [4, 0x40, 8, 0x80, 0x100, 0], teb);
+        let over = 0x100usize;
+        let mut env = Win32Trap::new(Win32Call::WRITE_FILE, [4, 0x40, 8, 0x80, over, 0], teb);
 
         assert_eq!(win32::dispatch(&mut env, &host), Dispatch::Handled);
-        assert_eq!(env.result, Some(0));
-        assert!(
-            host.wrote.borrow().is_none(),
-            "not served synchronously behind its back"
-        );
+        // No completion port anywhere - which is how `multiprocessing` writes
+        // a pipe - so the answer comes back through the OVERLAPPED. Windows
+        // is free to finish such a call before it returns, and here it does.
+        assert_eq!(env.result, Some(1));
+        // Handle 4 is the first table slot, which is descriptor zero.
+        assert_eq!(*host.wrote.borrow(), Some((0, 0x40, 8)), "it was written");
         let mem = host.mem.borrow();
-        // ERROR_INVALID_FUNCTION, the mapping of STATUS_NOT_IMPLEMENTED.
+        let word = |at: usize| u64::from_le_bytes(mem[at..at + 8].try_into().unwrap());
+        assert_eq!(word(over), 0, "the status it finished with");
+        assert_eq!(word(over + 8), 8, "and how much it moved");
         let at = teb + crate::teb_peb::TEB_LAST_ERROR;
-        assert_eq!(u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(mem[at..at + 4].try_into().unwrap()), 0);
     }
 
     /// A thread block with a PEB behind it and a heap arena, as the loader lays
