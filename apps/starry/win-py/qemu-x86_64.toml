@@ -9,10 +9,10 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/python/python.exe -u /suite/t10_multiprocessing.py"
-success_regex = ['PY_MP_OK']
+shell_init_cmd = "/python/python.exe -u /python/probe_pool.py"
+success_regex = ['PROBE-POOL-DONE']
 # Only the machine failing ends the run: the suite prints its own verdict, and
 # t19 drives the interpreter's own error paths on purpose - a child that dies
 # with "Fatal Python error" is a check passing, not the run failing.
 fail_regex = ['(?i)panic']
-timeout = 2400
+timeout = 1500

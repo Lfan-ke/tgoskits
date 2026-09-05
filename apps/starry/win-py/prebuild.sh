@@ -104,3 +104,4 @@ install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_exit.py" "$
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_queue.py" "$overlay_dir/python/probe_queue.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_t19.py" "$overlay_dir/python/probe_t19.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_pool.py" "$overlay_dir/python/probe_pool.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_msgsize.py" "$overlay_dir/python/probe_msgsize.py"
