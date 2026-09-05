@@ -195,6 +195,12 @@ impl Mem for MockHost {
     }
     fn map(&self, req: &MapRequest) -> SysResult {
         *self.mapped.borrow_mut() = Some(*req);
+        // A host has a finite address space; this one's is the buffer it
+        // calls user memory, so a request past what it could ever hold is
+        // refused rather than attempted.
+        if req.len > 1 << 26 {
+            return Err(12); // ENOMEM
+        }
         // Hand out a run inside the flat buffer this host calls user memory,
         // so what a caller maps is memory it can then read and write.
         let mut next = self.mapped_next.borrow_mut();

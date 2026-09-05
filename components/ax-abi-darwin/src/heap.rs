@@ -41,8 +41,17 @@ const END: u64 = 16;
 /// Hand back `len` bytes, or zero if there is no room.
 pub fn malloc(host: &dyn Host, at: &Library, len: usize) -> SysResult {
     // C says a request for nothing still answers with a pointer that can be
-    // freed, so it is rounded up like any other.
-    let want = (len.max(1) + HEADER).next_multiple_of(ALIGN);
+    // freed, so it is rounded up like any other. A length that cannot have a
+    // header and its rounding added to it is one no allocator can satisfy,
+    // and saying so is the only safe answer - wrapping would hand back a
+    // block far smaller than the caller asked for.
+    let Some(want) = len
+        .max(1)
+        .checked_add(HEADER + ALIGN - 1)
+        .map(|room| room / ALIGN * ALIGN)
+    else {
+        return Err(ENOMEM);
+    };
     if let Some(block) = take_free(host, at, want)? {
         return Ok(block as isize);
     }
@@ -126,7 +135,9 @@ fn carve(host: &dyn Host, at: &Library, want: usize) -> Result<usize, i32> {
     let mut next = word(host, at, NEXT)? as usize;
     let mut end = word(host, at, END)? as usize;
     if next == 0 || end - next < want {
-        let len = want.next_multiple_of(RUN);
+        let Some(len) = want.checked_next_multiple_of(RUN) else {
+            return Err(ENOMEM);
+        };
         let run = host.mem().ok_or(ENOMEM)?.map(&MapRequest {
             addr: 0,
             len,
@@ -293,6 +304,16 @@ mod tests {
         let empty = malloc(&host, &at, 0).unwrap() as usize;
         assert_ne!(empty, 0);
         assert_eq!(free(&host, &at, empty), Ok(0));
+    }
+
+    #[test]
+    fn a_length_that_cannot_be_rounded_up_is_refused_rather_than_wrapped() {
+        let (host, at) = ready();
+        assert_eq!(malloc(&host, &at, usize::MAX), Err(ENOMEM));
+        assert_eq!(malloc(&host, &at, usize::MAX - 8), Err(ENOMEM));
+        // And one just inside it is still asked for honestly, which the run
+        // it needs is what refuses.
+        assert!(malloc(&host, &at, usize::MAX / 2).is_err());
     }
 
     #[test]
