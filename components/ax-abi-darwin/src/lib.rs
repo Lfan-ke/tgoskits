@@ -65,9 +65,27 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingEnv {
+        /// The program, as the host would read it back.
+        image: Vec<u8>,
         maps: Vec<(u64, Prot, usize)>,
         from_file: Vec<(u64, u64)>,
         reset: bool,
+    }
+
+    impl RecordingEnv {
+        fn on(image: &[u8]) -> RecordingEnv {
+            RecordingEnv {
+                image: image.to_vec(),
+                ..RecordingEnv::default()
+            }
+        }
+
+        /// Whether anything was mapped over `va`.
+        fn mapped(&self, va: u64) -> bool {
+            self.maps
+                .iter()
+                .any(|(at, _, len)| (*at..*at + *len as u64).contains(&va))
+        }
     }
 
     impl LoadEnv for RecordingEnv {
@@ -95,8 +113,20 @@ mod tests {
             Ok(())
         }
 
-        fn read_image(&mut self, _at: u64, _out: &mut [u8]) -> AbiResult<usize> {
-            Ok(0)
+        fn read_image(&mut self, at: u64, out: &mut [u8]) -> AbiResult<usize> {
+            let from = self.image.get(at as usize..).unwrap_or(&[]);
+            let n = out.len().min(from.len());
+            out[..n].copy_from_slice(&from[..n]);
+            Ok(n)
+        }
+        fn image_len(&self) -> u64 {
+            self.image.len() as u64
+        }
+        fn stack_top(&self) -> u64 {
+            0x7FFF_0000
+        }
+        fn write(&mut self, _va: u64, _bytes: &[u8]) -> AbiResult<()> {
+            Ok(())
         }
         fn reset(&mut self) -> AbiResult<()> {
             self.reset = true;
@@ -145,7 +175,7 @@ mod tests {
     #[test]
     fn loads_segments_skipping_pagezero() {
         let img = synth();
-        let mut env = RecordingEnv::default();
+        let mut env = RecordingEnv::on(&img);
         let loaded = MachoFormat
             .load(
                 &LoadRequest {
@@ -158,11 +188,18 @@ mod tests {
                 &mut env,
             )
             .expect("load");
-        // Only __TEXT is mapped; __PAGEZERO is skipped.
-        assert_eq!(env.maps.len(), 1);
+        // Only __TEXT is mapped from the image; __PAGEZERO is skipped. The
+        // rest of what is mapped is the system's own: its variables, its
+        // stubs, the code the process starts on, and the stack.
         assert_eq!(env.maps[0].0, 0x1_0000_0000);
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
-        assert_eq!(loaded.entry, 0x1_0000_0200);
+        assert_eq!(env.maps.len(), 5);
+        // The program does not begin at its own `main` any more: it begins at
+        // the code that calls it and exits with what it returns.
+        assert_ne!(loaded.entry, 0x1_0000_0200);
+        assert!(env.mapped(loaded.entry), "the start code is mapped");
+        assert_eq!(loaded.stack % 16, 0);
+        assert!(env.mapped(loaded.stack), "the stack is mapped");
     }
 
     // Write a segment_command_64 at `off`.
@@ -209,7 +246,7 @@ mod tests {
         b[off + 4..off + 8].copy_from_slice(&(main as u32).to_le_bytes());
         b[off + 8..off + 16].copy_from_slice(&0x100u64.to_le_bytes()); // entryoff in __TEXT
 
-        let mut env = RecordingEnv::default();
+        let mut env = RecordingEnv::on(&b);
         let loaded = MachoFormat
             .load(
                 &LoadRequest {
@@ -223,7 +260,7 @@ mod tests {
             )
             .expect("load");
         // __PAGEZERO skipped; __TEXT/__DATA/__LINKEDIT mapped with their prots.
-        assert_eq!(env.maps.len(), 3);
+        assert_eq!(env.maps.len(), 3 + 4);
         assert_eq!(
             env.maps[0],
             (0x1_0000_0000, Prot::READ | Prot::EXEC, 0x1000)
@@ -233,14 +270,18 @@ mod tests {
             (0x1_0000_1000, Prot::READ | Prot::WRITE, 0x1000)
         );
         assert_eq!(env.maps[2], (0x1_0000_2000, Prot::READ, 0x1000));
-        assert_eq!(loaded.entry, 0x1_0000_0100);
+        assert!(env.mapped(loaded.entry), "the start code is mapped");
+        assert!(
+            env.reset,
+            "the space was prepared before anything was placed"
+        );
     }
 
     #[test]
     fn recognizes_only_mach_o() {
         assert!(MachoFormat.recognizes(&[0xFE, 0xED, 0xFA, 0xCF]));
         assert!(!MachoFormat.recognizes(b"MZ"));
-        let mut env = RecordingEnv::default();
+        let mut env = RecordingEnv::on(b"\x7fELF");
         assert_eq!(
             MachoFormat.load(
                 &LoadRequest {
@@ -267,35 +308,80 @@ impl ImageFormat for MachoFormat {
     }
 
     fn load(&self, req: &LoadRequest<'_>, env: &mut dyn LoadEnv) -> AbiResult<Loaded> {
-        let macho = macho::parse(req.image).ok_or(AbiError::MalformedImage)?;
+        let bytes = link::read_all(env)?;
+        let macho = macho::parse(&bytes).ok_or(AbiError::MalformedImage)?;
         // No LC_MAIN means a legacy LC_UNIXTHREAD entry, which is out of scope.
-        let entry = macho.entry(req.image).ok_or(AbiError::Unsupported)?;
+        let main = macho.entry(&bytes).ok_or(AbiError::Unsupported)?;
+        // Everything the set needs is read and resolved before anything is
+        // mapped, so a program whose libraries are missing or whose symbols
+        // nothing provides is refused while the caller still has the address
+        // space it came with.
+        let linked = link::link(bytes, req.path, env)?;
+        let exit = linked
+            .system
+            .address("_exit")
+            .ok_or(AbiError::MissingLibrary)?;
+        let inits = linked.initializers();
+        let start_va = linked.system.base + linked.system.extent();
 
-        // The image is this package's from here, so the space it goes into is
-        // torn down and prepared. Doing it after the header checks is what
-        // lets a malformed image be refused without destroying the caller's.
         env.reset()?;
-
-        for seg in macho.segments(req.image) {
-            // __PAGEZERO and other no-access reservations are address-space
-            // guards, not backed by pages; skip them rather than map gigabytes.
-            if seg.initprot == 0 || seg.vmsize == 0 {
-                continue;
+        for module in &linked.modules {
+            for seg in &module.segments {
+                // __PAGEZERO and other no-access reservations are address
+                // space guards, not backed by pages; skip them rather than
+                // map gigabytes.
+                if seg.initprot == 0 || seg.vmsize == 0 {
+                    continue;
+                }
+                env.map_region(
+                    module.slide + seg.vmaddr,
+                    seg.vmsize,
+                    segment_prot(seg),
+                    seg.file_data(&module.bytes),
+                )?;
             }
-            // Map from the file rather than copying it in: a segment's
-            // `fileoff`/`filesize` are the same shape as an ELF `PT_LOAD`'s
-            // `p_offset`/`p_filesz`, so it gets the same demand paging.
-            env.map_image(
-                seg.vmaddr,
-                seg.vmsize,
-                segment_prot(&seg),
-                seg.fileoff,
-                seg.fileoff + seg.filesize,
-            )?;
+            // What the fixups could not write into the file's own bytes,
+            // because it lands in a segment's zero-filled tail.
+            for (va, value) in &module.late {
+                env.write(*va, &value.to_le_bytes())?;
+            }
         }
+
+        // The library the system provides: its variables are what the program
+        // stores through, its stubs are what the program calls.
+        let system = &linked.system;
+        env.map_region(
+            system.base,
+            system.code_off(),
+            Prot::READ | Prot::WRITE,
+            Some(&system.vars()),
+        )?;
+        let code = system.code();
+        env.map_region(
+            system.base + system.code_off(),
+            code.len() as u64,
+            Prot::READ | Prot::EXEC,
+            Some(&code),
+        )?;
+
+        let stack = start::stack(env.stack_top(), req.path, req.args, req.envs);
+        let start = start::code(start::Entry { main, exit }, &inits, &stack);
+        env.map_region(
+            start_va,
+            start.len() as u64,
+            Prot::READ | Prot::EXEC,
+            Some(&start),
+        )?;
+        env.map_region(
+            stack.sp,
+            stack.bytes.len() as u64,
+            Prot::READ | Prot::WRITE,
+            Some(&stack.bytes),
+        )?;
+
         Ok(Loaded {
-            entry,
-            stack: 0,
+            entry: start_va,
+            stack: stack.sp,
             thread_pointer: 0,
         })
     }

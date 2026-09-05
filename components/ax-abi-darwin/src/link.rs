@@ -97,6 +97,41 @@ pub struct Linked {
     pub system: Library,
 }
 
+impl Linked {
+    /// Every initializer the set wants run before `main`, in the order dyld
+    /// runs them: a library's before the program's, since a program's own
+    /// initializer expects the libraries under it to be up.
+    pub fn initializers(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for module in self.modules.iter().rev() {
+            for run in module.info.initializers(&module.bytes) {
+                let Some(seg) = module
+                    .segments
+                    .iter()
+                    .find(|s| (s.vmaddr..s.vmaddr + s.vmsize).contains(&run.vmaddr))
+                else {
+                    continue;
+                };
+                let at = (seg.fileoff + (run.vmaddr - seg.vmaddr)) as usize;
+                let run = module
+                    .bytes
+                    .get(at..at + run.len as usize)
+                    .unwrap_or_default();
+                // The pointers were rebased with the rest of the image, so
+                // each already carries the slide.
+                let (words, _) = run.as_chunks::<8>();
+                out.extend(
+                    words
+                        .iter()
+                        .map(|word| u64::from_le_bytes(*word))
+                        .filter(|value| *value != 0),
+                );
+            }
+        }
+        out
+    }
+}
+
 /// Read the program's libraries, place the set, and resolve every fixup in it.
 ///
 /// `path` is where the program was found; a library that names itself relative
@@ -193,7 +228,7 @@ fn dir_of(path: &str) -> &str {
 }
 
 /// Read the whole of the image the host is on.
-fn read_all(env: &mut dyn LoadEnv) -> AbiResult<Vec<u8>> {
+pub fn read_all(env: &mut dyn LoadEnv) -> AbiResult<Vec<u8>> {
     let len = env.image_len() as usize;
     let mut bytes = alloc::vec![0u8; len];
     let mut got = 0;
@@ -398,6 +433,34 @@ mod tests {
             cmd[40..48].copy_from_slice(&fileoff.to_le_bytes());
             cmd[48..56].copy_from_slice(&len.to_le_bytes());
             cmd[60..64].copy_from_slice(&prot.to_le_bytes());
+            self.push(&cmd);
+        }
+
+        /// A segment carrying one `__mod_init_func` section, which is how an
+        /// image says it wants something run before `main`.
+        fn segment_init(
+            &mut self,
+            name: &str,
+            vmaddr: u64,
+            fileoff: u64,
+            len: u64,
+            prot: u32,
+            init: u64,
+            init_len: u64,
+        ) {
+            let mut cmd = alloc::vec![0u8; 72 + 80];
+            cmd[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+            cmd[4..8].copy_from_slice(&152u32.to_le_bytes());
+            cmd[8..8 + name.len()].copy_from_slice(name.as_bytes());
+            cmd[24..32].copy_from_slice(&vmaddr.to_le_bytes());
+            cmd[32..40].copy_from_slice(&len.to_le_bytes());
+            cmd[40..48].copy_from_slice(&fileoff.to_le_bytes());
+            cmd[48..56].copy_from_slice(&len.to_le_bytes());
+            cmd[60..64].copy_from_slice(&prot.to_le_bytes());
+            cmd[64..68].copy_from_slice(&1u32.to_le_bytes());
+            cmd[72 + 32..72 + 40].copy_from_slice(&init.to_le_bytes());
+            cmd[72 + 40..72 + 48].copy_from_slice(&init_len.to_le_bytes());
+            cmd[72 + 64..72 + 68].copy_from_slice(&9u32.to_le_bytes());
             self.push(&cmd);
         }
 
@@ -637,6 +700,40 @@ mod tests {
         assert_eq!(
             word(&linked.modules[1], 0x1000),
             0x1234 + linked.modules[1].slide
+        );
+    }
+
+    #[test]
+    fn runs_a_librarys_initializers_before_the_programs() {
+        // A library whose __DATA holds one initializer pointer, and a program
+        // whose __DATA holds another.
+        let mut lib = Build::default();
+        lib.segment("__TEXT", 0, 0, 0x1000, 5);
+        lib.segment_init("__DATA", 0x1000, 0x1000, 0x1000, 3, 0x1010, 8);
+        lib.segment("__LINKEDIT", 0x2000, 0x2000, 0x1000, 1);
+        lib.dylib("/usr/lib/libSystem.B.dylib");
+        lib.file.resize(0x2000, 0);
+        lib.file[0x1010..0x1018].copy_from_slice(&0x900u64.to_le_bytes());
+        lib.info(&rebase_one(1, 0x10), &[], &trie_one("_hello", 0x800));
+
+        let mut prog = Build::default();
+        prog.segment("__PAGEZERO", 0, 0, 0, 0);
+        prog.segment("__TEXT", 0x1_0000_0000, 0, 0x1000, 5);
+        prog.segment_init("__DATA", 0x1_0000_1000, 0x1000, 0x1000, 3, 0x1_0000_1020, 8);
+        prog.dylib("/lib/libhello.dylib");
+        prog.file.resize(0x2000, 0);
+        prog.file[0x1020..0x1028].copy_from_slice(&0x1_0000_0700u64.to_le_bytes());
+        prog.info(&[], &bind_one(1, "_hello", 2, 0), &[]);
+
+        let mut env = Files::default();
+        env.files
+            .insert(String::from("/lib/libhello.dylib"), lib.finish(0x3000));
+        let linked = link(prog.finish(0x2000), "/bin/prog", &mut env).expect("the set is complete");
+        // The library's initializer moved with the image; the program's did
+        // not, because a program does not move. The library's comes first.
+        assert_eq!(
+            linked.initializers(),
+            [0x900 + linked.modules[1].slide, 0x1_0000_0700]
         );
     }
 
