@@ -55,6 +55,10 @@ impl SysAbi for DarwinAbi {
     }
 }
 
+fn page_up(at: u64) -> u64 {
+    at.div_ceil(PAGE) * PAGE
+}
+
 /// Translate a segment's `initprot` bits into a mapping protection.
 fn segment_prot(seg: &Segment) -> Prot {
     let mut prot = Prot::empty();
@@ -202,11 +206,15 @@ mod tests {
         // stubs, the code the process starts on, and the stack.
         assert_eq!(env.maps[0].0, 0x1_0000_0000);
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
-        assert_eq!(env.maps.len(), 4);
+        assert_eq!(env.maps.len(), 5);
         // The program does not begin at its own `main` any more: it begins at
         // the code that calls it and exits with what it returns.
         assert_ne!(loaded.entry, 0x1_0000_0200);
         assert!(env.mapped(loaded.entry), "the start code is mapped");
+        assert!(
+            env.mapped(loaded.thread_pointer),
+            "the thread block is mapped"
+        );
         assert_eq!(loaded.stack % 16, 0);
         assert!(
             env.wrote.iter().any(|(at, _)| *at == loaded.stack),
@@ -281,7 +289,7 @@ mod tests {
             )
             .expect("load");
         // __PAGEZERO skipped; __TEXT/__DATA/__LINKEDIT mapped with their prots.
-        assert_eq!(env.maps.len(), 3 + 3);
+        assert_eq!(env.maps.len(), 3 + 4);
         assert_eq!(
             env.maps[0],
             (0x1_0000_0000, Prot::READ | Prot::EXEC, 0x1000)
@@ -399,6 +407,16 @@ impl ImageFormat for MachoFormat {
             Prot::READ | Prot::EXEC,
             Some(&start),
         )?;
+        // The block the thread reaches through `gs`: where its errno lives,
+        // and where the pthread family will keep the rest of what a thread
+        // has to have.
+        let tsd_va = page_up(start_va + start.len() as u64);
+        env.map_region(
+            tsd_va,
+            start::TSD_LEN,
+            Prot::READ | Prot::WRITE,
+            Some(&start::tsd(tsd_va)),
+        )?;
         // The host already mapped a stack; what goes on it is written, not
         // mapped over.
         env.write(stack.sp, &stack.bytes)?;
@@ -406,7 +424,7 @@ impl ImageFormat for MachoFormat {
         Ok(Loaded {
             entry: start_va,
             stack: stack.sp,
-            thread_pointer: 0,
+            thread_pointer: tsd_va,
         })
     }
 }

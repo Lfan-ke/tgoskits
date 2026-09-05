@@ -494,6 +494,24 @@ impl Library {
 /// what the ABI lets it.
 pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
     Some(match call.name() {
+        // `__error()` hands back where this thread's errno is, which is the
+        // only way a Darwin program is allowed to reach it.
+        "___error" => &[
+            0x65,
+            0x48,
+            0x8B,
+            0x04,
+            0x25,
+            0,
+            0,
+            0,
+            0, // mov rax, gs:[0]
+            0x48,
+            0x83,
+            0xC0,
+            crate::start::TSD_ERRNO as u8, // add rax, errno
+            0xC3,
+        ],
         // mov rax,rdi; mov rcx,rdx; rep movsb; ret
         "_memcpy" => &[0x48, 0x89, 0xF8, 0x48, 0x89, 0xD1, 0xF3, 0xA4, 0xC3],
         // As memcpy, but copying downwards when the two overlap the wrong way.
@@ -748,13 +766,21 @@ pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
 /// to `r10` first - which is what every libSystem stub does too.
 pub fn stub(call: DarwinCall) -> [u8; STUB_LEN] {
     let nr = call.nr().to_le_bytes();
+    let errno = crate::start::TSD_ERRNO as u8;
     let mut out = [0xCC_u8; STUB_LEN];
     let mut at = 0;
     for part in [
         &[0x49, 0x89, 0xCA][..],                 // mov r10, rcx
         &[0xB8, nr[0], nr[1], nr[2], nr[3]][..], // mov eax, <trap number>
         &[0x0F, 0x05][..],                       // syscall
-        &[0xC3][..],                             // ret
+        // The kernel reports failure Darwin's way - the errno in rax with the
+        // carry flag raised - and a C entry point reports it C's way, so the
+        // stub is where the one becomes the other.
+        &[0x73, 0x10][..],                               // jnc done
+        &[0x65, 0x48, 0x8B, 0x0C, 0x25, 0, 0, 0, 0][..], // mov rcx, gs:[0]
+        &[0x89, 0x41, errno][..],                        // mov [rcx+errno], eax
+        &[0x48, 0x83, 0xC8, 0xFF][..],                   // or rax, -1
+        &[0xC3][..],                                     // done: ret
     ] {
         out[at..at + part.len()].copy_from_slice(part);
         at += part.len();
@@ -1043,6 +1069,27 @@ mod tests {
         assert_eq!(wmemcmp([1u32].as_ptr(), [2u32].as_ptr(), 0), 0);
         assert!(wmemcmp([1u32, 0].as_ptr(), [1u32, 5].as_ptr(), 2) < 0);
         assert!(wmemcmp([1u32, 9].as_ptr(), [1u32, 5].as_ptr(), 2) > 0);
+    }
+
+    #[test]
+    fn the_stub_and_error_agree_on_where_errno_is() {
+        // The two halves of one convention live in different functions, which
+        // is how a constant drifts: the stub stores the errno the kernel
+        // reported, and `__error()` hands out the address a program reads it
+        // back from. If they ever disagreed, every failing call would report
+        // whatever was last at the other offset.
+        let stub = stub(Library::call("_write").unwrap());
+        let store = stub
+            .windows(3)
+            .position(|w| w[0] == 0x89 && w[1] == 0x41)
+            .expect("the stub stores errno");
+        let error = body(Library::call("___error").unwrap()).expect("it is code");
+        let add = error
+            .windows(4)
+            .position(|w| w[0] == 0x48 && w[1] == 0x83 && w[2] == 0xC0)
+            .expect("__error offsets the block");
+        assert_eq!(u64::from(stub[store + 2]), crate::start::TSD_ERRNO);
+        assert_eq!(u64::from(error[add + 3]), crate::start::TSD_ERRNO);
     }
 
     #[test]

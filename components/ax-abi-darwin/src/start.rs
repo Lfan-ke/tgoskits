@@ -19,6 +19,29 @@ use alloc::{format, string::String, vec::Vec};
 /// `_NSGetExecutablePath` reads it back.
 const EXECUTABLE_PATH: &str = "executable_path=";
 
+/// Where a thread keeps the address of its own block, so code that has `gs`
+/// can get the address rather than only the contents. Darwin's own thread
+/// block starts with the same self pointer, and so do Windows' TEB and
+/// Linux's TCB, for the same reason: `gs` names a base, not a value.
+pub const TSD_SELF: u64 = 0;
+
+/// Where the thread's `errno` is. Darwin reaches it through `__error()`, and
+/// nothing outside this package knows the offset, so the layout is this
+/// package's to choose - but the stub that stores it and the entry point that
+/// hands out its address must agree, which is what [`crate::system`] asserts.
+pub const TSD_ERRNO: u64 = 8;
+
+/// How big the block is. Only two words are spoken for; the rest is room for
+/// what the pthread family will need.
+pub const TSD_LEN: u64 = 64;
+
+/// The block a thread reaches through `gs`, placed at `at`.
+pub fn tsd(at: u64) -> Vec<u8> {
+    let mut out = alloc::vec![0u8; TSD_LEN as usize];
+    out[TSD_SELF as usize..TSD_SELF as usize + 8].copy_from_slice(&at.to_le_bytes());
+    out
+}
+
 /// A laid-out initial stack: where the pointer runs are, and the bytes to
 /// write at [`sp`](Stack::sp).
 #[derive(Debug, Clone, PartialEq, Eq)]
