@@ -745,11 +745,16 @@ chk("exit_bool_false", rc == 0, "rc=%d" % rc)
 # An uncaught KeyboardInterrupt prints its traceback, then CPython re-raises
 # SIGINT so the process dies *by the signal* (documented behavior) — subprocess
 # reports the death as a negative returncode (-SIGINT) on POSIX, while a shell
-# would see 128+2=130. Accept either spelling; the load-bearing assertion is the
-# traceback names KeyboardInterrupt and the run did NOT exit 0.
+# would see 128+2=130. Windows has no signal to die by, so CPython ends the
+# process with STATUS_CONTROL_C_EXIT instead. Accept every spelling; the
+# load-bearing assertion is the traceback names KeyboardInterrupt and the run
+# did NOT exit 0.
+_ki_codes = (-2, 130, 1)
+if sys.platform == "win32":
+    _ki_codes += (0xC000013A,)
 rc, o, e = run(["-c", "raise KeyboardInterrupt"])
 chk("exit_keyboardinterrupt",
-    rc != 0 and "KeyboardInterrupt" in e and rc in (-2, 130, 1),
+    rc != 0 and "KeyboardInterrupt" in e and rc in _ki_codes,
     "rc=%d" % rc)
 
 # ===========================================================================
