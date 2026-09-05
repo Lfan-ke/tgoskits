@@ -17,9 +17,9 @@ pub const DARWIN_BASE: u32 = 0x0F00_0000;
 
 /// How much room one entry's code takes. A trapping stub is eleven bytes; the
 /// handful of entries that are pure computation carry their own code instead
-/// and the longest of those is twenty-nine, so this is what keeps every entry
+/// and the longest of those is thirty-nine, so this is what keeps every entry
 /// at an address its index alone can name.
-pub const STUB_LEN: usize = 32;
+pub const STUB_LEN: usize = 48;
 
 /// What a variable's slot is aligned and rounded to, so one slot's size never
 /// decides the next one's alignment.
@@ -563,6 +563,114 @@ pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
             0xC3, 0x31, 0xC0, // miss: xor eax,eax
             0xC3,
         ],
+        // Byte by byte for the first match, the last match, or the end.
+        "_strchr" => &[
+            0x40, 0x0F, 0xB6, 0xCE, // movzbl %sil,%ecx
+            0x0F, 0xB6, 0x07, // movzbl (%rdi),%eax
+            0x39, 0xC8, // cmp %ecx,%eax
+            0x74, 0x09, // je found
+            0x84, 0xC0, // test %al,%al
+            0x74, 0x09, // je miss - the end matches only a search for it
+            0x48, 0xFF, 0xC7, // inc %rdi
+            0xEB, 0xF0, // jmp back
+            0x48, 0x89, 0xF8, 0xC3, // found: mov %rdi,%rax; ret
+            0x31, 0xC0, 0xC3, // miss: xor %eax,%eax; ret
+        ],
+        "_strrchr" => &[
+            0x40, 0x0F, 0xB6, 0xCE, // movzbl %sil,%ecx
+            0x31, 0xC0, // xor %eax,%eax - nothing found yet
+            0x0F, 0xB6, 0x17, // movzbl (%rdi),%edx
+            0x39, 0xCA, // cmp %ecx,%edx
+            0x75, 0x03, // jne skip
+            0x48, 0x89, 0xF8, // mov %rdi,%rax - remember this one
+            0x84, 0xD2, // skip: test %dl,%dl
+            0x74, 0x05, // je done
+            0x48, 0xFF, 0xC7, // inc %rdi
+            0xEB, 0xED, // jmp back
+            0xC3, // done: ret
+        ],
+        "_strncmp" => &[
+            0x31, 0xC0, // xor %eax,%eax
+            0x48, 0x85, 0xD2, // test %rdx,%rdx
+            0x74, 0x17, // je done - a length of zero compares equal
+            0x48, 0xFF, 0xCA, // dec %rdx
+            0x0F, 0xB6, 0x07, // movzbl (%rdi),%eax
+            0x0F, 0xB6, 0x0E, // movzbl (%rsi),%ecx
+            0x48, 0xFF, 0xC7, // inc %rdi
+            0x48, 0xFF, 0xC6, // inc %rsi
+            0x29, 0xC8, // sub %ecx,%eax
+            0x75, 0x04, // jne done
+            0x84, 0xC9, // test %cl,%cl
+            0x75, 0xE4, // jne back - not the end, keep going
+            0xC3, // done: ret
+        ],
+        "_strcpy" => &[
+            0x48, 0x89, 0xF8, // mov %rdi,%rax
+            0x0F, 0xB6, 0x0E, // movzbl (%rsi),%ecx
+            0x88, 0x0F, // mov %cl,(%rdi)
+            0x48, 0xFF, 0xC7, // inc %rdi
+            0x48, 0xFF, 0xC6, // inc %rsi
+            0x84, 0xC9, // test %cl,%cl
+            0x75, 0xF1, // jne back
+            0xC3,
+        ],
+        // Up to n bytes, and the rest of n filled with zeroes, which is the
+        // part of strncpy everyone forgets.
+        "_strncpy" => &[
+            0x49, 0x89, 0xF8, // mov %rdi,%r8
+            0x48, 0x85, 0xD2, // test %rdx,%rdx
+            0x74, 0x1B, // je done
+            0x48, 0xFF, 0xCA, // dec %rdx
+            0x0F, 0xB6, 0x0E, // movzbl (%rsi),%ecx
+            0x88, 0x0F, // mov %cl,(%rdi)
+            0x48, 0xFF, 0xC7, // inc %rdi
+            0x84, 0xC9, // test %cl,%cl
+            0x74, 0x05, // je pad
+            0x48, 0xFF, 0xC6, // inc %rsi
+            0xEB, 0xE7, // jmp back
+            0x48, 0x89, 0xD1, // pad: mov %rdx,%rcx
+            0x31, 0xC0, // xor %eax,%eax
+            0xF3, 0xAA, // rep stosb
+            0x4C, 0x89, 0xC0, // done: mov %r8,%rax
+            0xC3,
+        ],
+        // The wide characters Darwin uses are four bytes each.
+        "_wcslen" => &[
+            0x48, 0x89, 0xF8, // mov %rdi,%rax
+            0x83, 0x38, 0x00, // cmpl $0,(%rax)
+            0x74, 0x06, // je done
+            0x48, 0x83, 0xC0, 0x04, // add $4,%rax
+            0xEB, 0xF5, // jmp back
+            0x48, 0x29, 0xF8, // done: sub %rdi,%rax
+            0x48, 0xC1, 0xE8, 0x02, // shr $2,%rax
+            0xC3,
+        ],
+        "_wcscmp" => &[
+            0x8B, 0x07, // mov (%rdi),%eax
+            0x8B, 0x0E, // mov (%rsi),%ecx
+            0x48, 0x83, 0xC7, 0x04, // add $4,%rdi
+            0x48, 0x83, 0xC6, 0x04, // add $4,%rsi
+            0x39, 0xC8, // cmp %ecx,%eax
+            0x75, 0x07, // jne differ
+            0x85, 0xC0, // test %eax,%eax
+            0x75, 0xEC, // jne back
+            0x31, 0xC0, 0xC3, // both ended together
+            0xB8, 0x01, 0x00, 0x00, 0x00, // differ: mov $1,%eax
+            0x7F, 0x05, // jg out - wchar_t is signed on Darwin
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov $-1,%eax
+            0xC3, // out: ret
+        ],
+        "_wmemchr" => &[
+            0x48, 0x85, 0xD2, // test %rdx,%rdx
+            0x74, 0x11, // je miss
+            0x48, 0xFF, 0xCA, // dec %rdx
+            0x39, 0x37, // cmp %esi,(%rdi)
+            0x74, 0x06, // je found
+            0x48, 0x83, 0xC7, 0x04, // add $4,%rdi
+            0xEB, 0xEE, // jmp back
+            0x48, 0x89, 0xF8, 0xC3, // found: mov %rdi,%rax; ret
+            0x31, 0xC0, 0xC3, // miss: xor %eax,%eax; ret
+        ],
         _ => return None,
     })
 }
@@ -739,6 +847,95 @@ mod tests {
         });
         assert!(memchr(hay.as_ptr(), b'z' as i32, 6).is_null());
         assert!(memchr(hay.as_ptr(), b'a' as i32, 0).is_null());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn strchr_and_strrchr_find_the_first_and_the_last() {
+        let strchr: extern "C" fn(*const u8, i32) -> *const u8 =
+            unsafe { core::mem::transmute(code_for("_strchr")) };
+        let s = b"abcabc\0";
+        assert_eq!(strchr(s.as_ptr(), b'b' as i32), unsafe {
+            s.as_ptr().add(1)
+        });
+        assert!(strchr(s.as_ptr(), b'z' as i32).is_null());
+        // A search for the terminator finds it, which C requires.
+        assert_eq!(strchr(s.as_ptr(), 0), unsafe { s.as_ptr().add(6) });
+
+        let strrchr: extern "C" fn(*const u8, i32) -> *const u8 =
+            unsafe { core::mem::transmute(code_for("_strrchr")) };
+        assert_eq!(strrchr(s.as_ptr(), b'b' as i32), unsafe {
+            s.as_ptr().add(4)
+        });
+        assert!(strrchr(s.as_ptr(), b'z' as i32).is_null());
+        assert_eq!(strrchr(s.as_ptr(), 0), unsafe { s.as_ptr().add(6) });
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn strncmp_stops_at_the_length_it_was_given() {
+        let strncmp: extern "C" fn(*const u8, *const u8, usize) -> i32 =
+            unsafe { core::mem::transmute(code_for("_strncmp")) };
+        assert_eq!(strncmp(b"abcx\0".as_ptr(), b"abcy\0".as_ptr(), 3), 0);
+        assert!(strncmp(b"abcx\0".as_ptr(), b"abcy\0".as_ptr(), 4) < 0);
+        assert_eq!(strncmp(b"a\0".as_ptr(), b"b\0".as_ptr(), 0), 0);
+        // A string that ends early stops the comparison there.
+        assert!(strncmp(b"ab\0".as_ptr(), b"abc\0".as_ptr(), 8) < 0);
+        assert_eq!(strncmp(b"ab\0".as_ptr(), b"ab\0".as_ptr(), 8), 0);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn strcpy_and_strncpy_copy_and_pad() {
+        let strcpy: extern "C" fn(*mut u8, *const u8) -> *mut u8 =
+            unsafe { core::mem::transmute(code_for("_strcpy")) };
+        let mut out = [0xFFu8; 8];
+        assert_eq!(
+            strcpy(out.as_mut_ptr(), b"abc\0".as_ptr()),
+            out.as_mut_ptr()
+        );
+        assert_eq!(&out[..5], b"abc\0\xff");
+
+        let strncpy: extern "C" fn(*mut u8, *const u8, usize) -> *mut u8 =
+            unsafe { core::mem::transmute(code_for("_strncpy")) };
+        // Short source: the rest of n is filled with zeroes.
+        let mut pad = [0xFFu8; 8];
+        assert_eq!(
+            strncpy(pad.as_mut_ptr(), b"ab\0".as_ptr(), 6),
+            pad.as_mut_ptr()
+        );
+        assert_eq!(pad, [b'a', b'b', 0, 0, 0, 0, 0xFF, 0xFF]);
+        // Long source: no terminator is written, which is the trap in strncpy.
+        let mut cut = [0xFFu8; 4];
+        strncpy(cut.as_mut_ptr(), b"abcdef\0".as_ptr(), 3);
+        assert_eq!(cut, [b'a', b'b', b'c', 0xFF]);
+        let mut none = [0xFFu8; 2];
+        strncpy(none.as_mut_ptr(), b"ab\0".as_ptr(), 0);
+        assert_eq!(none, [0xFF, 0xFF]);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_wide_entries_step_four_bytes_at_a_time() {
+        let wcslen: extern "C" fn(*const u32) -> usize =
+            unsafe { core::mem::transmute(code_for("_wcslen")) };
+        assert_eq!(wcslen([0u32].as_ptr()), 0);
+        assert_eq!(wcslen([b'a' as u32, 0x4E2D, 0].as_ptr()), 2);
+
+        let wcscmp: extern "C" fn(*const u32, *const u32) -> i32 =
+            unsafe { core::mem::transmute(code_for("_wcscmp")) };
+        assert_eq!(wcscmp([1u32, 2, 0].as_ptr(), [1u32, 2, 0].as_ptr()), 0);
+        assert!(wcscmp([1u32, 0].as_ptr(), [1u32, 2, 0].as_ptr()) < 0);
+        assert!(wcscmp([9u32, 0].as_ptr(), [1u32, 0].as_ptr()) > 0);
+
+        let wmemchr: extern "C" fn(*const u32, u32, usize) -> *const u32 =
+            unsafe { core::mem::transmute(code_for("_wmemchr")) };
+        let wide = [7u32, 8, 9];
+        assert_eq!(wmemchr(wide.as_ptr(), 9, 3), unsafe {
+            wide.as_ptr().add(2)
+        });
+        assert!(wmemchr(wide.as_ptr(), 9, 2).is_null());
+        assert!(wmemchr(wide.as_ptr(), 7, 0).is_null());
     }
 
     #[test]
