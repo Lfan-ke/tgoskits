@@ -26,6 +26,13 @@ const CPU_TYPE: u32 = if cfg!(target_arch = "aarch64") {
 // Load-command kinds we act on (`<mach-o/loader.h>`).
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_MAIN: u32 = 0x8000_0028;
+// The four ways an image names a library it needs. A bind's library ordinal
+// counts these in the order they appear, whichever kind each one is, so they
+// are reported as one list.
+const LC_LOAD_DYLIB: u32 = 0x0C;
+const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
+const LC_REEXPORT_DYLIB: u32 = 0x8000_001F;
+const LC_LOAD_UPWARD_DYLIB: u32 = 0x8000_0023;
 
 // `mach_header_64` is 32 bytes; load commands follow it.
 const HEADER_LEN: usize = 32;
@@ -52,6 +59,17 @@ impl MachoInfo {
         Segments {
             image,
             base: self.base as u64,
+            next: self.commands_off,
+            end: self.commands_off + self.sizeofcmds as usize,
+            remaining: self.ncmds,
+        }
+    }
+
+    /// The libraries this image needs, in the order a bind's library ordinal
+    /// counts them.
+    pub fn dylibs<'a>(&self, image: &'a [u8]) -> Dylibs<'a> {
+        Dylibs {
+            image,
             next: self.commands_off,
             end: self.commands_off + self.sizeofcmds as usize,
             remaining: self.ncmds,
@@ -127,6 +145,63 @@ impl Segment {
     pub fn file_data<'a>(&self, image: &'a [u8]) -> Option<&'a [u8]> {
         let start = self.fileoff as usize;
         image.get(start..start.checked_add(self.filesize as usize)?)
+    }
+}
+
+/// One library an image names, and whether it will settle for it being
+/// missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dylib<'a> {
+    pub path: &'a str,
+    pub weak: bool,
+    /// Whether what this library exports counts as this image's own exports,
+    /// which is what a framework's umbrella library is for.
+    pub reexport: bool,
+}
+
+/// Iterator over the libraries an image names.
+pub struct Dylibs<'a> {
+    image: &'a [u8],
+    next: usize,
+    end: usize,
+    remaining: u32,
+}
+
+impl<'a> Iterator for Dylibs<'a> {
+    type Item = Dylib<'a>;
+
+    fn next(&mut self) -> Option<Dylib<'a>> {
+        while self.remaining > 0 && self.next + 8 <= self.end {
+            let off = self.next;
+            let cmd = read_u32(self.image, off)?;
+            let size = read_u32(self.image, off + 4)? as usize;
+            if size < 8 {
+                return None;
+            }
+            self.next = off + size;
+            self.remaining -= 1;
+            if !matches!(
+                cmd,
+                LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB | LC_LOAD_UPWARD_DYLIB
+            ) {
+                continue;
+            }
+            // dylib_command: the name is an `lc_str`, an offset from the
+            // command's own start, and runs to its NUL.
+            let at = off + read_u32(self.image, off + 8)? as usize;
+            if at >= off + size {
+                continue;
+            }
+            let rest = self.image.get(at..off + size)?;
+            let len = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+            let path = core::str::from_utf8(&rest[..len]).ok()?;
+            return Some(Dylib {
+                path,
+                weak: cmd == LC_LOAD_WEAK_DYLIB,
+                reexport: cmd == LC_REEXPORT_DYLIB,
+            });
+        }
+        None
     }
 }
 
@@ -307,6 +382,51 @@ mod tests {
         // Change the one slice that matched, and nothing is left to load.
         image[8 + 20..8 + 24].copy_from_slice(&(CPU_TYPE ^ 0xF0).swap_bytes().to_le_bytes());
         assert!(parse(&image).is_none());
+    }
+
+    /// An image whose load commands are only `LC_LOAD_DYLIB` and friends, so
+    /// the order a bind's ordinal counts them can be checked.
+    fn with_dylibs(paths: &[(&str, u32)]) -> Vec<u8> {
+        let mut cmds: Vec<u8> = Vec::new();
+        for (path, cmd) in paths {
+            let len = (24 + path.len() + 1).next_multiple_of(8);
+            cmds.extend_from_slice(&cmd.to_le_bytes());
+            cmds.extend_from_slice(&(len as u32).to_le_bytes());
+            cmds.extend_from_slice(&24u32.to_le_bytes()); // name offset
+            cmds.extend_from_slice(&[0u8; 12]); // timestamp and two versions
+            let head = cmds.len();
+            cmds.resize(head + len - 24, 0);
+            cmds[head..head + path.len()].copy_from_slice(path.as_bytes());
+        }
+        let mut b = vec![0u8; HEADER_LEN + cmds.len()];
+        b[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+        b[12..16].copy_from_slice(&2u32.to_le_bytes());
+        b[16..20].copy_from_slice(&(paths.len() as u32).to_le_bytes());
+        b[20..24].copy_from_slice(&(cmds.len() as u32).to_le_bytes());
+        b[HEADER_LEN..].copy_from_slice(&cmds);
+        b
+    }
+
+    #[test]
+    fn lists_the_libraries_an_image_needs_in_order() {
+        let b = with_dylibs(&[
+            ("/usr/lib/libSystem.B.dylib", LC_LOAD_DYLIB),
+            (
+                "/System/Library/Frameworks/CoreFoundation",
+                LC_LOAD_WEAK_DYLIB,
+            ),
+            ("/Library/Frameworks/Python", LC_REEXPORT_DYLIB),
+        ]);
+        let m = parse(&b).expect("thin macho");
+        let libs: Vec<Dylib> = m.dylibs(&b).collect();
+        assert_eq!(libs.len(), 3, "every kind of load command counts");
+        assert_eq!(libs[0].path, "/usr/lib/libSystem.B.dylib");
+        assert!(!libs[0].weak && !libs[0].reexport);
+        assert!(libs[1].weak, "a weak load is one the image can do without");
+        assert!(
+            libs[2].reexport,
+            "a re-export lends its exports to this image"
+        );
     }
 
     #[test]
