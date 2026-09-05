@@ -142,6 +142,7 @@ fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) ->
         "__NSGetEnviron" => Ok(library.address("_environ")? as isize),
         "__NSGetExecutablePath" => exec_path(host, &library, a[0], a[1]),
         "_getenv" => getenv(host, &library, a[0]),
+        "_sysconf" => sysconf(host, a[0]),
         "_setenv" => crate::environ::set(host, &library, a),
         "_unsetenv" => crate::environ::unset(host, &library, a[0]),
         // The stream family. Nothing is buffered, so `fflush` has nothing to
@@ -334,6 +335,20 @@ mod tests {
     }
 
     #[test]
+    fn sysconf_answers_the_page_size_and_leaves_the_rest_indeterminate() {
+        let host = MockHost::default();
+        let mut page = call("_sysconf", &host, [29, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut page, &host), Dispatch::Handled);
+        assert_eq!(page.answer(), (Some(4096), Some(false)));
+
+        // Not an error - "indeterminate" is an answer C already asks callers
+        // to handle, and it does not claim the name is unknown.
+        let mut other = call("_sysconf", &host, [58, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut other, &host), Dispatch::Handled);
+        assert_eq!(other.answer(), (Some(-1i32 as usize), Some(false)));
+    }
+
+    #[test]
     fn abort_ends_the_program_rather_than_returning_to_it() {
         let host = MockHost::default();
         let mut env = call("_abort", &host, [0; 6]);
@@ -412,4 +427,27 @@ fn getenv(host: &dyn Host, library: &Library, name_at: usize) -> SysResult {
         array += 8;
     }
     Ok(0)
+}
+
+/// The `_SC_*` names this layer can answer, from Darwin's `<unistd.h>`.
+mod sc {
+    pub const PAGESIZE: usize = 29;
+}
+
+/// `sysconf(name)`.
+///
+/// A name this layer has no answer for is answered with -1 and no errno,
+/// which C spells "indeterminate" and every caller already has to handle -
+/// rather than with `EINVAL`, which would say the name is not a name. The
+/// host's log names it, so the list of what is still unanswered is the log.
+fn sysconf(host: &dyn Host, name: usize) -> SysResult {
+    match name {
+        // The page size is this personality's own, not something to ask about.
+        sc::PAGESIZE => Ok(crate::PAGE as isize),
+        _ => {
+            host.platform()
+                .trace(&alloc::format!("sysconf({name}) has no answer here"));
+            Ok(-1)
+        }
+    }
 }
