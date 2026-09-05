@@ -75,7 +75,7 @@ mod tests {
         /// The program, as the host would read it back.
         image: Vec<u8>,
         maps: Vec<(u64, Prot, usize)>,
-        wrote: Vec<(u64, usize)>,
+        wrote: Vec<(u64, Vec<u8>)>,
         from_file: Vec<(u64, u64)>,
         reset: bool,
     }
@@ -134,7 +134,7 @@ mod tests {
             0x7FFF_0000
         }
         fn write(&mut self, va: u64, bytes: &[u8]) -> AbiResult<()> {
-            self.wrote.push((va, bytes.len()));
+            self.wrote.push((va, bytes.to_vec()));
             Ok(())
         }
         fn reset(&mut self) -> AbiResult<()> {
@@ -211,6 +211,15 @@ mod tests {
         assert!(
             env.wrote.iter().any(|(at, _)| *at == loaded.stack),
             "what the process starts on was written to the stack"
+        );
+        // `environ` is filled in, and with an address on the stack that was
+        // just laid out rather than with nothing.
+        assert!(
+            env.wrote.iter().any(|(_, bytes)| bytes.len() == 8 && {
+                let value = u64::from_le_bytes(bytes[..].try_into().unwrap());
+                (loaded.stack..0x7FFF_0000).contains(&value)
+            }),
+            "environ points into the stack"
         );
     }
 
@@ -377,6 +386,12 @@ impl ImageFormat for MachoFormat {
         )?;
 
         let stack = start::stack(env.stack_top(), req.path, req.args, req.envs);
+        // The one variable that starts with a value rather than a zero:
+        // `environ` names the run of pointers the stack already carries, and
+        // `getenv` reads it from the first call.
+        if let Some(at) = system.address("_environ") {
+            env.write(at, &stack.envp.to_le_bytes())?;
+        }
         let start = start::code(start::Entry { main, exit }, &inits, &stack);
         env.map_region(
             start_va,
