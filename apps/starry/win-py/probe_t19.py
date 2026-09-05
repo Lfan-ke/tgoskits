@@ -41,6 +41,19 @@ def main():
     show("X-showopts", ["-X", "tracemalloc=1", "-c",
                         "import sys; print(sys._xoptions)"])
     show("import-timeit", ["-c", "import timeit; print('timeit ok')"])
+    # If a module's docstring is gone, `-m timeit --help` prints "None" and
+    # nothing is wrong with the pipe at all.
+    show("timeit-doc", ["-c", "import timeit; print(repr(timeit.__doc__)[:80])"])
+    # Unbuffered, and again straight to stderr: separates "the child never got
+    # there" from "what it printed was lost on the way out".
+    show("tracemalloc-unbuffered", ["-u", "-X", "tracemalloc=1", "-c",
+                                    "print(tracemalloc_is_tracing())"
+                                    .replace("tracemalloc_is_tracing()",
+                                             "__import__('tracemalloc').is_tracing()")])
+    show("tracemalloc-stderr", ["-X", "tracemalloc=1", "-c",
+                                "import sys, tracemalloc;"
+                                " sys.stderr.write('T %s' % tracemalloc.is_tracing());"
+                                " sys.stderr.flush()"])
     print("PROBE-T19-DONE", flush=True)
 
 
