@@ -221,16 +221,51 @@ fn process_params(req: &LoadRequest<'_>, path: &str, at: u64) -> Vec<u8> {
     };
     let own = [image.as_str()];
     let args: &[&str] = if req.args.is_empty() { &own } else { req.args };
+    let envs = windows_environment(req.envs);
+    let envs: Vec<&str> = envs.iter().map(alloc::string::String::as_str).collect();
     teb_peb::build_params(
         &teb_peb::ProcessInfo {
             image: &image,
             dir: &dir,
             args,
-            envs: req.envs,
+            envs: &envs,
             std: [0, 1, 2].map(|slot| u64::from(handle::Handle::from_slot(slot).0)),
         },
         at,
     )
+}
+
+/// The environment with the names a Windows process is always started with
+/// added, and nothing the caller set replaced.
+///
+/// A program does not ask whether it is on Windows before reading `TMP`: the
+/// C runtime, `tempfile` and every installer take it for granted, and one
+/// that is missing sends them looking down a list of guesses. What is added
+/// here is what this personality can answer truthfully - where temporary
+/// files go, which drive there is - and nothing it cannot.
+fn windows_environment(envs: &[&str]) -> Vec<alloc::string::String> {
+    const ALWAYS: [(&str, &str); 4] = [
+        ("TMP", win32::TEMP_DIR),
+        ("TEMP", win32::TEMP_DIR),
+        ("SystemDrive", "Z:"),
+        ("OS", "Windows_NT"),
+    ];
+    let mut out: Vec<alloc::string::String> = envs
+        .iter()
+        .map(|e| alloc::string::String::from(*e))
+        .collect();
+    for (name, value) in ALWAYS {
+        // Names compare without regard to case, the way Windows compares them.
+        let set = envs.iter().any(|entry| {
+            entry
+                .split_once('=')
+                .is_some_and(|(had, _)| had.eq_ignore_ascii_case(name))
+        });
+        if !set {
+            out.push(alloc::format!("{name}={value}"));
+        }
+    }
+    out
 }
 
 /// The current directory an `=X:=X:\\dir` entry names, if the environment has
@@ -951,6 +986,28 @@ mod tests {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(String::from_utf16_lossy(&name), "Z:\\app\\prog.exe");
+    }
+
+    #[test]
+    fn the_environment_gains_the_names_a_windows_process_always_has() {
+        // Nothing said where temporary files go, so the process is told.
+        let filled = super::windows_environment(&["PATH=Z:\\bin"]);
+        assert!(filled.iter().any(|e| e == "TMP=Z:\\tmp"));
+        assert!(filled.iter().any(|e| e == "TEMP=Z:\\tmp"));
+        assert!(filled.iter().any(|e| e == "PATH=Z:\\bin"));
+
+        // What the caller set stays what the caller set, whatever case the
+        // name was spelled in - Windows compares these without regard to it.
+        let kept = super::windows_environment(&["tmp=Z:\\scratch", "TEMP=Z:\\other"]);
+        assert!(kept.iter().any(|e| e == "tmp=Z:\\scratch"));
+        assert_eq!(
+            kept.iter()
+                .filter(|e| e.to_lowercase().starts_with("tmp="))
+                .count(),
+            1,
+            "the name is not set twice"
+        );
+        assert!(kept.iter().any(|e| e == "TEMP=Z:\\other"));
     }
 
     #[test]

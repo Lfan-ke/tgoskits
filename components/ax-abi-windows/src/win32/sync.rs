@@ -25,6 +25,10 @@ const CONTENDED: u32 = 2;
 /// `INFINITE`: a wait with no deadline.
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 
+/// `ERROR_TOO_MANY_POSTS`: a semaphore released past the maximum it was made
+/// with, which is how a lock released twice is reported.
+const ERROR_TOO_MANY_POSTS: u32 = 298;
+
 /// What a wait returns: `WAIT_OBJECT_0`, `WAIT_TIMEOUT`, `WAIT_FAILED`.
 pub const WAIT_OBJECT_0: usize = 0;
 pub const WAIT_TIMEOUT: usize = 0x102;
@@ -46,6 +50,8 @@ const OWNER: usize = 20;
 const GUARD: usize = 20;
 const DEPTH: usize = 24;
 const DUE: usize = 24;
+/// A semaphore's ceiling, which a release past it reports rather than crosses.
+const MAXIMUM: usize = 24;
 /// A thread's own fields: which thread it is, and what it ended with.
 const TID: usize = 20;
 const EXIT_CODE: usize = 24;
@@ -311,18 +317,47 @@ fn create(c: &mut Call<'_>, kind: Kind, state: u32) -> Option<usize> {
 }
 
 /// The object a handle names, if it names one.
+///
+/// A handle is either the block itself - which is all an object private to one
+/// process needs to be - or a descriptor naming the section an object that
+/// crosses to another process lives in. The second kind arrives in a child
+/// that never created it, so the section is mapped here on first sight.
 fn object(c: &Call<'_>, handle: usize) -> Option<(usize, Kind)> {
-    if handle == 0 || !handle.is_multiple_of(8) {
+    if let Some(fd) = descriptor_of(c, handle)
+        && let Some((block, fresh)) = super::section::attach(c, fd)
+    {
+        match (block_at(c, block), fresh) {
+            (Some(found), _) => return Some(found),
+            // A section that turned out to hold no object is let go again
+            // rather than left mapped on the strength of one hopeful look.
+            (None, true) => super::section::detach(c, fd),
+            (None, false) => {}
+        }
+    }
+    block_at(c, handle)
+}
+
+/// The object at `block`, if there is one there.
+fn block_at(c: &Call<'_>, block: usize) -> Option<(usize, Kind)> {
+    if block == 0 || !block.is_multiple_of(8) {
         return None;
     }
-    (c.read_u64(handle)? == MAGIC)
-        .then(|| Kind::from(c.read_u32(handle + KIND)?).map(|kind| (handle, kind)))?
+    (c.read_u64(block)? == MAGIC)
+        .then(|| Kind::from(c.read_u32(block + KIND)?).map(|kind| (block, kind)))?
+}
+
+/// The descriptor a handle names, and only when this process really holds it:
+/// a block's own address can look like a handle value, and going to the file
+/// system to find out otherwise is worse than checking first.
+fn descriptor_of(c: &Call<'_>, handle: usize) -> Option<i32> {
+    let fd = super::file::descriptor(handle).ok()?;
+    c.host.files()?.validate(fd).ok().map(|_| fd)
 }
 
 /// Release an object's block. A handle that names one is closed here; any
 /// other handle is left to the caller to make sense of.
 pub(super) fn close(c: &mut Call<'_>, handle: usize) -> bool {
-    let Some((block, _)) = object(c, handle) else {
+    let Some((block, _)) = block_at(c, handle) else {
         return false;
     };
     // Anyone still parked on it is woken rather than left waiting on memory
@@ -334,6 +369,20 @@ pub(super) fn close(c: &mut Call<'_>, handle: usize) -> bool {
         heap::mark_free(c, heap, block);
     }
     true
+}
+
+/// Let go of an object that lived in a section, now that the descriptor
+/// naming it is closing. The descriptor itself is the caller's to close.
+pub(super) fn close_shared(c: &mut Call<'_>, fd: i32) {
+    if let Some((block, false)) = super::section::attach(c, fd) {
+        if block_at(c, block).is_some() {
+            // Anyone still parked is woken rather than left waiting on a page
+            // that is about to go.
+            unpark(c, block + STATE, u32::MAX);
+            announce(c);
+        }
+        super::section::detach(c, fd);
+    }
 }
 
 /// CreateEventA/W(attributes, manual reset, initial state, name).
@@ -478,15 +527,32 @@ pub(super) fn due_in_ms(c: &Call<'_>, handle: usize) -> Option<u32> {
 }
 
 /// CreateSemaphoreA/W(attributes, initial count, maximum, name).
+///
+/// A semaphore is the one object here that has to survive being handed to
+/// another process - it is what a Windows program builds a cross-process lock
+/// out of - so it does not live on this process's heap. It lives in a section,
+/// and its handle is the descriptor naming that section: a child inherits the
+/// descriptor, maps the same pages, and counts against the same word.
 pub fn create_semaphore(c: &mut Call<'_>) -> Dispatch {
-    let initial = c.arg(1) as u32;
-    match create(c, Kind::Semaphore, initial) {
-        Some(handle) => {
-            c.set_last_error(0);
-            c.finish(handle)
-        }
-        None => c.fail(super::ERROR_NOT_ENOUGH_MEMORY, 0),
+    let (initial, maximum) = (c.arg(1) as u32, c.arg(2) as u32);
+    if maximum == 0 || initial > maximum {
+        return c.fail(super::ERROR_INVALID_PARAMETER, 0);
     }
+    let Some((fd, block)) = super::section::anonymous_shared(c, super::section::PAGE) else {
+        return c.fail(super::ERROR_NOT_ENOUGH_MEMORY, 0);
+    };
+    let Ok(slot) = usize::try_from(fd) else {
+        return c.fail(super::ERROR_NOT_ENOUGH_MEMORY, 0);
+    };
+    if !super::zero(c, block, 32) {
+        return c.fail(super::ERROR_NOT_ENOUGH_MEMORY, 0);
+    }
+    c.write_u64(block, MAGIC);
+    c.write_u32(block + KIND, Kind::Semaphore as u32);
+    c.write_u32(block + STATE, initial);
+    c.write_u32(block + MAXIMUM, maximum);
+    c.set_last_error(0);
+    c.finish(crate::handle::Handle::from_slot(slot).0 as usize)
 }
 
 /// ReleaseSemaphore(handle, count, previous out): raise the count and wake as
@@ -501,7 +567,14 @@ pub fn release_semaphore(c: &mut Call<'_>) -> Dispatch {
     };
     lock(c, block + GUARD);
     let previous = c.read_u32(block + STATE).unwrap_or(0);
-    c.write_u32(block + STATE, previous.saturating_add(count));
+    let maximum = c.read_u32(block + MAXIMUM).unwrap_or(u32::MAX);
+    // Past the ceiling nothing is added and the count is left where it was:
+    // a lock released twice has to be told so, not quietly counted up.
+    if count == 0 || previous.saturating_add(count) > maximum {
+        unlock(c, block + GUARD);
+        return c.fail(ERROR_TOO_MANY_POSTS, FALSE);
+    }
+    c.write_u32(block + STATE, previous + count);
     unlock(c, block + GUARD);
     if previous_out != 0 {
         c.write_u32(previous_out, previous);
@@ -544,6 +617,19 @@ pub fn release_mutex(c: &mut Call<'_>) -> Dispatch {
     unlock(c, block + STATE);
     announce(c);
     c.finish(TRUE)
+}
+
+/// Whether a handle names an object that lives in a section, which is to say
+/// one another process can signal.
+///
+/// Only a section this process already has a view of counts: every caller has
+/// just been round [`object`], so an object's section is mapped by now, and
+/// mapping one here to find out otherwise would map whatever else a handle
+/// happens to name.
+pub(super) fn is_shared(c: &Call<'_>, handle: usize) -> bool {
+    descriptor_of(c, handle)
+        .and_then(|fd| super::section::view_for(c, fd))
+        .is_some_and(|block| block_at(c, block).is_some())
 }
 
 /// Wait on one object until it is signalled or the deadline passes.

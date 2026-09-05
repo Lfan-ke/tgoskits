@@ -1131,7 +1131,25 @@ mod tests {
         kills: core::cell::Cell<bool>,
         /// Children the test has declared finished, and with what code.
         exits: RefCell<alloc::collections::BTreeMap<u32, i32>>,
+        /// Whether this host makes sections: an open hands out the next
+        /// descriptor, and mapping one lands it on a page of its own so two
+        /// sections are two pages, the way two files would be.
+        sections: core::cell::Cell<bool>,
+        /// The descriptors handed out for sections so far.
+        section_fds: core::cell::Cell<i32>,
+        /// How long each of those sections is, which starts at nothing and is
+        /// what truncating it sets - the way a fresh file behaves.
+        section_sizes: RefCell<alloc::collections::BTreeMap<i32, u64>>,
+        /// How long the last park was asked to last, or nothing for one with
+        /// no deadline.
+        parked: RefCell<Option<Option<u64>>>,
     }
+
+    /// Where the first section a mock host makes is mapped: past the heap
+    /// arena the test process lays out, with a page for each.
+    const SECTION_BASE: usize = 0x18000;
+    /// The first descriptor a mock section is given.
+    const SECTION_FD: i32 = 40;
 
     impl MockHost {
         /// The socket a descriptor names, for a test to set up or inspect.
@@ -1169,6 +1187,10 @@ mod tests {
                 killed: RefCell::default(),
                 kills: core::cell::Cell::new(true),
                 exits: RefCell::default(),
+                sections: core::cell::Cell::new(false),
+                section_fds: core::cell::Cell::new(SECTION_FD),
+                section_sizes: RefCell::default(),
+                parked: RefCell::default(),
             }
         }
     }
@@ -1411,6 +1433,7 @@ mod tests {
 
     impl ax_abi_port::Wait for MockHost {
         fn wait(&self, _at: usize, _expected: u32, timeout_ns: Option<u64>) -> Result<bool, i32> {
+            *self.parked.borrow_mut() = Some(timeout_ns);
             // Nothing here wakes a parked thread, so a park with a deadline
             // is exactly that much time going by.
             if let Some(ns) = timeout_ns {
@@ -1576,6 +1599,9 @@ mod tests {
         }
         fn ftruncate(&self, fd: i32, len: u64) -> ax_abi_port::SysResult {
             *self.truncated.borrow_mut() = Some((fd, len));
+            if self.sections.get() {
+                self.section_sizes.borrow_mut().insert(fd, len);
+            }
             Ok(0)
         }
     }
@@ -1589,6 +1615,12 @@ mod tests {
         }
         fn map(&self, req: &MapRequest) -> ax_abi_port::SysResult {
             *self.mapped.borrow_mut() = Some(*req);
+            if let ax_abi_port::MapSource::File { fd, .. } = req.source
+                && self.sections.get()
+                && (SECTION_FD..self.section_fds.get()).contains(&fd)
+            {
+                return Ok((SECTION_BASE + (fd - SECTION_FD) as usize * 0x1000) as isize);
+            }
             Ok(0x4000)
         }
         fn unmap(&self, _addr: usize, _len: usize) -> ax_abi_port::SysResult {
@@ -1613,6 +1645,11 @@ mod tests {
     impl ax_abi_port::Paths for MockHost {
         fn open(&self, at: At, path: &str, how: &OpenHow) -> ax_abi_port::SysResult {
             *self.opened.borrow_mut() = Some((at, path.to_string(), *how));
+            if self.sections.get() {
+                let fd = self.section_fds.get();
+                self.section_fds.set(fd + 1);
+                return Ok(fd as isize);
+            }
             self.opens_at.map(|fd| fd as isize)
         }
         fn attributes(&self, _at: At, path: &str, _follow: bool) -> Result<Attributes, i32> {
@@ -1624,7 +1661,13 @@ mod tests {
                 })
                 .ok_or(ax_abi_port::ENOENT)
         }
-        fn attributes_of(&self, _fd: i32) -> Result<Attributes, i32> {
+        fn attributes_of(&self, fd: i32) -> Result<Attributes, i32> {
+            if self.sections.get() && (SECTION_FD..self.section_fds.get()).contains(&fd) {
+                return Ok(Attributes {
+                    size: self.section_sizes.borrow().get(&fd).copied().unwrap_or(0),
+                    ..Attributes::default()
+                });
+            }
             self.describes.clone().ok_or(ax_abi_port::EBADF)
         }
         fn space(&self, _at: At, _path: &str) -> Result<ax_abi_port::Space, i32> {
@@ -3501,10 +3544,216 @@ mod tests {
         assert_eq!(waited(&host, teb, event, 0), WAIT_TIMEOUT);
     }
 
+    /// A host that can make sections, which is what a semaphore lives in.
+    fn section_host() -> MockHost {
+        let host = MockHost {
+            has_paths: true,
+            ..MockHost::default()
+        };
+        host.sections.set(true);
+        host
+    }
+
+    #[test]
+    fn a_wait_on_several_objects_looks_again_when_one_can_be_signalled_elsewhere() {
+        use crate::win32;
+        let host = section_host();
+        let (teb, _) = process(&host);
+        let event = created(&host, teb, "CreateEventW", [0, 0, 0, 0, 0, 0]);
+        let semaphore = created(&host, teb, "CreateSemaphoreW", [0, 0, 1, 0, 0, 0]);
+        let set = 0x7400usize;
+        let park_for = |handles: &[usize]| {
+            {
+                let mut mem = host.mem.borrow_mut();
+                for (i, handle) in handles.iter().enumerate() {
+                    let at = set + i * 8;
+                    mem[at..at + 8].copy_from_slice(&(*handle as u64).to_le_bytes());
+                }
+            }
+            *host.parked.borrow_mut() = None;
+            let mut wait = call(
+                "WaitForMultipleObjects",
+                [handles.len(), set, 0, 5_000, 0, 0],
+                teb,
+            );
+            win32::dispatch(&mut wait, &host);
+            (*host.parked.borrow()).expect("the wait parked")
+        };
+        // Nothing but this process can signal an event, so a wait on one
+        // sleeps for as long as it was given.
+        assert_eq!(
+            park_for(&[event]),
+            Some(5_000_000_000),
+            "a private object is slept on"
+        );
+        // A semaphore lives in a section another process can release, and
+        // that release does not touch this process's signal count - so the
+        // wait has to come back and look rather than sleep through it.
+        assert_eq!(
+            park_for(&[event, semaphore]),
+            Some(10_000_000),
+            "a set holding a shared object is swept"
+        );
+    }
+
+    #[test]
+    fn a_semaphore_is_a_section_a_process_that_only_holds_the_descriptor_can_use() {
+        use crate::win32;
+        let host = section_host();
+        let (teb, peb) = process(&host);
+        let semaphore = created(&host, teb, "CreateSemaphoreW", [0, 1, 1, 0, 0, 0]);
+        // The handle is a descriptor, which is the whole point: that is what
+        // crosses to a child, where a block of this process's heap could not.
+        assert_eq!(
+            crate::handle::Handle(semaphore as u32).slot(),
+            Some(SECTION_FD as usize),
+            "the handle names the section's descriptor"
+        );
+        // A process that never created it has no view of the section. Losing
+        // the views is what that looks like from here, and the next wait has
+        // to map it again and find the same count.
+        let clear = |at: usize| {
+            let mut mem = host.mem.borrow_mut();
+            mem[at..at + 8].copy_from_slice(&0u64.to_le_bytes());
+        };
+        clear(peb + win32::PEB_MAPPINGS);
+        assert_eq!(waited(&host, teb, semaphore, 0), WAIT_OBJECT_0);
+        clear(peb + win32::PEB_MAPPINGS);
+        assert_eq!(
+            waited(&host, teb, semaphore, 0),
+            WAIT_TIMEOUT,
+            "the count one process spent is the count the other sees"
+        );
+    }
+
+    #[test]
+    fn a_semaphore_released_past_its_maximum_is_refused() {
+        use crate::win32;
+        let host = section_host();
+        let (teb, _) = process(&host);
+        let semaphore = created(&host, teb, "CreateSemaphoreW", [0, 1, 1, 0, 0, 0]);
+        let mut release = call("ReleaseSemaphore", [semaphore, 1, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut release, &host);
+        assert_eq!(release.result, Some(0), "past the ceiling nothing is added");
+        assert_eq!(
+            last_error(&host, teb),
+            298,
+            "ERROR_TOO_MANY_POSTS is how a lock released twice is reported"
+        );
+        // The count stayed where it was, so the one unit it holds is still
+        // there to be taken exactly once.
+        assert_eq!(waited(&host, teb, semaphore, 0), WAIT_OBJECT_0);
+        assert_eq!(waited(&host, teb, semaphore, 0), WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn a_handle_duplicated_into_another_process_keeps_the_value_it_had() {
+        use crate::win32;
+        const PROCESS_TAG: usize = 0x2000_0000;
+        let host = section_host();
+        let (teb, _) = process(&host);
+        let semaphore = created(&host, teb, "CreateSemaphoreW", [0, 1, 1, 0, 0, 0]);
+        let out = 0x7300usize;
+        // Into a child: the child inherited the descriptor, so the number the
+        // parent sends it is the number it already holds.
+        let mut across = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("DuplicateHandle").unwrap(),
+            [
+                crate::handle::Handle::CURRENT_PROCESS.0 as usize,
+                semaphore,
+                PROCESS_TAG | 4242,
+                out,
+                0,
+                0,
+            ],
+            teb,
+            &[2],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut across, &host);
+        assert_eq!(across.result, Some(1));
+        let handed = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[out..out + 8].try_into().unwrap()) as usize
+        };
+        assert_eq!(
+            handed, semaphore,
+            "a handle crossing to another process is the one it already has"
+        );
+        // Into this process it is a copy, which is a number of its own.
+        let mut here = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("DuplicateHandle").unwrap(),
+            [
+                crate::handle::Handle::CURRENT_PROCESS.0 as usize,
+                semaphore,
+                crate::handle::Handle::CURRENT_PROCESS.0 as usize,
+                out,
+                0,
+                0,
+            ],
+            teb,
+            &[2],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut here, &host);
+        let copy = {
+            let mem = host.mem.borrow();
+            u64::from_le_bytes(mem[out..out + 8].try_into().unwrap()) as usize
+        };
+        assert_ne!(copy, semaphore, "a copy of one's own is a new number");
+    }
+
+    #[test]
+    fn a_section_is_mapped_shared_from_the_descriptor_that_names_it() {
+        use crate::win32;
+        let host = section_host();
+        let (teb, _) = process(&host);
+        let section = created(
+            &host,
+            teb,
+            "CreateFileMappingW",
+            [usize::MAX, 0, 0x04, 0, 0x1000, 0],
+        );
+        assert_eq!(
+            *host.truncated.borrow(),
+            Some((SECTION_FD, 0x1000)),
+            "the section is as long as it was asked for"
+        );
+        const FILE_MAP_ALL_ACCESS: usize = 0x000F_001F;
+        let mut view = call(
+            "MapViewOfFile",
+            [section, FILE_MAP_ALL_ACCESS, 0, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut view, &host);
+        let at = view.result.expect("the view was placed");
+        assert_ne!(at, 0);
+        // Shared and from the section's own descriptor: a private mapping
+        // would be a copy, and a copy is not what two processes share.
+        let asked = host.mapped.borrow().expect("the host was asked to map");
+        assert!(asked.shared, "a view of a section is shared");
+        assert_eq!(
+            asked.source,
+            ax_abi_port::MapSource::File {
+                fd: SECTION_FD,
+                offset: 0
+            }
+        );
+        assert_eq!(asked.len, 0x1000, "a length of zero means all of it");
+        let mut unmap = call("UnmapViewOfFile", [at, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut unmap, &host);
+        assert_eq!(unmap.result, Some(1));
+        let mut twice = call("UnmapViewOfFile", [at, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut twice, &host);
+        assert_eq!(twice.result, Some(0), "a view goes only once");
+    }
+
     #[test]
     fn a_semaphore_hands_out_its_count_and_release_reports_the_previous_one() {
         use crate::win32;
-        let host = MockHost::default();
+        let host = section_host();
         let (teb, _) = process(&host);
         let previous_out = 0x7200usize;
         let semaphore = created(&host, teb, "CreateSemaphoreW", [0, 2, 2, 0, 0, 0]);
@@ -4937,6 +5186,75 @@ mod tests {
         // Once the child ends the same wait finds it.
         host.exits.borrow_mut().insert(11, 3);
         assert_eq!(waited(&host, teb, handle, 500), WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn a_wait_on_several_objects_does_not_call_a_running_child_signalled() {
+        use crate::win32;
+        const PROCESS_TAG: usize = 0x2000_0000;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let set = 0x7500usize;
+        let handle = PROCESS_TAG | 31;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[set..set + 8].copy_from_slice(&(handle as u64).to_le_bytes());
+        }
+        let wait_for = |ms: usize| {
+            let mut wait = call("WaitForMultipleObjects", [1, set, 0, ms, 0, 0], teb);
+            win32::dispatch(&mut wait, &host);
+            wait.result.expect("the wait answered")
+        };
+        // A process handle is not one of the objects this layer keeps, and
+        // taking "not mine" for "signalled" would tell a caller its child had
+        // ended while it was still running.
+        assert_eq!(wait_for(200), WAIT_TIMEOUT, "the child is still running");
+        host.exits.borrow_mut().insert(31, 7);
+        assert_eq!(wait_for(200), WAIT_OBJECT_0, "and found once it ends");
+    }
+
+    #[test]
+    fn the_temporary_directory_is_what_the_environment_says_it_is() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let (buf, size) = (0x7600usize, 64usize);
+        let temp_path = || {
+            let mut ask = call("GetTempPathW", [size, buf, 0, 0, 0, 0], teb);
+            win32::dispatch(&mut ask, &host);
+            let len = ask.result.expect("the path was answered");
+            let mem = host.mem.borrow();
+            String::from_utf16_lossy(
+                &mem[buf..buf + len * 2]
+                    .chunks(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect::<Vec<u16>>(),
+            )
+        };
+        // Nothing set it, so it is where this personality puts them.
+        assert_eq!(temp_path(), "Z:\\tmp\\");
+
+        // TMP is the first name Windows looks at, and a value without the
+        // trailing separator still comes back with one.
+        let name: Vec<u8> = "TMP\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let value: Vec<u8> = "Z:\\scratch\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let (name_at, value_at) = (0x7700usize, 0x7780usize);
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[name_at..name_at + name.len()].copy_from_slice(&name);
+            mem[value_at..value_at + value.len()].copy_from_slice(&value);
+        }
+        let mut set = call(
+            "SetEnvironmentVariableW",
+            [name_at, value_at, 0, 0, 0, 0],
+            teb,
+        );
+        win32::dispatch(&mut set, &host);
+        assert_eq!(set.result, Some(1));
+        assert_eq!(temp_path(), "Z:\\scratch\\");
     }
 
     #[test]

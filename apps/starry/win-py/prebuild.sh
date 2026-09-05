@@ -100,3 +100,5 @@ install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_wait.py" "$
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_failing.py" "$overlay_dir/python/probe_failing.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_cli.py" "$overlay_dir/python/probe_cli.py"
 install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_crt.py" "$overlay_dir/python/probe_crt.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_shm.py" "$overlay_dir/python/probe_shm.py"
+install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_exit.py" "$overlay_dir/python/probe_exit.py"

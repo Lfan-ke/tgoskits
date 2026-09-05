@@ -533,7 +533,7 @@ pub fn output_debug_string(c: &mut Call<'_>) -> Dispatch {
 /// The value of `name` from the environment, as UTF-16 units, or None with the
 /// last error set for a name that is not present. Shared by the narrow and
 /// wide forms; names are compared without regard to case, as Windows does.
-fn env_value(c: &mut Call<'_>, name: &[u16]) -> Option<alloc::vec::Vec<u16>> {
+pub(super) fn env_value(c: &mut Call<'_>, name: &[u16]) -> Option<alloc::vec::Vec<u16>> {
     use crate::teb_peb::PARAMS_ENVIRONMENT;
     let env = c
         .params()

@@ -541,27 +541,52 @@ pub fn get_file_information_by_handle(c: &mut Call<'_>) -> Dispatch {
 /// lpTargetHandle, dwDesiredAccess, bInheritHandle, dwOptions): within this
 /// process, another handle on the same file.
 pub fn duplicate_handle(c: &mut Call<'_>) -> Dispatch {
-    let (source, target_out) = (c.arg(1), c.arg(3));
+    let (source, target, target_out, options) =
+        (c.arg(1), c.arg(2), c.arg(3), c.arg(6) as u32 as usize);
     let (Ok(fd), Some(files)) = (descriptor(source), c.host.files()) else {
         // Only a descriptor can be duplicated: it is the child's too, since
         // a child here starts with the descriptors its parent had. A block
-        // of this process's own memory - an event, a semaphore - is not
+        // of this process's own memory - an event, a mutex - is not
         // something another process can be given.
         c.host.platform().trace(&alloc::format!(
             "DuplicateHandle: {source:#x} is not a descriptor and cannot cross to another process"
         ));
         return c.fail_status(Ntstatus::INVALID_HANDLE, FALSE);
     };
-    match files.dup(fd) {
-        Ok(new) if new >= 0 => {
-            let handle = Handle::from_slot(new as usize).0 as u64;
-            if target_out != 0 && !c.write_u64(target_out, handle) {
-                return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
-            }
-            c.finish(TRUE)
+    // Into another process the handle needs no new number: the child started
+    // with the descriptors its parent had, so the value the parent is about
+    // to send it already names the same thing there. Duplicating instead
+    // would hand it a number of the parent's that the child never got.
+    let handle = if elsewhere(c, target) {
+        source as u64
+    } else {
+        match files.dup(fd) {
+            Ok(new) if new >= 0 => Handle::from_slot(new as usize).0 as u64,
+            Ok(_) => return c.fail_status(Ntstatus::UNSUCCESSFUL, FALSE),
+            Err(errno) => return c.fail_status(nt::status_from_errno(errno), FALSE),
         }
-        Ok(_) => c.fail_status(Ntstatus::UNSUCCESSFUL, FALSE),
-        Err(errno) => c.fail_status(nt::status_from_errno(errno), FALSE),
+    };
+    if target_out != 0 && !c.write_u64(target_out, handle) {
+        return c.fail_status(Ntstatus::ACCESS_VIOLATION, FALSE);
+    }
+    if options & DUPLICATE_CLOSE_SOURCE != 0 {
+        let _ = files.close(fd);
+    }
+    c.finish(TRUE)
+}
+
+/// `DUPLICATE_CLOSE_SOURCE`: the source handle goes as the copy is made.
+const DUPLICATE_CLOSE_SOURCE: usize = 0x1;
+
+/// Whether a process handle names a process other than this one.
+fn elsewhere(c: &Call<'_>, process: usize) -> bool {
+    if process == Handle::CURRENT_PROCESS.0 as usize || process == 0 {
+        return false;
+    }
+    let mine = c.host.tasks().and_then(|t| t.getpid().ok());
+    match (super::process::pid_of(process), mine) {
+        (Some(pid), Some(mine)) => pid as isize != mine,
+        _ => true,
     }
 }
 
@@ -600,11 +625,28 @@ pub fn get_full_path_name(c: &mut Call<'_>) -> Dispatch {
     result
 }
 
+/// Where temporary files go by default, when the environment does not say.
+pub const TEMP_DIR: &str = "Z:\\tmp";
+
 /// GetTempPathW(nBufferLength, lpBuffer): where temporary files go, with its
 /// trailing separator.
+///
+/// The environment is where Windows keeps this, and the order it looks in is
+/// `TMP`, then `TEMP`, then the default - so a program that sets one of them
+/// is answered with what it set rather than with where this happens to put
+/// temporary files.
 pub fn get_temp_path(c: &mut Call<'_>) -> Dispatch {
     let (size, buf) = (c.arg(0), c.arg(1));
-    answer_text(c, "Z:\\tmp\\", buf, size)
+    let named = ["TMP", "TEMP"].into_iter().find_map(|name| {
+        let name: Vec<u16> = name.encode_utf16().collect();
+        let value = super::runtime::env_value(c, &name)?;
+        String::from_utf16(&value).ok().filter(|v| !v.is_empty())
+    });
+    let mut path = named.unwrap_or_else(|| String::from(TEMP_DIR));
+    if !path.ends_with('\\') {
+        path.push('\\');
+    }
+    answer_text(c, &path, buf, size)
 }
 
 /// SetCurrentDirectoryW(lpPathName): a directory that exists becomes the one

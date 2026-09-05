@@ -842,13 +842,19 @@ fn set_to_bits(set: SignalSet) -> u64 {
 /// kernel's futexes are. The port takes a plain timeout rather than a
 /// `timespec` in user memory, so a personality can wait on a deadline it
 /// computed itself.
+///
+/// The key is resolved the way an unflagged Linux futex resolves it: a word in
+/// a shared mapping is keyed by what backs it, so two processes parking on the
+/// same page find each other. A personality that builds a cross-process object
+/// out of shared memory - a Windows semaphore a child inherits, say - needs
+/// that; a private word is unaffected.
 impl Wait for KernelHost {
     fn wait(&self, addr: usize, expected: u32, timeout_ns: Option<u64>) -> Result<bool, i32> {
         let word = addr as *const u32;
         if !addr.is_multiple_of(align_of::<u32>()) {
             return Err(errno(StarryError::InvalidInput));
         }
-        let key = FutexKey::new_current(addr, FutexKeyMode::Private);
+        let key = FutexKey::new_current(addr, FutexKeyMode::Auto);
         let table = futex_table_for(&key);
         // The word is read once before parking so a caller that is already
         // out of date is told to look again instead of sleeping on a value
@@ -908,7 +914,7 @@ impl Wait for KernelHost {
         if !addr.is_multiple_of(align_of::<u32>()) {
             return Err(errno(StarryError::InvalidInput));
         }
-        let key = FutexKey::new_current(addr, FutexKeyMode::Private);
+        let key = FutexKey::new_current(addr, FutexKeyMode::Auto);
         let woken = futex_table_for(&key)
             .get(&key)
             .map_or(0, |futex| futex.wq.wake(count as usize, u32::MAX));

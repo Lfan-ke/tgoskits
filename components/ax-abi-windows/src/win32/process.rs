@@ -435,6 +435,16 @@ pub(super) fn terminate(c: &mut Call<'_>, pid: u32, code: u32) -> Dispatch {
 /// signals nothing in this process, so the wait has to come back and ask.
 const POLL_MS: u32 = 10;
 
+/// Whether `pid` has ended, without waiting for it: `None` when it is no
+/// child of ours to ask about.
+pub(super) fn ended(c: &Call<'_>, pid: u32) -> Option<bool> {
+    match reap(c, pid, false) {
+        Child::Ended => Some(true),
+        Child::Running => Some(false),
+        Child::Gone => None,
+    }
+}
+
 /// WaitForSingleObject on a process handle: the child ending, or the timeout.
 pub fn wait_process(c: &mut Call<'_>, pid: u32, timeout_ms: u32) -> Dispatch {
     let deadline = super::sync::deadline_for(c, timeout_ms);

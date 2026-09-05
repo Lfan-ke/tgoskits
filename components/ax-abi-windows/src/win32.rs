@@ -36,8 +36,8 @@ use crate::{
     teb_peb::{
         PARAMS_COMMAND_LINE, PARAMS_COMMAND_LINE_A, PARAMS_CURRENT_DIRECTORY, PARAMS_ENVIRONMENT,
         PARAMS_ENVIRONMENT_SIZE, PARAMS_FLAGS, PARAMS_SHOW_WINDOW, PARAMS_STD_INPUT,
-        PEB_BEING_DEBUGGED, PEB_IMAGE_BASE, PEB_LDR, PEB_PROCESS_HEAP, PEB_PROCESS_PARAMS,
-        PEB_TLS_BITMAP_BITS, TEB_LAST_ERROR, TEB_PEB, TEB_TLS_SLOTS,
+        PEB_BEING_DEBUGGED, PEB_IMAGE_BASE, PEB_LDR, PEB_PRIVATE, PEB_PROCESS_HEAP,
+        PEB_PROCESS_PARAMS, PEB_SIZE, PEB_TLS_BITMAP_BITS, TEB_LAST_ERROR, TEB_PEB, TEB_TLS_SLOTS,
     },
 };
 
@@ -392,8 +392,10 @@ const KERNEL32: &[(&str, u16)] = &[
     ("LoadLibraryW", 0),
     ("LocalFree", 0),
     ("MapViewOfFile", 0),
+    ("MapViewOfFileEx", 0),
     ("NeedCurrentDirectoryForExePathW", 0),
     ("OpenEventW", 0),
+    ("OpenFileMappingA", 0),
     ("OpenFileMappingW", 0),
     ("OpenMutexW", 0),
     ("OpenProcess", 0),
@@ -1320,6 +1322,12 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         "DuplicateHandle" => file::duplicate_handle(&mut c),
         "GetFullPathNameW" => file::get_full_path_name(&mut c),
         "GetTempPathW" => file::get_temp_path(&mut c),
+        "CreateFileMappingA" | "CreateFileMappingW" => section::create_file_mapping(&mut c),
+        "OpenFileMappingA" | "OpenFileMappingW" => section::open_file_mapping(&mut c),
+        "MapViewOfFile" => section::map_view_of_file(&mut c, false),
+        "MapViewOfFileEx" => section::map_view_of_file(&mut c, true),
+        "UnmapViewOfFile" => section::unmap_view_of_file(&mut c),
+        "FlushViewOfFile" => section::flush_view_of_file(&mut c),
         "SetCurrentDirectoryW" => file::set_current_directory(&mut c),
         "FlsAlloc" => runtime::fls_alloc(&mut c),
         "FlsGetValue" => runtime::fls_get_value(&mut c),
@@ -1455,8 +1463,9 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
                 process::forget(pid);
                 return c.finish(TRUE);
             }
-            // An event, semaphore or mutex is a block of the process heap,
-            // which goes back to it here.
+            // An event or mutex is a block of the process heap, which goes
+            // back to it here; a semaphore lives in a section and closes with
+            // the descriptor naming it, further down.
             let handle = c.arg(0);
             if sync::close(&mut c, handle) || iocp::close(&mut c, handle) {
                 return c.finish(TRUE);
@@ -1468,6 +1477,7 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             // think it reports to a completion port or is a pipe.
             iocp::unregister(&mut c, fd);
             pipe::forget(&mut c, fd);
+            sync::close_shared(&mut c, fd);
             file::close_temporary(&mut c, fd);
             match files.close(fd) {
                 Ok(_) => c.finish(TRUE),
@@ -1543,13 +1553,16 @@ mod pipe;
 mod process;
 mod pyd;
 mod runtime;
+mod section;
+
+pub use file::TEMP_DIR;
 mod sock;
 mod sync;
 mod thread;
 
 /// Where the top-level exception filter is kept: a word of the PEB's reserved
 /// area that nothing else here uses.
-const PEB_EXCEPTION_FILTER: usize = 0x3F8;
+const PEB_EXCEPTION_FILTER: usize = 0xF50;
 
 /// WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten,
 /// lpOverlapped).
@@ -1663,65 +1676,78 @@ fn process_cookie(c: &Call<'_>) -> u32 {
     }
 }
 
-/// Where the completion-port registrations hang: a word of the PEB's
-/// reserved area holding the first of them, or zero.
-pub(crate) const PEB_PORT_FILES: usize = 0x3D0;
+/// Where the completion-port registrations hang: a word past the real PEB
+/// holding the first of them, or zero.
+///
+/// Every scratch word below sits past the last field a real PEB has, the way
+/// [`crate::teb_peb::TEB_PRIVATE`] does for the TEB: a real field's address is
+/// something a runtime may read for its own reasons, and a word we write for
+/// ours has no business sharing one.
+pub(crate) const PEB_PORT_FILES: usize = 0xF18;
 
 /// Where the pipes this process has hang, the same way.
-pub(crate) const PEB_PIPES: usize = 0x3C8;
+pub(crate) const PEB_PIPES: usize = 0xF20;
 
 /// Where the names that go when their handle closes hang, the same way.
-pub(crate) const PEB_TEMP_FILES: usize = 0x3C0;
+pub(crate) const PEB_TEMP_FILES: usize = 0xF28;
 
 /// Where the process's error mode is kept: another reserved word of the PEB.
-pub(crate) const PEB_ERROR_MODE: usize = 0x3D8;
+pub(crate) const PEB_ERROR_MODE: usize = 0xF30;
 
 /// Where the cookie is kept: another reserved word of the PEB.
-const PEB_COOKIE: usize = 0x3F0;
+const PEB_COOKIE: usize = 0xF38;
 /// Where a run-time load leaves the entry points still to be called with
 /// `DLL_PROCESS_ATTACH`: a word of the PEB's reserved area holding the
 /// address of a `(entry, base)` list ending in a zero pair, or zero.
-pub(crate) const PEB_PENDING_ATTACH: usize = 0x3E8;
+pub(crate) const PEB_PENDING_ATTACH: usize = 0xF40;
 
 /// A word past the real PEB that counts every signal any waitable object in
 /// the process has received. A thread waiting on several objects at once
 /// cannot park on all their words, so it parks on this one instead: whatever
 /// is signalled bumps it and wakes everyone waiting that way, and each of them
 /// looks over its own objects again.
-pub(crate) const PEB_SIGNAL_SEQ: usize = 0x3E0;
+pub(crate) const PEB_SIGNAL_SEQ: usize = 0xF48;
+
+/// Where the section objects this process has made hang, the same way.
+pub(crate) const PEB_MAPPINGS: usize = 0xF10;
 
 // Each of these words is written for a different reason; sharing one would
 // let a signal rewrite the cookie under an encoded pointer.
-const _: () = assert!(
-    PEB_TEMP_FILES != PEB_PIPES
-        && PEB_TEMP_FILES != PEB_PORT_FILES
-        && PEB_TEMP_FILES != PEB_ERROR_MODE
-        && PEB_TEMP_FILES != PEB_SIGNAL_SEQ
-        && PEB_TEMP_FILES != PEB_COOKIE
-        && PEB_TEMP_FILES != PEB_PENDING_ATTACH
-        && PEB_TEMP_FILES != PEB_EXCEPTION_FILTER
-        && PEB_PIPES != PEB_PORT_FILES
-        && PEB_PIPES != PEB_ERROR_MODE
-        && PEB_PIPES != PEB_SIGNAL_SEQ
-        && PEB_PIPES != PEB_COOKIE
-        && PEB_PIPES != PEB_PENDING_ATTACH
-        && PEB_PIPES != PEB_EXCEPTION_FILTER
-        && PEB_PORT_FILES != PEB_ERROR_MODE
-        && PEB_PORT_FILES != PEB_SIGNAL_SEQ
-        && PEB_PORT_FILES != PEB_COOKIE
-        && PEB_PORT_FILES != PEB_PENDING_ATTACH
-        && PEB_PORT_FILES != PEB_EXCEPTION_FILTER
-        && PEB_ERROR_MODE != PEB_SIGNAL_SEQ
-        && PEB_ERROR_MODE != PEB_COOKIE
-        && PEB_ERROR_MODE != PEB_PENDING_ATTACH
-        && PEB_ERROR_MODE != PEB_EXCEPTION_FILTER
-        && PEB_SIGNAL_SEQ != PEB_COOKIE
-        && PEB_SIGNAL_SEQ != PEB_PENDING_ATTACH
-        && PEB_SIGNAL_SEQ != PEB_EXCEPTION_FILTER
-        && PEB_COOKIE != PEB_PENDING_ATTACH
-        && PEB_COOKIE != PEB_EXCEPTION_FILTER
-        && PEB_PENDING_ATTACH != PEB_EXCEPTION_FILTER
-);
+const PEB_WORDS: [usize; 9] = [
+    PEB_TEMP_FILES,
+    PEB_PIPES,
+    PEB_PORT_FILES,
+    PEB_MAPPINGS,
+    PEB_ERROR_MODE,
+    PEB_SIGNAL_SEQ,
+    PEB_COOKIE,
+    PEB_PENDING_ATTACH,
+    PEB_EXCEPTION_FILTER,
+];
+
+/// The bitmap `PEB.TlsBitmap` points at is the one other thing kept past the
+/// real PEB, and it goes first.
+const PEB_WORDS_START: usize = PEB_PRIVATE + 0x10;
+
+const fn peb_words_sound() -> bool {
+    let mut i = 0;
+    while i < PEB_WORDS.len() {
+        if PEB_WORDS[i] < PEB_WORDS_START || PEB_WORDS[i] + 8 > PEB_SIZE {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < PEB_WORDS.len() {
+            if PEB_WORDS[i] == PEB_WORDS[j] {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(peb_words_sound());
 
 /// TlsAlloc: the first clear bit of the PEB's TLS bitmap, set, with the slot
 /// cleared in this thread's TEB.
@@ -2045,6 +2071,12 @@ fn timed_out(c: &mut Call<'_>, woken: bool) -> Dispatch {
 /// again. The counter is read before the handles are looked at, so a signal
 /// that lands during the sweep leaves the park with a value that no longer
 /// matches and it returns at once rather than missing the wake.
+/// How long a wait sleeps before looking again when one of the things it waits
+/// for is not something this process signals: a child ending, or an object in
+/// a section another process releases. Neither touches this process's signal
+/// count, which is what a wait on several objects parks on.
+const SHARED_SWEEP_MS: u32 = 10;
+
 fn wait_for_multiple_objects(c: &mut Call<'_>) -> Dispatch {
     let (count, handles, all, timeout) = (c.arg(0), c.arg(1), c.arg(2) != 0, c.arg(3) as u32);
     if count == 0 || count > 64 {
@@ -2062,10 +2094,22 @@ fn wait_for_multiple_objects(c: &mut Call<'_>) -> Dispatch {
             return c.fail(ERROR_INVALID_PARAMETER, sync::WAIT_FAILED);
         };
         let mut ready = 0;
+        let mut elsewhere = false;
         for i in 0..count {
             let Some(handle) = c.read_u64(handles + i * 8).map(|h| h as usize) else {
                 return c.fail(ERROR_INVALID_PARAMETER, sync::WAIT_FAILED);
             };
+            // A process handle is signalled by the child ending, which is not
+            // an object of this layer's and has to be asked about.
+            if let Some(pid) = process::pid_of(handle) {
+                match process::ended(c, pid) {
+                    Some(true) if !all => return c.finish(sync::WAIT_OBJECT_0 + i),
+                    Some(true) => ready += 1,
+                    Some(false) => elsewhere = true,
+                    None => return c.fail(ERROR_INVALID_HANDLE, sync::WAIT_FAILED),
+                }
+                continue;
+            }
             match sync::wait_object(c, handle, 0) {
                 // Not one of ours to wait on, which a single wait answers as
                 // signalled; answering differently here would hang a caller
@@ -2097,13 +2141,21 @@ fn wait_for_multiple_objects(c: &mut Call<'_>) -> Dispatch {
             }
         };
         // Nothing signals a timer, so the wait ends when the nearest one is
-        // due even if no object is touched in the meantime.
+        // due even if no object is touched in the meantime. An object in a
+        // section is the same problem for a different reason: what wakes a
+        // wait on several objects is this process's own signal count, and a
+        // release in another process does not touch it - so a set that holds
+        // one is swept again rather than slept through.
         for i in 0..count {
-            if let Some(handle) = c.read_u64(handles + i * 8).map(|h| h as usize)
-                && let Some(due) = sync::due_in_ms(c, handle)
-            {
-                left = left.min(due);
+            if let Some(handle) = c.read_u64(handles + i * 8).map(|h| h as usize) {
+                if let Some(due) = sync::due_in_ms(c, handle) {
+                    left = left.min(due);
+                }
+                elsewhere |= sync::is_shared(c, handle);
             }
+        }
+        if elsewhere {
+            left = left.min(SHARED_SWEEP_MS);
         }
         if !sync::wait_for_signal(c, seq, left) && deadline.is_some() {
             return c.finish(sync::WAIT_TIMEOUT);
