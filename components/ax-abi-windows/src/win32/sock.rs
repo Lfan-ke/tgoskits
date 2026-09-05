@@ -459,14 +459,20 @@ pub fn option(c: &mut Call<'_>, setting: bool) -> Dispatch {
         sockets.set_option(fd, option, value).map(|()| 0)
     } else {
         sockets.option(fd, option).map(|value| {
-            // A pending error is reported in Winsock's numbering, not the
-            // host's: a caller passes it straight to the code that turns a
-            // number into an exception, and 111 there means something else
-            // entirely.
-            let value = if option == SocketOption::Error && value != 0 {
-                error_of(value as i32)
-            } else {
-                value
+            let value = match option {
+                // A pending error is reported in Winsock's numbering, not the
+                // host's: a caller passes it straight to the code that turns a
+                // number into an exception, and 111 there means something else
+                // entirely.
+                SocketOption::Error if value != 0 => error_of(value as i32),
+                // What the socket carries is asked for as `SOCK_*`, which is
+                // Winsock's numbering rather than the port's.
+                SocketOption::Kind => match value {
+                    v if v == SocketKind::Datagram as u32 => 2,
+                    v if v == SocketKind::SeqPacket as u32 => 5,
+                    _ => 1,
+                },
+                _ => value,
             };
             let (at, len) = (c.arg(3), c.arg(4));
             if at != 0 {

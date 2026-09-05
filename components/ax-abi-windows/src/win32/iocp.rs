@@ -541,6 +541,38 @@ fn inline(
     ok: usize,
     bad: usize,
 ) -> Dispatch {
+    // A read of nothing is a question, not a transfer: `multiprocessing` asks
+    // it of every pipe it is waiting on. Answering it by reading zero bytes
+    // would take a whole message off the socket and throw it away, since that
+    // is what a zero-length receive does to a message that keeps boundaries.
+    if kind == READ && length == 0 && sock::is_pipe(c, fd) {
+        let ready = super::pipe::waiting_on(c, fd) != 0;
+        if overlapped != 0 {
+            let status = if ready {
+                u64::from(super::pipe::ERROR_MORE_DATA)
+            } else {
+                STATUS_PENDING
+            };
+            c.write_u64(overlapped + OVERLAPPED_INTERNAL, status);
+            c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, 0);
+            if ready {
+                wake(c, overlapped);
+            }
+        }
+        if transferred_out != 0 {
+            c.write_u32(transferred_out, 0);
+        }
+        // Nothing waiting leaves the operation outstanding, which is what a
+        // caller polling with a deadline waits on and cancels when it passes.
+        return c.fail(
+            if ready {
+                super::pipe::ERROR_MORE_DATA
+            } else {
+                ERROR_IO_PENDING
+            },
+            bad,
+        );
+    }
     // A pipe keeps message boundaries, and says so when a message did not
     // fit; every other descriptor is a plain read.
     if kind == READ && sock::is_pipe(c, fd) {
@@ -792,6 +824,20 @@ pub fn cancel(c: &mut Call<'_>) -> Dispatch {
         return c.fail(super::ERROR_INVALID_HANDLE, FALSE);
     };
     let Some((port, _)) = port_of(c, fd) else {
+        // An operation with no port left its state in the OVERLAPPED alone,
+        // so that is where it is called off - and whoever is waiting on it
+        // has to be told, or it waits for a completion that is not coming.
+        if overlapped != 0 && c.read_u64(overlapped + OVERLAPPED_INTERNAL) == Some(STATUS_PENDING) {
+            c.write_u64(
+                overlapped + OVERLAPPED_INTERNAL,
+                u64::from(ERROR_OPERATION_ABORTED),
+            );
+            c.write_u64(overlapped + OVERLAPPED_INTERNAL_HIGH, 0);
+            wake(c, overlapped);
+            sync::announce_signal(c);
+            c.set_last_error(0);
+            return c.finish(TRUE);
+        }
         return c.fail(ERROR_NOT_FOUND, FALSE);
     };
     let mut found = false;

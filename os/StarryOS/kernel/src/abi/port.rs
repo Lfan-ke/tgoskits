@@ -1163,7 +1163,19 @@ impl Sockets for KernelHost {
             SocketOption::SendBuffer => socket.get_option(Get::SendBuffer(&mut size)),
             SocketOption::ReceiveBuffer => socket.get_option(Get::ReceiveBuffer(&mut size)),
             SocketOption::Error => socket.get_option(Get::Error(&mut number)),
-            SocketOption::Kind => socket.get_option(Get::SocketType(&mut number)),
+            // What the socket carries is reported in the port's own numbering,
+            // not this host's: the host says `SOCK_SEQPACKET` is five, and a
+            // domain reading it has no business knowing that.
+            SocketOption::Kind => {
+                socket
+                    .get_option(Get::SocketType(&mut number))
+                    .map_err(|e| errno(e.into()))?;
+                return Ok(match number {
+                    2 => SocketKind::Datagram,
+                    5 => SocketKind::SeqPacket,
+                    _ => SocketKind::Stream,
+                } as u32);
+            }
         };
         done.map_err(|e| errno(e.into()))?;
         Ok(match option {

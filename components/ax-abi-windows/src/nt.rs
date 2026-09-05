@@ -1325,10 +1325,11 @@ mod tests {
         fn option(&self, fd: i32, option: ax_abi_port::SocketOption) -> Result<u32, i32> {
             let socket = self.socket(fd)?;
             Ok(match option {
-                ax_abi_port::SocketOption::Kind => match socket.kind {
-                    Some(ax_abi_port::SocketKind::Datagram) => 2,
-                    _ => 1,
-                },
+                // The port numbers these itself; turning that into what
+                // Winsock calls it is the domain's job, not the host's.
+                ax_abi_port::SocketOption::Kind => {
+                    socket.kind.unwrap_or(ax_abi_port::SocketKind::Stream) as u32
+                }
                 other => socket
                     .options
                     .iter()
@@ -4785,6 +4786,20 @@ mod tests {
         };
         assert_eq!(read, 1, "SOCK_STREAM");
 
+        // A sequenced-packet socket - which is what a named pipe is here -
+        // reads back as Winsock's SOCK_SEQPACKET, not as the port's own
+        // number for it.
+        host.socket(socket_fd(stream)).unwrap().kind = Some(ax_abi_port::SocketKind::SeqPacket);
+        put_bytes(&host, len, &4u32.to_le_bytes());
+        let mut sequenced = call("getsockopt", [stream, 0xFFFF, 0x1008, value, len, 0], teb);
+        win32::dispatch(&mut sequenced, &host);
+        let read = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(mem[value..value + 4].try_into().unwrap())
+        };
+        assert_eq!(read, 5, "SOCK_SEQPACKET");
+        host.socket(socket_fd(stream)).unwrap().kind = Some(ax_abi_port::SocketKind::Stream);
+
         // A pending error reads back in Winsock's numbering, since that is
         // what the caller turns into an exception.
         host.socket(socket_fd(stream))
@@ -5330,6 +5345,66 @@ mod tests {
         assert_eq!(wait_for(200), WAIT_TIMEOUT, "the child is still running");
         host.exits.borrow_mut().insert(31, 7);
         assert_eq!(wait_for(200), WAIT_OBJECT_0, "and found once it ends");
+    }
+
+    #[test]
+    fn a_read_of_nothing_asks_a_pipe_rather_than_emptying_it() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let name: Vec<u8> = "\\\\.\\pipe\\ask\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let name_at = 0x7B00usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[name_at..name_at + name.len()].copy_from_slice(&name);
+        }
+        let mut made = Win32Trap::with_stack(
+            crate::win32::Win32Call::named("CreateNamedPipeW").unwrap(),
+            [name_at, 3, 4, 1, 8192, 8192],
+            teb,
+            &[0xFFFF_FFFF, 0],
+            0,
+            &host,
+        );
+        win32::dispatch(&mut made, &host);
+        let handle = made.result.expect("a pipe");
+        let fd = crate::handle::Handle(handle as u32).slot().unwrap() as i32;
+        host.socket(fd).unwrap().queued.extend_from_slice(b"hello");
+
+        // `multiprocessing` asks every pipe it waits on whether it is ready by
+        // reading nothing from it. Answering that by receiving zero bytes
+        // would take the whole message off a socket that keeps boundaries and
+        // throw it away.
+        let (over, into) = (0x7B80usize, 0x7C00usize);
+        let mut ask = call("ReadFile", [handle, into, 0, 0, over, 0], teb);
+        win32::dispatch(&mut ask, &host);
+        assert_eq!(ask.result, Some(0), "a read of nothing is not a transfer");
+        let last = {
+            let mem = host.mem.borrow();
+            u32::from_le_bytes(
+                mem[teb + crate::teb_peb::TEB_LAST_ERROR..][..4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            last, 234,
+            "ERROR_MORE_DATA: there is a message and it stayed"
+        );
+        assert_eq!(host.socket(fd).unwrap().queued, b"hello", "still there");
+
+        // And the read that follows gets the whole of it.
+        let mut real = call("ReadFile", [handle, into, 16, 0, 0, 0], teb);
+        win32::dispatch(&mut real, &host);
+        assert_eq!(real.result, Some(1));
+        let got = {
+            let mem = host.mem.borrow();
+            mem[into..into + 5].to_vec()
+        };
+        assert_eq!(got, b"hello");
     }
 
     #[test]

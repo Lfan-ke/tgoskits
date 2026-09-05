@@ -184,6 +184,20 @@ fn waiting(c: &Call<'_>, fd: i32) -> usize {
     left.saturating_sub(taken)
 }
 
+/// How much is waiting to be read, the tail of a half-read message and what
+/// the socket holds together. What `PeekNamedPipe` reports, and what decides
+/// whether a read of nothing can say the pipe is ready.
+pub(super) fn waiting_on(c: &Call<'_>, fd: i32) -> usize {
+    let held = waiting(c, fd);
+    if held != 0 {
+        return held;
+    }
+    c.host
+        .sockets()
+        .and_then(|sockets| sockets.pending(fd).ok())
+        .unwrap_or(0)
+}
+
 /// Read one message, or as much of it as the caller has room for.
 ///
 /// Windows keeps the rest of a message that did not fit and gives it to the
