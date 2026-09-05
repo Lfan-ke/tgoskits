@@ -1122,6 +1122,34 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
             c.write(c.arg(0), &[0u8; 16]);
             c.finish(0)
         }
+        // The x64 SLIST_HEADER packs its fields: the first word is a 16-bit
+        // depth and a 48-bit sequence, and the second holds the head entry in
+        // its top sixty bits, which works because an entry is sixteen-byte
+        // aligned. Both calls answer with what the list started with.
+        "InterlockedFlushSList" => {
+            let head = c.arg(0);
+            let Some(region) = c.read_u64(head + 8) else {
+                return c.fail_status(nt::Ntstatus::ACCESS_VIOLATION, 0);
+            };
+            c.write(head, &[0u8; 16]);
+            c.finish((region & !0xF) as usize)
+        }
+        "InterlockedPushEntrySList" => {
+            let (head, entry) = (c.arg(0), c.arg(1));
+            let (Some(counts), Some(region)) = (c.read_u64(head), c.read_u64(head + 8)) else {
+                return c.fail_status(nt::Ntstatus::ACCESS_VIOLATION, 0);
+            };
+            let first = region & !0xF;
+            let depth = (counts & 0xFFFF) + 1;
+            let sequence = (counts >> 16) + 1;
+            if !c.write_u64(entry, first)
+                || !c.write_u64(head, (depth & 0xFFFF) | (sequence << 16))
+                || !c.write_u64(head + 8, entry as u64)
+            {
+                return c.fail_status(nt::Ntstatus::ACCESS_VIOLATION, 0);
+            }
+            c.finish(first as usize)
+        }
         "TlsAlloc" => tls_alloc(&mut c),
         "TlsGetValue" => {
             let index = c.arg(0) as u32;

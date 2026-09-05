@@ -4276,6 +4276,42 @@ mod tests {
     }
 
     #[test]
+    fn a_singly_linked_list_keeps_what_is_pushed_and_hands_it_all_back_at_once() {
+        use crate::win32;
+        let host = MockHost::default();
+        let (teb, _) = process(&host);
+        let head = 0x7400usize;
+        let (first, second) = (0x7500usize, 0x7510usize);
+        let mut made = call("InitializeSListHead", [head, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut made, &host);
+
+        // An empty list flushes to nothing.
+        let mut empty = call("InterlockedFlushSList", [head, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut empty, &host);
+        assert_eq!(empty.result, Some(0));
+
+        // Pushing answers with what was there before, and the entry's own
+        // first word becomes the link to it.
+        let mut one = call("InterlockedPushEntrySList", [head, first, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut one, &host);
+        assert_eq!(one.result, Some(0), "nothing was on the list yet");
+        let mut two = call("InterlockedPushEntrySList", [head, second, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut two, &host);
+        assert_eq!(two.result, Some(first));
+        let link = u64::from_le_bytes(host.mem.borrow()[second..second + 8].try_into().unwrap());
+        assert_eq!(link as usize, first, "the new entry points at the old head");
+        // The depth is the low sixteen bits of the first word.
+        let counts = u64::from_le_bytes(host.mem.borrow()[head..head + 8].try_into().unwrap());
+        assert_eq!(counts & 0xFFFF, 2, "two entries deep");
+
+        // Flushing hands back the head and leaves the list empty.
+        let mut flushed = call("InterlockedFlushSList", [head, 0, 0, 0, 0, 0], teb);
+        win32::dispatch(&mut flushed, &host);
+        assert_eq!(flushed.result, Some(second));
+        assert_eq!(host.mem.borrow()[head..head + 16], [0u8; 16]);
+    }
+
+    #[test]
     fn the_alertable_form_of_the_wait_is_the_same_wait() {
         use crate::win32;
         let host = MockHost::default();
