@@ -420,6 +420,104 @@ pub fn binds<'a>(stream: &'a [u8], mut each: impl FnMut(Bind<'a>)) {
     }
 }
 
+/// One symbol a library exports, as the trie records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Export<'a> {
+    pub name: &'a str,
+    /// Where it is, as an offset from the image's base.
+    pub address: u64,
+    /// The trie's flags word: the low bits are the symbol's kind, and the two
+    /// that matter here say whether it is a re-export or a resolver.
+    pub flags: u64,
+}
+
+impl Export<'_> {
+    /// Whether the symbol is really somewhere else, named by another library.
+    /// Such an entry carries no address of its own.
+    pub const fn reexport(&self) -> bool {
+        self.flags & EXPORT_REEXPORT != 0
+    }
+
+    /// Whether the address is a resolver to call rather than the symbol.
+    pub const fn resolver(&self) -> bool {
+        self.flags & EXPORT_RESOLVER != 0
+    }
+}
+
+/// `EXPORT_SYMBOL_FLAGS_REEXPORT` and `..._STUB_AND_RESOLVER`.
+const EXPORT_REEXPORT: u64 = 0x08;
+const EXPORT_RESOLVER: u64 = 0x10;
+
+/// The longest symbol name reported. Names are spelled out along the trie's
+/// edges, so a name longer than this is one the walk does not report.
+const MAX_NAME: usize = 512;
+
+/// How many edges deep the walk goes before it decides the trie loops. A
+/// child's offset is under no ordering rule - the root's one child is
+/// typically the last node in the trie - so depth is what bounds this, not
+/// the direction an edge points.
+const MAX_DEPTH: usize = 128;
+
+/// Walk a library's export trie, reporting every symbol it names.
+///
+/// The trie spells names out along its edges: a node holds the terminal
+/// information for the name spelled so far, then a child count and, for each
+/// child, the rest of a name and where that child starts. Walking it is how
+/// dyld answers "does this library export this symbol", and it is the only
+/// place the answer is written - the symbol table is there for debuggers, not
+/// for loading.
+pub fn exports(trie: &[u8], each: &mut dyn FnMut(Export<'_>)) {
+    let mut name = [0u8; MAX_NAME];
+    walk(trie, 0, &mut name, 0, 0, each);
+}
+
+fn walk(
+    trie: &[u8],
+    at: usize,
+    name: &mut [u8; MAX_NAME],
+    len: usize,
+    depth: usize,
+    each: &mut dyn FnMut(Export<'_>),
+) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let mut s = Stream { bytes: trie, at };
+    let Some(terminal) = s.uleb() else { return };
+    if terminal != 0 {
+        let end = s.at + terminal as usize;
+        if let Some(flags) = s.uleb()
+            && let Ok(text) = core::str::from_utf8(&name[..len])
+        {
+            // A re-export names another library and, sometimes, another name;
+            // neither is an address in this image, so only the plain kind
+            // reports one.
+            let address = if flags & EXPORT_REEXPORT != 0 {
+                None
+            } else {
+                s.uleb()
+            };
+            each(Export {
+                name: text,
+                address: address.unwrap_or(0),
+                flags,
+            });
+        }
+        s.at = end;
+    }
+    let Some(children) = s.byte() else { return };
+    for _ in 0..children {
+        let Some(edge) = s.name() else { return };
+        let Some(next) = s.uleb() else { return };
+        let next = next as usize;
+        if next == at || next >= trie.len() || len + edge.len() > MAX_NAME {
+            continue;
+        }
+        name[len..len + edge.len()].copy_from_slice(edge.as_bytes());
+        walk(trie, next, name, len + edge.len(), depth + 1, each);
+    }
+}
+
 fn read_u32(image: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         image.get(off..off + 4)?.try_into().ok()?,
@@ -550,5 +648,77 @@ mod tests {
         let mut found = Vec::new();
         binds(&stream, |b| found.push((b.offset, b.symbol)));
         assert_eq!(found, [(0x00, "_one"), (0x08, "_two")]);
+    }
+
+    /// An export trie laid out by hand: a root whose one edge is `_`, and
+    /// under it two symbols - one a plain definition, one a re-export, which
+    /// carries no address of its own. Every offset here is under 128, so each
+    /// is one ULEB byte and the layout can be written out in order.
+    fn trie() -> Vec<u8> {
+        let under = 5usize; // past the root
+        let leaf_a = under + 12; // past the "_" node
+        let leaf_b = leaf_a + 5; // past the first leaf
+        let mut t: Vec<u8> = Vec::new();
+        // root
+        t.push(0); // no terminal
+        t.push(1); // one child
+        t.extend_from_slice(b"_\0");
+        t.push(under as u8);
+        assert_eq!(t.len(), under);
+        // "_"
+        t.push(0);
+        t.push(2);
+        t.extend_from_slice(b"one\0");
+        t.push(leaf_a as u8);
+        t.extend_from_slice(b"two\0");
+        t.push(leaf_b as u8);
+        assert_eq!(t.len(), leaf_a);
+        // "_one": flags 0, address 0x1234 (two ULEB bytes)
+        t.push(3);
+        t.push(0);
+        t.extend_from_slice(&[0xB4, 0x24]);
+        t.push(0);
+        assert_eq!(t.len(), leaf_b);
+        // "_two": a re-export, so a library ordinal instead of an address
+        t.push(2);
+        t.push(0x08);
+        t.push(3);
+        t.push(0);
+        t
+    }
+
+    #[test]
+    fn reads_an_export_trie() {
+        let t = trie();
+        let mut seen: Vec<(alloc::string::String, u64, u64)> = Vec::new();
+        exports(&t, &mut |e| seen.push((e.name.into(), e.address, e.flags)));
+        seen.sort();
+        assert_eq!(seen.len(), 2, "both leaves are reported: {seen:?}");
+        assert_eq!(seen[0].0, "_one");
+        assert_eq!(seen[0].1, 0x1234);
+        assert_eq!(seen[1].0, "_two");
+        // A re-export names another library, not a place in this image.
+        assert_eq!(seen[1].1, 0);
+        assert!(
+            Export {
+                name: "",
+                address: 0,
+                flags: seen[1].2
+            }
+            .reexport()
+        );
+    }
+
+    #[test]
+    fn a_truncated_trie_stops_rather_than_reads_past_it() {
+        let t = trie();
+        for cut in 1..t.len() {
+            let mut seen = 0usize;
+            exports(&t[..t.len() - cut], &mut |_| seen += 1);
+            assert!(
+                seen <= 2,
+                "a short trie cannot hold more than the whole one"
+            );
+        }
     }
 }
