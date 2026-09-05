@@ -9,9 +9,11 @@
 //! by construction and an `exec` forgets the first one for free.
 //!
 //! It is a first-fit free list over runs taken from the memory port, which is
-//! what a small allocator is before anyone measures it. Runs are never given
-//! back and neighbouring free blocks are not merged; both are worth doing once
-//! there is a program running long enough to care.
+//! what a small allocator is before anyone measures it. Three things it does
+//! not do, all worth doing once a program runs long enough to care: runs are
+//! never given back, neighbouring free blocks are never merged, and what is
+//! left of a run when a request outgrows it is abandoned rather than put on
+//! the list.
 
 use ax_abi_port::{Host, MapRequest, MapSource, Prot, SysResult};
 
