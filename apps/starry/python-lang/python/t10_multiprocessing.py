@@ -332,14 +332,19 @@ def cohort_process_exitcode_codes():
     p3.terminate()
     p3.join(timeout=_wait())
     chk("process_terminate", p3.exitcode == -_sig.SIGTERM, "ec=%r" % p3.exitcode)
-    # kill() (SIGKILL) -> exitcode == -SIGKILL (docs: Process.kill, 3.7+).
+    # kill() -> exitcode says which signal ended it (docs: Process.kill, 3.7+).
+    # Which signal that is belongs to the platform: POSIX sends SIGKILL, while
+    # Windows has no signals to send and `kill` is `terminate`, so the exit
+    # code is the same one terminate leaves and multiprocessing maps it back
+    # to -SIGTERM. There is no SIGKILL on Windows to compare against at all.
     if hasattr(_CTX.Process, "kill"):
+        _killed_by = _sig.SIGTERM if sys.platform == "win32" else _sig.SIGKILL
         p4 = _CTX.Process(target=_sleep_forever)
         p4.start()
         time.sleep(0.1)
         p4.kill()
         p4.join(timeout=_wait())
-        chk("process_kill", p4.exitcode == -_sig.SIGKILL, "ec=%r" % p4.exitcode)
+        chk("process_kill", p4.exitcode == -_killed_by, "ec=%r" % p4.exitcode)
     else:
         chk("process_kill", True, "(skip: no Process.kill)")
 
