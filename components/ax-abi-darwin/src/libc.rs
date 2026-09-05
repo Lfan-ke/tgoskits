@@ -141,6 +141,7 @@ fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) ->
         // wants to replace the whole environment rather than read it.
         "__NSGetEnviron" => Ok(library.address("_environ")? as isize),
         "__NSGetExecutablePath" => exec_path(host, &library, a[0], a[1]),
+        "_getenv" => getenv(host, &library, a[0]),
         // The stream family. Nothing is buffered, so `fflush` has nothing to
         // do and `setvbuf` has nothing to change.
         "_fwrite" => crate::stdio::fwrite(host, a),
@@ -295,6 +296,42 @@ mod tests {
     }
 
     #[test]
+    fn getenv_answers_with_where_the_value_is_in_the_environment() {
+        let host = MockHost::default();
+        let library = Library::new(LIBRARY);
+        // An environment of two entries, and the array that names them.
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem.resize(0x1_0000, 0);
+            mem[0x300..0x30A].copy_from_slice(b"PATH=/bin\0");
+            mem[0x320..0x32B].copy_from_slice(b"PATHEXT=.x\0");
+            mem[0x200..0x208].copy_from_slice(&0x300u64.to_le_bytes());
+            mem[0x208..0x210].copy_from_slice(&0x320u64.to_le_bytes());
+            mem[0x210..0x218].copy_from_slice(&0u64.to_le_bytes());
+            let at = library.address("_environ").unwrap() as usize;
+            mem[at..at + 8].copy_from_slice(&0x200u64.to_le_bytes());
+            mem[0x100..0x105].copy_from_slice(b"PATH\0");
+            mem[0x110..0x115].copy_from_slice(b"NOPE\0");
+        }
+        let mut found = call("_getenv", &host, [0x100, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut found, &host), Dispatch::Handled);
+        assert_eq!(
+            found.result,
+            Some(0x300 + 5),
+            "it points into the entry, past the separator"
+        );
+
+        // A name that only prefixes an entry is not that entry.
+        let mut missing = call("_getenv", &host, [0x110, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut missing, &host), Dispatch::Handled);
+        assert_eq!(
+            missing.answer(),
+            (Some(0), Some(false)),
+            "not there is null"
+        );
+    }
+
+    #[test]
     fn abort_ends_the_program_rather_than_returning_to_it() {
         let host = MockHost::default();
         let mut env = call("_abort", &host, [0; 6]);
@@ -335,5 +372,42 @@ fn exec_path(host: &dyn Host, library: &Library, buf: usize, size_at: usize) -> 
         return Err(ENAMETOOLONG);
     }
     host.platform().write_user(buf, &path[..len + 1])?;
+    Ok(0)
+}
+
+/// How many entries of `environ` a walk reads before it decides the array has
+/// no end, which is what a corrupted one looks like.
+const ENVIRON_LIMIT: usize = 4096;
+
+/// `getenv(name)`: where the value is inside `environ`'s own string, or null.
+/// The answer points into the environment rather than at a copy, which is what
+/// C promises and what lets a caller compare pointers.
+fn getenv(host: &dyn Host, library: &Library, name_at: usize) -> SysResult {
+    let mut name = [0u8; 256];
+    let len = host.platform().read_user_cstr(name_at, &mut name)? as usize;
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut word = [0u8; 8];
+    host.platform().read_user(
+        library.address("_environ").ok_or(ENOSYS)? as usize,
+        &mut word,
+    )?;
+    let mut array = u64::from_le_bytes(word) as usize;
+    for _ in 0..ENVIRON_LIMIT {
+        host.platform().read_user(array, &mut word)?;
+        let entry = u64::from_le_bytes(word) as usize;
+        if entry == 0 {
+            return Ok(0);
+        }
+        let mut line = [0u8; 1024];
+        let put = host.platform().read_user_cstr(entry, &mut line)? as usize;
+        // The name has to match in full and be followed by the separator, so
+        // that asking for PATH does not answer with PATHEXT.
+        if put > len && line[..len] == name[..len] && line[len] == b'=' {
+            return Ok((entry + len + 1) as isize);
+        }
+        array += 8;
+    }
     Ok(0)
 }
