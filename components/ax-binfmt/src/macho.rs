@@ -3,12 +3,25 @@
 //! The binfmt layer's knowledge of the Mach-O format, alongside [`crate::pe`].
 //! `ax-abi-darwin` reuses this to map segments and find the entry point rather
 //! than re-decoding load commands. Offsets follow `<mach-o/loader.h>`
-//! (`mach_header_64`, `segment_command_64`, `entry_point_command`). Fat/universal
-//! archives are recognized by [`crate::detect`] but not parsed here; a thin slice
-//! is expected.
+//! (`mach_header_64`, `segment_command_64`, `entry_point_command`). A
+//! fat/universal archive is a directory of thin images, so it is opened here
+//! by picking the slice for the architecture this is built for - the official
+//! macOS CPython ships that way.
 
 /// 64-bit little-endian Mach-O magic (`MH_MAGIC_64`).
 pub const MH_MAGIC_64: u32 = 0xFEED_FACF;
+
+// A universal archive's header and entries are big-endian, whichever way the
+// slices themselves run (`<mach-o/fat.h>`).
+const FAT_MAGIC: u32 = 0xCAFE_BABE;
+const FAT_MAGIC_64: u32 = 0xCAFE_BABF;
+
+/// The `cputype` of the slice to take: the architecture this is built for.
+const CPU_TYPE: u32 = if cfg!(target_arch = "aarch64") {
+    0x0100_000C // CPU_TYPE_ARM64
+} else {
+    0x0100_0007 // CPU_TYPE_X86_64
+};
 
 // Load-command kinds we act on (`<mach-o/loader.h>`).
 const LC_SEGMENT_64: u32 = 0x19;
@@ -20,6 +33,11 @@ const HEADER_LEN: usize = 32;
 /// Parsed Mach-O header: enough to walk load commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MachoInfo {
+    /// Where the slice this header belongs to starts in the file: zero for an
+    /// image that is one slice already, and the archive's offset for a slice
+    /// out of a universal one. Every file offset a load command names is
+    /// measured from here.
+    pub base: usize,
     /// File offset where load commands begin (just past the header).
     pub commands_off: usize,
     /// Number of load commands.
@@ -33,6 +51,7 @@ impl MachoInfo {
     pub fn segments<'a>(&self, image: &'a [u8]) -> Segments<'a> {
         Segments {
             image,
+            base: self.base as u64,
             next: self.commands_off,
             end: self.commands_off + self.sizeofcmds as usize,
             remaining: self.ncmds,
@@ -43,7 +62,9 @@ impl MachoInfo {
     /// segment that contains its file offset. Returns `None` if there is no
     /// `LC_MAIN` or no segment covers it (e.g. a legacy `LC_UNIXTHREAD` image).
     pub fn entry(&self, image: &[u8]) -> Option<u64> {
-        let entryoff = self.main_entryoff(image)?;
+        // `entryoff` is measured from the slice, and a segment's `fileoff` is
+        // reported from the file, so the two are brought to the same origin.
+        let entryoff = self.base as u64 + self.main_entryoff(image)?;
         self.segments(image)
             .find(|s| (s.fileoff..s.fileoff + s.filesize).contains(&entryoff))
             .map(|s| s.vmaddr + (entryoff - s.fileoff))
@@ -112,6 +133,7 @@ impl Segment {
 /// Iterator over a Mach-O image's `LC_SEGMENT_64` commands, skipping others.
 pub struct Segments<'a> {
     image: &'a [u8],
+    base: u64,
     next: usize,
     end: usize,
     remaining: u32,
@@ -136,7 +158,7 @@ impl Iterator for Segments<'_> {
                 return Some(Segment {
                     vmaddr: read_u64(self.image, off + 24)?,
                     vmsize: read_u64(self.image, off + 32)?,
-                    fileoff: read_u64(self.image, off + 40)?,
+                    fileoff: self.base + read_u64(self.image, off + 40)?,
                     filesize: read_u64(self.image, off + 48)?,
                     initprot: read_u32(self.image, off + 60)?,
                 });
@@ -149,13 +171,39 @@ impl Iterator for Segments<'_> {
 /// Parse a thin 64-bit Mach-O header. Returns `None` for other magics
 /// (32-bit, big-endian, or a fat archive) or a truncated header.
 pub fn parse(image: &[u8]) -> Option<MachoInfo> {
-    if read_u32(image, 0)? != MH_MAGIC_64 {
+    let base = slice_at(image)?;
+    if read_u32(image, base)? != MH_MAGIC_64 {
         return None;
     }
     Some(MachoInfo {
-        commands_off: HEADER_LEN,
-        ncmds: read_u32(image, 16)?,
-        sizeofcmds: read_u32(image, 20)?,
+        base,
+        commands_off: base + HEADER_LEN,
+        ncmds: read_u32(image, base + 16)?,
+        sizeofcmds: read_u32(image, base + 20)?,
+    })
+}
+
+/// Where the image to read starts: the front of a thin file, or the slice a
+/// universal archive holds for this architecture.
+fn slice_at(image: &[u8]) -> Option<usize> {
+    let magic = read_u32(image, 0)?;
+    if magic != FAT_MAGIC.swap_bytes() && magic != FAT_MAGIC_64.swap_bytes() {
+        return Some(0);
+    }
+    // fat_arch is cputype, cpusubtype, offset, size, align; fat_arch_64 widens
+    // offset and size and adds a reserved word.
+    let wide = magic == FAT_MAGIC_64.swap_bytes();
+    let (entry, offset_at) = if wide { (32, 8) } else { (20, 8) };
+    let count = read_u32(image, 4)?.swap_bytes() as usize;
+    (0..count).find_map(|i| {
+        let at = 8 + i * entry;
+        (read_u32(image, at)?.swap_bytes() == CPU_TYPE).then_some(())?;
+        let offset = if wide {
+            read_u64(image, at + offset_at)?.swap_bytes() as usize
+        } else {
+            read_u32(image, at + offset_at)?.swap_bytes() as usize
+        };
+        (offset < image.len()).then_some(offset)
     })
 }
 
@@ -203,6 +251,62 @@ mod tests {
         b[main + 4..main + 8].copy_from_slice(&(main_len as u32).to_le_bytes());
         b[main + 8..main + 16].copy_from_slice(&entryoff.to_le_bytes());
         b
+    }
+
+    // Wrap `thin` in a universal archive with a decoy slice in front of it.
+    fn fat(thin: &[u8], wide: bool) -> (Vec<u8>, usize) {
+        let entry = if wide { 32usize } else { 20 };
+        let head = 8 + entry * 2;
+        let decoy_at = (head + 0xF) & !0xF;
+        let ours_at = decoy_at + 0x100;
+        let mut b = vec![0u8; ours_at + thin.len()];
+        let magic = if wide { FAT_MAGIC_64 } else { FAT_MAGIC };
+        b[0..4].copy_from_slice(&magic.swap_bytes().to_le_bytes());
+        b[4..8].copy_from_slice(&2u32.swap_bytes().to_le_bytes());
+        let mut put = |i: usize, cpu: u32, at: usize, len: usize| {
+            let a = 8 + i * entry;
+            b[a..a + 4].copy_from_slice(&cpu.swap_bytes().to_le_bytes());
+            if wide {
+                b[a + 8..a + 16].copy_from_slice(&(at as u64).swap_bytes().to_le_bytes());
+                b[a + 16..a + 24].copy_from_slice(&(len as u64).swap_bytes().to_le_bytes());
+            } else {
+                b[a + 8..a + 12].copy_from_slice(&(at as u32).swap_bytes().to_le_bytes());
+                b[a + 12..a + 16].copy_from_slice(&(len as u32).swap_bytes().to_le_bytes());
+            }
+        };
+        // A slice for some other architecture comes first, as the official
+        // macOS builds put x86_64 and arm64 side by side.
+        put(0, CPU_TYPE ^ 0xF, decoy_at, 0x100);
+        put(1, CPU_TYPE, ours_at, thin.len());
+        b[ours_at..ours_at + thin.len()].copy_from_slice(thin);
+        (b, ours_at)
+    }
+
+    #[test]
+    fn takes_its_own_slice_out_of_a_universal_archive() {
+        for wide in [false, true] {
+            let thin = synth(0x1_0000_0000, 0x800);
+            let (image, at) = fat(&thin, wide);
+            let macho = parse(&image).expect("a slice for this architecture");
+            assert_eq!(macho.base, at, "the slice was found");
+            assert_eq!(macho.ncmds, 2);
+            // File offsets come back measured from the file, not the slice, so
+            // whatever maps the segments needs no arithmetic of its own.
+            let segs: Vec<Segment> = macho.segments(&image).collect();
+            assert_eq!(segs[0].fileoff, at as u64);
+            assert_eq!(segs[0].vmaddr, 0x1_0000_0000);
+            // And the entry still resolves through that segment.
+            assert_eq!(macho.entry(&image), Some(0x1_0000_0800));
+        }
+    }
+
+    #[test]
+    fn an_archive_without_this_architecture_is_not_an_image() {
+        let thin = synth(0x1_0000_0000, 0x800);
+        let (mut image, _) = fat(&thin, false);
+        // Change the one slice that matched, and nothing is left to load.
+        image[8 + 20..8 + 24].copy_from_slice(&(CPU_TYPE ^ 0xF0).swap_bytes().to_le_bytes());
+        assert!(parse(&image).is_none());
     }
 
     #[test]

@@ -213,7 +213,10 @@ pub fn rebases(stream: &[u8], mut each: impl FnMut(Rebase)) {
     const DO_REBASE_ADD_ADDR_ULEB: u8 = 0x70;
     const DO_REBASE_ULEB_TIMES_SKIPPING_ULEB: u8 = 0x80;
 
-    let mut s = Stream { bytes: stream, at: 0 };
+    let mut s = Stream {
+        bytes: stream,
+        at: 0,
+    };
     let (mut segment, mut offset) = (0u8, 0u64);
     let mut kind = RebaseKind::Pointer;
     fn run(
@@ -253,7 +256,14 @@ pub fn rebases(stream: &[u8], mut each: impl FnMut(Rebase)) {
                 None => return,
             },
             ADD_ADDR_IMM_SCALED => offset = offset.wrapping_add(u64::from(immediate) * POINTER),
-            DO_REBASE_IMM_TIMES => run(&mut each, segment, kind, &mut offset, u64::from(immediate), 0),
+            DO_REBASE_IMM_TIMES => run(
+                &mut each,
+                segment,
+                kind,
+                &mut offset,
+                u64::from(immediate),
+                0,
+            ),
             DO_REBASE_ULEB_TIMES => match s.uleb() {
                 Some(times) => run(&mut each, segment, kind, &mut offset, times, 0),
                 None => return,
@@ -292,7 +302,10 @@ pub fn binds<'a>(stream: &'a [u8], mut each: impl FnMut(Bind<'a>)) {
     /// `BIND_SYMBOL_FLAGS_WEAK_IMPORT`.
     const WEAK_IMPORT: u8 = 0x1;
 
-    let mut s = Stream { bytes: stream, at: 0 };
+    let mut s = Stream {
+        bytes: stream,
+        at: 0,
+    };
     let (mut segment, mut offset) = (0u8, 0u64);
     let mut kind = RebaseKind::Pointer;
     let mut source = Source::Library(1);
@@ -347,16 +360,40 @@ pub fn binds<'a>(stream: &'a [u8], mut each: impl FnMut(Bind<'a>)) {
                 None => return,
             },
             DO_BIND => {
-                each(Bind { segment, offset, kind, source, symbol, addend, weak });
+                each(Bind {
+                    segment,
+                    offset,
+                    kind,
+                    source,
+                    symbol,
+                    addend,
+                    weak,
+                });
                 offset = offset.wrapping_add(POINTER);
             }
             DO_BIND_ADD_ADDR_ULEB => {
                 let Some(skip) = s.uleb() else { return };
-                each(Bind { segment, offset, kind, source, symbol, addend, weak });
+                each(Bind {
+                    segment,
+                    offset,
+                    kind,
+                    source,
+                    symbol,
+                    addend,
+                    weak,
+                });
                 offset = offset.wrapping_add(POINTER).wrapping_add(skip);
             }
             DO_BIND_ADD_ADDR_IMM_SCALED => {
-                each(Bind { segment, offset, kind, source, symbol, addend, weak });
+                each(Bind {
+                    segment,
+                    offset,
+                    kind,
+                    source,
+                    symbol,
+                    addend,
+                    weak,
+                });
                 offset = offset
                     .wrapping_add(POINTER)
                     .wrapping_add(u64::from(immediate) * POINTER);
@@ -366,7 +403,15 @@ pub fn binds<'a>(stream: &'a [u8], mut each: impl FnMut(Bind<'a>)) {
                     return;
                 };
                 for _ in 0..times {
-                    each(Bind { segment, offset, kind, source, symbol, addend, weak });
+                    each(Bind {
+                        segment,
+                        offset,
+                        kind,
+                        source,
+                        symbol,
+                        addend,
+                        weak,
+                    });
                     offset = offset.wrapping_add(POINTER).wrapping_add(skip);
                 }
             }
@@ -376,13 +421,16 @@ pub fn binds<'a>(stream: &'a [u8], mut each: impl FnMut(Bind<'a>)) {
 }
 
 fn read_u32(image: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(image.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        image.get(off..off + 4)?.try_into().ok()?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloc::vec::Vec;
+
+    use super::*;
 
     /// A stream that names three pointers in one segment: two in a run, then
     /// one further along, which is the shape a linker emits most.
@@ -420,7 +468,11 @@ mod tests {
         ];
         let mut found = Vec::new();
         rebases(&stream, |r| found.push(r.offset));
-        assert_eq!(found, [0, 0x10, 0x20], "eight bytes of pointer, eight skipped");
+        assert_eq!(
+            found,
+            [0, 0x10, 0x20],
+            "eight bytes of pointer, eight skipped"
+        );
     }
 
     /// A truncated operand ends the walk rather than reading past the stream.
