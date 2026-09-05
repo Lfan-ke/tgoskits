@@ -26,8 +26,13 @@ pub const STUB_LEN: usize = 48;
 const SLOT_ALIGN: u64 = 16;
 
 /// How much room past the variables this layer keeps for itself - the
-/// allocator's three words, and whatever comes after.
+/// allocator's three words, the path the program was run by, and whatever
+/// comes after.
 pub const PRIVATE_LEN: u64 = 64;
+
+/// Where the program's own path is, inside the private area. What is kept is
+/// the address of the string on the stack, not a copy of it.
+pub const PRIVATE_EXEC_PATH: u64 = 24;
 
 /// One thing the library exports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

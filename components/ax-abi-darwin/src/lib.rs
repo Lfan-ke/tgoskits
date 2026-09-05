@@ -401,6 +401,12 @@ impl ImageFormat for MachoFormat {
         if let Some(at) = system.address("_environ") {
             env.write(at, &stack.envp.to_le_bytes())?;
         }
+        // And where the program was run from, which is the one thing
+        // `_NSGetExecutablePath` has to have and cannot work out.
+        env.write(
+            system.private() + system::PRIVATE_EXEC_PATH,
+            &stack.exec_path.to_le_bytes(),
+        )?;
         let start = start::code(start::Entry { main, exit }, &inits, &stack);
         env.map_region(
             start_va,

@@ -59,6 +59,9 @@ pub struct Stack {
     pub argv: u64,
     pub envp: u64,
     pub apple: u64,
+    /// Where the path itself is inside `apple[0]`, past the name it is filed
+    /// under. `_NSGetExecutablePath` answers with a copy of it.
+    pub exec_path: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -103,12 +106,20 @@ pub fn stack(top: u64, path: &str, args: &[&str], envs: &[&str]) -> Stack {
     let apple: Vec<&str> = apple.iter().map(String::as_str).collect();
     let apple = run(&mut bytes, &mut word, &mut text_at, &apple);
 
+    // apple[0] is "executable_path=<path>", and the path starts past the
+    // name; the run's first pointer is where the whole string is.
+    let first = u64::from_le_bytes(
+        bytes[(apple - sp) as usize..(apple - sp) as usize + 8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    );
     Stack {
         sp,
         argc: args.len() as u64,
         argv,
         envp,
         apple,
+        exec_path: first + EXECUTABLE_PATH.len() as u64,
         bytes,
     }
 }

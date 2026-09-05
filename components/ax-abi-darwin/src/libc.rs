@@ -24,6 +24,10 @@ use crate::{
 /// answers with.
 const ENOSYS: i32 = 78;
 
+/// `ENAMETOOLONG`, which is what `_NSGetExecutablePath` reports for a buffer
+/// that could not hold the answer.
+const ENAMETOOLONG: i32 = 63;
+
 /// The wait status of a program that aborted: killed by signal six, with no
 /// exit code of its own.
 const SIGABRT: i32 = 6;
@@ -133,6 +137,10 @@ fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) ->
         "_calloc" => crate::heap::calloc(host, &library, a[0], a[1]),
         "_realloc" => crate::heap::realloc(host, &library, a[0], a[1]),
         "_free" => crate::heap::free(host, &library, a[0]),
+        // Where `environ` itself is, which is what a program asks for when it
+        // wants to replace the whole environment rather than read it.
+        "__NSGetEnviron" => Ok(library.address("_environ")? as isize),
+        "__NSGetExecutablePath" => exec_path(host, &library, a[0], a[1]),
         // Both of these end the program on purpose and neither returns. The
         // status is the one a shell reports for a process killed by SIGABRT,
         // which is what a real abort turns into.
@@ -225,6 +233,48 @@ mod tests {
     }
 
     #[test]
+    fn the_program_can_ask_where_environ_is_and_where_it_was_run_from() {
+        let host = MockHost::default();
+        let library = Library::new(LIBRARY);
+        // The path the loader left, and the string it points at.
+        let path = b"/bin/prog\0";
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem.resize(0x1_0000, 0);
+            mem[0x300..0x300 + path.len()].copy_from_slice(path);
+            let at = (library.private() + crate::system::PRIVATE_EXEC_PATH) as usize;
+            mem[at..at + 8].copy_from_slice(&0x300u64.to_le_bytes());
+        }
+
+        let mut environ = call("__NSGetEnviron", &host, [0; 6]);
+        assert_eq!(dispatch(&mut environ, &host), Dispatch::Handled);
+        assert_eq!(
+            environ.result.map(|at| at as u64),
+            library.address("_environ"),
+            "it answers with where the variable is, not what is in it"
+        );
+
+        // A buffer that fits gets the path and a terminator.
+        host.mem.borrow_mut()[0x400..0x404].copy_from_slice(&64u32.to_le_bytes());
+        let mut got = call("__NSGetExecutablePath", &host, [0x500, 0x400, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut got, &host), Dispatch::Handled);
+        assert_eq!(got.answer(), (Some(0), Some(false)));
+        assert_eq!(&host.mem.borrow()[0x500..0x50A], path);
+
+        // Too small a buffer is answered with how much room it needs.
+        host.mem.borrow_mut()[0x400..0x404].copy_from_slice(&4u32.to_le_bytes());
+        let mut small = call("__NSGetExecutablePath", &host, [0x600, 0x400, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut small, &host), Dispatch::Handled);
+        assert_eq!(small.failed, Some(true));
+        let asked = u32::from_le_bytes(host.mem.borrow()[0x400..0x404].try_into().unwrap());
+        assert_eq!(
+            asked,
+            path.len() as u32,
+            "the whole path and its terminator"
+        );
+    }
+
+    #[test]
     fn abort_ends_the_program_rather_than_returning_to_it() {
         let host = MockHost::default();
         let mut env = call("_abort", &host, [0; 6]);
@@ -242,4 +292,28 @@ mod tests {
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.answer(), (Some(ENOSYS as usize), Some(true)));
     }
+}
+
+/// `_NSGetExecutablePath(buf, &size)`: the path the program was run by, copied
+/// out. Too small a buffer is not a failure to answer - the call says how much
+/// room it needs, which is what a caller is expected to loop on.
+fn exec_path(host: &dyn Host, library: &Library, buf: usize, size_at: usize) -> SysResult {
+    let mut word = [0u8; 8];
+    host.platform().read_user(
+        (library.private() + crate::system::PRIVATE_EXEC_PATH) as usize,
+        &mut word,
+    )?;
+    let at = u64::from_le_bytes(word) as usize;
+    let mut path = [0u8; 1024];
+    let len = host.platform().read_user_cstr(at, &mut path)? as usize;
+    let mut room = [0u8; 4];
+    host.platform().read_user(size_at, &mut room)?;
+    let room = u32::from_le_bytes(room) as usize;
+    if room < len + 1 {
+        host.platform()
+            .write_user(size_at, &(len as u32 + 1).to_le_bytes())?;
+        return Err(ENAMETOOLONG);
+    }
+    host.platform().write_user(buf, &path[..len + 1])?;
+    Ok(0)
 }
