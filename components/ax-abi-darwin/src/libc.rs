@@ -63,8 +63,10 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
 /// so what they do is what the BSD half already does.
 const CALLS: &[(&str, usize)] = &[
     ("__exit", nr::EXIT),
+    ("_access", nr::ACCESS),
     ("_close", nr::CLOSE),
     ("_dup2", nr::DUP2),
+    ("_faccessat", nr::FACCESSAT),
     ("_fstat$INODE64", nr::FSTAT64),
     ("_fsync", nr::FSYNC),
     ("_ftruncate", nr::FTRUNCATE),
@@ -85,8 +87,10 @@ const CALLS: &[(&str, usize)] = &[
     ("_pread", nr::PREAD),
     ("_pwrite", nr::PWRITE),
     ("_read", nr::READ),
+    ("_readv", nr::READV),
     ("_stat$INODE64", nr::STAT64),
     ("_write", nr::WRITE),
+    ("_writev", nr::WRITEV),
 ];
 
 /// What one call does, or `None` for one this layer does not serve yet.

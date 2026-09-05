@@ -494,6 +494,8 @@ impl Library {
 /// what the ABI lets it.
 pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
     Some(match call.name() {
+        // A constant the C library answers from its own head.
+        "_getpagesize" => &[0xB8, 0x00, 0x10, 0x00, 0x00, 0xC3], // mov eax,4096; ret
         // `__error()` hands back where this thread's errno is, which is the
         // only way a Darwin program is allowed to reach it.
         "___error" => &[

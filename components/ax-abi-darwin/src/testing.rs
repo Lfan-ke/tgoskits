@@ -60,6 +60,11 @@ impl TrapEnv for Trap {
 pub struct MockHost {
     pub wrote: RefCell<Option<(i32, usize, usize)>>,
     pub closed: RefCell<Option<i32>>,
+    /// The runs the last scatter-gather transfer named.
+    pub gathered: RefCell<Vec<(usize, usize)>>,
+    /// The name a permission question was asked about, what it wanted, and
+    /// whether it asked about the real ids.
+    pub asked_about: RefCell<Option<(String, bool, bool, bool, bool)>>,
     pub mapped: RefCell<Option<MapRequest>>,
     pub advised: RefCell<Option<Advice>>,
     /// User memory, as one flat buffer starting at address zero.
@@ -134,14 +139,16 @@ impl Files for MockHost {
     fn seekable(&self, _fd: i32) -> SysResult {
         Ok(0)
     }
-    fn readv(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> SysResult {
+    fn readv(&self, _fd: i32, segs: &[ax_abi_port::Segment]) -> SysResult {
+        *self.gathered.borrow_mut() = segs.iter().map(|s| (s.uaddr, s.len)).collect();
         Ok(0)
     }
     fn preadv(&self, _fd: i32, _segs: &[ax_abi_port::Segment], _offset: u64) -> SysResult {
         Ok(0)
     }
-    fn writev(&self, _fd: i32, _segs: &[ax_abi_port::Segment]) -> SysResult {
-        Ok(0)
+    fn writev(&self, _fd: i32, segs: &[ax_abi_port::Segment]) -> SysResult {
+        *self.gathered.borrow_mut() = segs.iter().map(|s| (s.uaddr, s.len)).collect();
+        Ok(segs.iter().map(|s| s.len).sum::<usize>() as isize)
     }
     fn pwritev(&self, _fd: i32, _segs: &[ax_abi_port::Segment], _offset: u64) -> SysResult {
         Ok(0)
@@ -236,11 +243,18 @@ impl Paths for MockHost {
     fn permitted(
         &self,
         _at: ax_abi_port::At,
-        _path: &str,
-        _wants: ax_abi_port::Access,
+        path: &str,
+        wants: ax_abi_port::Access,
         _follow: bool,
-        _real_ids: bool,
+        real_ids: bool,
     ) -> Result<(), i32> {
+        *self.asked_about.borrow_mut() = Some((
+            alloc::string::String::from(path),
+            wants.read,
+            wants.write,
+            wants.execute,
+            real_ids,
+        ));
         Ok(())
     }
 

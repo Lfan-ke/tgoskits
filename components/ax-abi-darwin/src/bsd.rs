@@ -10,8 +10,8 @@
 //! [`TrapEnv::set_error`] alongside the value.
 
 use ax_abi_port::{
-    Advice, At, Attributes, Create, Host, MapRequest, MapSource, NodeKind, OpenHow, Prot, SeekFrom,
-    SysResult,
+    Access, Advice, At, Attributes, Create, Host, MapRequest, MapSource, NodeKind, OpenHow, Prot,
+    SeekFrom, Segment, SysResult,
 };
 use ax_dispatch::{Dispatch, TrapEnv};
 
@@ -32,6 +32,22 @@ const PAGE_SIZE: usize = 4096;
 const EINVAL: i32 = 22;
 /// `EBADF`.
 const EBADF: i32 = 9;
+/// `EFAULT`.
+const EFAULT: i32 = 14;
+
+/// The bits `access` takes, from XNU's `<unistd.h>`. `F_OK` is zero and asks
+/// only whether the name is there.
+mod amode {
+    pub const X_OK: usize = 1 << 0;
+    pub const W_OK: usize = 1 << 1;
+    pub const R_OK: usize = 1 << 2;
+}
+
+/// `AT_EACCESS`, which turns `faccessat` to the effective ids.
+const AT_EACCESS: usize = 0x0010;
+
+/// How many iovec entries one transfer carries, which is XNU's `UIO_MAXIOV`.
+const IOV_MAX: usize = 1024;
 
 /// The BSD calls this personality services, from `syscalls.master`.
 /// The `O_*` bits XNU's `<sys/fcntl.h>` defines. The low bits agree with other
@@ -77,6 +93,10 @@ pub(crate) mod nr {
     pub const FSYNC: usize = 95;
     pub const PREAD: usize = 153;
     pub const OPENAT: usize = 463;
+    pub const ACCESS: usize = 33;
+    pub const FACCESSAT: usize = 466;
+    pub const READV: usize = 120;
+    pub const WRITEV: usize = 121;
     // The 64-bit inode variants, which is what everything has used since
     // 10.6; the older numbers describe a `struct stat` with a 32-bit inode
     // that no current binary asks for.
@@ -316,6 +336,68 @@ pub(crate) fn route(host: &dyn Host, call: usize, a: &[usize; 6]) -> Option<SysR
                 Err(errno) => return Some(Err(errno)),
             }
         }
+        // access(path, mode) and faccessat(fd, path, mode, flag). The mode
+        // bits are this ABI's; whether the caller may is the host's, and the
+        // question is asked of the real ids, which is what access is for.
+        nr::ACCESS | nr::FACCESSAT => {
+            let paths = host.paths()?;
+            let at_dir = if call == nr::FACCESSAT {
+                match a[0] as i32 {
+                    AT_FDCWD => At::Cwd,
+                    fd => At::Dir(fd),
+                }
+            } else {
+                At::Cwd
+            };
+            let base = usize::from(call == nr::FACCESSAT);
+            let mut buf = [0u8; PATH_MAX];
+            let path = match read_path(host, a[base], &mut buf) {
+                Ok(path) => path,
+                Err(errno) => return Some(Err(errno)),
+            };
+            let mode = a[base + 1];
+            // XNU's <unistd.h>: F_OK is zero and asks only whether it is
+            // there, so an empty want is the whole question.
+            let wants = Access {
+                read: mode & amode::R_OK != 0,
+                write: mode & amode::W_OK != 0,
+                execute: mode & amode::X_OK != 0,
+            };
+            // AT_EACCESS turns the question to the effective ids; without it
+            // access asks about the real ones.
+            let real_ids = call == nr::ACCESS || a[3] & AT_EACCESS == 0;
+            paths
+                .permitted(at_dir, path, wants, true, real_ids)
+                .map(|()| 0)
+        }
+        // readv(fd, iov, iovcnt) and writev(fd, iov, iovcnt). An iovec is a
+        // pointer and a length, and the transfer is one, not one per entry.
+        nr::READV | nr::WRITEV => {
+            let files = host.files()?;
+            // The array is the caller's, and it can name up to `UIO_MAXIOV`
+            // runs, so it is read into the heap rather than onto the stack.
+            let count = a[2].min(IOV_MAX);
+            let mut segs = alloc::vec::Vec::with_capacity(count);
+            for index in 0..count {
+                let mut entry = [0u8; 16];
+                if host
+                    .platform()
+                    .read_user(a[1] + index * 16, &mut entry)
+                    .is_err()
+                {
+                    return Some(Err(EFAULT));
+                }
+                segs.push(Segment {
+                    uaddr: usize::from_le_bytes(entry[..8].try_into().unwrap_or([0; 8])),
+                    len: usize::from_le_bytes(entry[8..].try_into().unwrap_or([0; 8])),
+                });
+            }
+            if call == nr::READV {
+                files.readv(fd, &segs)
+            } else {
+                files.writev(fd, &segs)
+            }
+        }
         // stat(path, buf), lstat(path, buf) and fstat(fd, buf). The layout is
         // this ABI's; what is in it is the host's.
         nr::STAT64 | nr::LSTAT64 => {
@@ -509,7 +591,7 @@ mod tests {
         assert_eq!(bad.failed, Some(true));
     }
 
-    use alloc::vec;
+    use alloc::{string::String, vec};
     use core::cell::RefCell;
 
     use super::*;
@@ -518,6 +600,77 @@ mod tests {
     /// A BSD call as it arrives: the class in the top byte, the number below.
     fn unix_call(nr: usize) -> usize {
         (CLASS_UNIX << CLASS_SHIFT) | nr
+    }
+
+    #[test]
+    fn access_asks_about_the_real_ids_and_faccessat_may_ask_about_the_effective() {
+        let host = MockHost::default();
+        host.mem.borrow_mut().resize(0x200, 0);
+        let name = b"/etc/passwd\0";
+        host.mem.borrow_mut()[0x40..0x40 + name.len()].copy_from_slice(name);
+
+        // access(path, R_OK | W_OK)
+        let mut env = Trap::at(unix_call(nr::ACCESS), [0x40, 0b110, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(
+            *host.asked_about.borrow(),
+            Some((String::from("/etc/passwd"), true, true, false, true)),
+            "access asks about the real ids"
+        );
+
+        // faccessat(AT_FDCWD, path, X_OK, AT_EACCESS)
+        let mut at = Trap::at(
+            unix_call(nr::FACCESSAT),
+            [AT_FDCWD as usize, 0x40, 0b001, AT_EACCESS, 0, 0],
+        );
+        assert_eq!(dispatch(&mut at, &host), Dispatch::Handled);
+        assert_eq!(
+            *host.asked_about.borrow(),
+            Some((String::from("/etc/passwd"), false, false, true, false)),
+            "AT_EACCESS turns the question to the effective ids"
+        );
+
+        // F_OK is zero and asks only whether the name is there.
+        let mut exists = Trap::at(unix_call(nr::ACCESS), [0x40, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut exists, &host), Dispatch::Handled);
+        assert_eq!(
+            *host.asked_about.borrow(),
+            Some((String::from("/etc/passwd"), false, false, false, true))
+        );
+    }
+
+    #[test]
+    fn writev_hands_the_port_every_run_the_caller_named() {
+        let host = MockHost::default();
+        host.mem.borrow_mut().resize(0x200, 0);
+        // Two iovecs at 0x80: {0x1000, 4} and {0x2000, 6}.
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[0x80..0x88].copy_from_slice(&0x1000u64.to_le_bytes());
+            mem[0x88..0x90].copy_from_slice(&4u64.to_le_bytes());
+            mem[0x90..0x98].copy_from_slice(&0x2000u64.to_le_bytes());
+            mem[0x98..0xA0].copy_from_slice(&6u64.to_le_bytes());
+        }
+        let mut env = Trap::at(unix_call(nr::WRITEV), [1, 0x80, 2, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(*host.gathered.borrow(), [(0x1000, 4), (0x2000, 6)]);
+        assert_eq!(env.result, Some(10), "one transfer, not one per run");
+        assert_eq!(env.failed, Some(false));
+
+        // A count of zero is a transfer of nothing, not a fault.
+        let mut none = Trap::at(unix_call(nr::READV), [1, 0x80, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&mut none, &host), Dispatch::Handled);
+        assert!(host.gathered.borrow().is_empty());
+        assert_eq!(none.failed, Some(false));
+    }
+
+    #[test]
+    fn an_iovec_array_that_is_not_there_faults() {
+        let host = MockHost::default();
+        let mut env = Trap::at(unix_call(nr::WRITEV), [1, 0x9000, 1, 0, 0, 0]);
+        assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
+        assert_eq!(env.result, Some(EFAULT as usize));
+        assert_eq!(env.failed, Some(true));
     }
 
     #[test]
