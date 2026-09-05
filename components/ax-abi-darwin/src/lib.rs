@@ -16,8 +16,12 @@
 #![feature(used_with_arg)]
 
 pub mod bsd;
+pub mod system;
 
 extern crate alloc;
+
+/// The page a Darwin x86_64 image is laid out in.
+pub(crate) const PAGE: u64 = 0x1000;
 
 use ax_binfmt::{
     AbiError, AbiResult, ImageFormat, LoadEnv, LoadRequest, Loaded, Prot,
