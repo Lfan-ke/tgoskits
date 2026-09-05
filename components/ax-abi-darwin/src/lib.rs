@@ -75,6 +75,7 @@ mod tests {
         /// The program, as the host would read it back.
         image: Vec<u8>,
         maps: Vec<(u64, Prot, usize)>,
+        wrote: Vec<(u64, usize)>,
         from_file: Vec<(u64, u64)>,
         reset: bool,
     }
@@ -132,7 +133,8 @@ mod tests {
         fn stack_top(&self) -> u64 {
             0x7FFF_0000
         }
-        fn write(&mut self, _va: u64, _bytes: &[u8]) -> AbiResult<()> {
+        fn write(&mut self, va: u64, bytes: &[u8]) -> AbiResult<()> {
+            self.wrote.push((va, bytes.len()));
             Ok(())
         }
         fn reset(&mut self) -> AbiResult<()> {
@@ -200,13 +202,16 @@ mod tests {
         // stubs, the code the process starts on, and the stack.
         assert_eq!(env.maps[0].0, 0x1_0000_0000);
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
-        assert_eq!(env.maps.len(), 5);
+        assert_eq!(env.maps.len(), 4);
         // The program does not begin at its own `main` any more: it begins at
         // the code that calls it and exits with what it returns.
         assert_ne!(loaded.entry, 0x1_0000_0200);
         assert!(env.mapped(loaded.entry), "the start code is mapped");
         assert_eq!(loaded.stack % 16, 0);
-        assert!(env.mapped(loaded.stack), "the stack is mapped");
+        assert!(
+            env.wrote.iter().any(|(at, _)| *at == loaded.stack),
+            "what the process starts on was written to the stack"
+        );
     }
 
     // Write a segment_command_64 at `off`.
@@ -267,7 +272,7 @@ mod tests {
             )
             .expect("load");
         // __PAGEZERO skipped; __TEXT/__DATA/__LINKEDIT mapped with their prots.
-        assert_eq!(env.maps.len(), 3 + 4);
+        assert_eq!(env.maps.len(), 3 + 3);
         assert_eq!(
             env.maps[0],
             (0x1_0000_0000, Prot::READ | Prot::EXEC, 0x1000)
@@ -379,12 +384,9 @@ impl ImageFormat for MachoFormat {
             Prot::READ | Prot::EXEC,
             Some(&start),
         )?;
-        env.map_region(
-            stack.sp,
-            stack.bytes.len() as u64,
-            Prot::READ | Prot::WRITE,
-            Some(&stack.bytes),
-        )?;
+        // The host already mapped a stack; what goes on it is written, not
+        // mapped over.
+        env.write(stack.sp, &stack.bytes)?;
 
         Ok(Loaded {
             entry: start_va,
