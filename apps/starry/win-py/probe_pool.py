@@ -18,6 +18,11 @@ def boom():
 
 
 def main():
+    # multiprocessing says why its own threads give up, but only when asked.
+    # The result handler exits quietly on EOFError/OSError and dies silently
+    # on anything else, so its reason is the whole question here.
+    import logging
+    mp.log_to_stderr(logging.DEBUG)
     ctx = mp.get_context("spawn")
     say("start", sys.platform)
 
@@ -45,6 +50,9 @@ def main():
         say("raised %s: %s after %.1fs" % (type(e).__name__, e, time.monotonic() - t))
     stop.set()
     say("successful?", ar.successful() if ar.ready() else "not ready")
+    say("workers", [(w.pid, w.is_alive()) for w in pool._pool])
+    say("result handler alive?", pool._result_handler.is_alive())
+    say("task handler alive?", pool._task_handler.is_alive())
 
     pool.terminate()
     say("terminated")
