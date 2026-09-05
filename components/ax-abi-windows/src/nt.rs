@@ -1432,7 +1432,13 @@ mod tests {
     }
 
     impl ax_abi_port::Wait for MockHost {
-        fn wait(&self, _at: usize, _expected: u32, timeout_ns: Option<u64>) -> Result<bool, i32> {
+        fn wait(
+            &self,
+            _at: usize,
+            _expected: u32,
+            timeout_ns: Option<u64>,
+            _shared: bool,
+        ) -> Result<bool, i32> {
             *self.parked.borrow_mut() = Some(timeout_ns);
             // Nothing here wakes a parked thread, so a park with a deadline
             // is exactly that much time going by.
@@ -1441,7 +1447,7 @@ mod tests {
             }
             Ok(false)
         }
-        fn wake(&self, _at: usize, _count: u32) -> Result<u32, i32> {
+        fn wake(&self, _at: usize, _count: u32, _shared: bool) -> Result<u32, i32> {
             Ok(0)
         }
         fn swap(&self, at: usize, value: u32) -> Result<u32, i32> {
@@ -3593,6 +3599,31 @@ mod tests {
             park_for(&[event, semaphore]),
             Some(10_000_000),
             "a set holding a shared object is swept"
+        );
+    }
+
+    #[test]
+    fn a_swept_wait_still_waits_the_whole_time_it_was_given() {
+        use crate::win32;
+        let host = section_host();
+        let (teb, _) = process(&host);
+        let semaphore = created(&host, teb, "CreateSemaphoreW", [0, 0, 1, 0, 0, 0]);
+        let set = 0x7480usize;
+        {
+            let mut mem = host.mem.borrow_mut();
+            mem[set..set + 8].copy_from_slice(&(semaphore as u64).to_le_bytes());
+        }
+        let started = *host.now.borrow();
+        let mut wait = call("WaitForMultipleObjects", [1, set, 0, 500, 0, 0], teb);
+        win32::dispatch(&mut wait, &host);
+        assert_eq!(wait.result, Some(WAIT_TIMEOUT));
+        // The sweep cuts each park short on purpose; ending the wait at the
+        // first one that came back empty would report a deadline that is
+        // nowhere near - which is a wait of ten milliseconds where half a
+        // second was asked for.
+        assert!(
+            *host.now.borrow() - started >= 500 * 1_000_000,
+            "it waited the time it was given, not one sweep"
         );
     }
 

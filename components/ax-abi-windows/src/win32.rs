@@ -1839,9 +1839,9 @@ pub mod heap {
         if c.read_u64(heap)? != MAGIC {
             return None;
         }
-        super::sync::lock(c, heap + LOCK);
+        super::sync::lock(c, heap + LOCK, false);
         let block = carve(c, heap, size);
-        super::sync::unlock(c, heap + LOCK);
+        super::sync::unlock(c, heap + LOCK, false);
         block
     }
 
@@ -1927,7 +1927,7 @@ pub mod heap {
         if block < BLOCK_HEADER {
             return;
         }
-        super::sync::lock(c, heap + LOCK);
+        super::sync::lock(c, heap + LOCK, false);
         // A block that is not in use is not put on the list again: the list
         // links live in the blocks themselves, so a block on it twice is two
         // callers handed the same memory, which corrupts whatever the second
@@ -1939,7 +1939,7 @@ pub mod heap {
             c.write_u64(block, old);
             c.write_u64(heap + FREE_HEAD, header as u64);
         }
-        super::sync::unlock(c, heap + LOCK);
+        super::sync::unlock(c, heap + LOCK, false);
     }
 }
 
@@ -2157,9 +2157,10 @@ fn wait_for_multiple_objects(c: &mut Call<'_>) -> Dispatch {
         if elsewhere {
             left = left.min(SHARED_SWEEP_MS);
         }
-        if !sync::wait_for_signal(c, seq, left) && deadline.is_some() {
-            return c.finish(sync::WAIT_TIMEOUT);
-        }
+        // A park that ended without a signal has only reached the deadline if
+        // it was allowed to run to it: a sweep cuts it short on purpose, and
+        // the head of the loop is what decides the deadline either way.
+        sync::wait_for_signal(c, seq, left);
     }
 }
 
@@ -2181,7 +2182,7 @@ fn enter_critical_section(c: &mut Call<'_>) -> Dispatch {
         c.write_u32(at + CS_DEPTH, depth + 1);
         return c.finish(0);
     }
-    sync::lock(c, at + CS_LOCK);
+    sync::lock(c, at + CS_LOCK, false);
     c.write_u64(at + CS_OWNER, tid);
     c.write_u32(at + CS_DEPTH, 1);
     c.finish(0)
@@ -2214,7 +2215,7 @@ fn leave_critical_section(c: &mut Call<'_>) -> Dispatch {
     }
     c.write_u32(at + CS_DEPTH, 0);
     c.write_u64(at + CS_OWNER, 0);
-    sync::unlock(c, at + CS_LOCK);
+    sync::unlock(c, at + CS_LOCK, false);
     c.finish(0)
 }
 

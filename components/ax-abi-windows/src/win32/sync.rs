@@ -97,26 +97,27 @@ fn add(c: &Call<'_>, at: usize, value: u32) -> Option<u32> {
 /// Park until the word at `at` stops holding `expected`, or the deadline
 /// passes. A word that already changed counts as woken: the caller looks
 /// again either way.
-fn park(c: &Call<'_>, at: usize, expected: u32, timeout_ms: u32) -> bool {
+fn park(c: &Call<'_>, at: usize, expected: u32, timeout_ms: u32, shared: bool) -> bool {
     let Some(wait) = port(c) else { return false };
     let timeout = (timeout_ms != INFINITE).then(|| timeout_ms as u64 * 1_000_000);
     // An error is the word having moved between the caller's read and the
     // park, which is a reason to look again - the same as being woken.
-    wait.wait(at, expected, timeout).unwrap_or(true)
+    wait.wait(at, expected, timeout, shared).unwrap_or(true)
 }
 
-fn unpark(c: &Call<'_>, at: usize, count: u32) {
+fn unpark(c: &Call<'_>, at: usize, count: u32, shared: bool) {
     if let Some(wait) = port(c) {
-        let _ = wait.wake(at, count);
+        let _ = wait.wake(at, count, shared);
     }
 }
 
-/// Take the lock at `at`, blocking until it is free.
+/// Take the lock at `at`, blocking until it is free. `shared` says whether the
+/// word is one another process can see, which the park has to be told.
 ///
 /// A host with no blocking of its own cannot be waited on, so the lock is
 /// taken rather than waited for: without the port nothing could ever wake this
 /// thread, and spinning would only hang the one thread that might release it.
-pub(super) fn lock(c: &Call<'_>, at: usize) {
+pub(super) fn lock(c: &Call<'_>, at: usize, shared: bool) {
     if port(c).is_none() {
         c.write_u32(at, HELD);
         return;
@@ -127,14 +128,15 @@ pub(super) fn lock(c: &Call<'_>, at: usize) {
     // Every later attempt claims it as contended, so whoever releases it
     // knows to wake this thread even if it took the lock in between.
     while swap(c, at, CONTENDED) != Some(FREE) {
-        park(c, at, CONTENDED, INFINITE);
+        park(c, at, CONTENDED, INFINITE, shared);
     }
 }
 
-/// Release the lock at `at`, waking one waiter if the lock says there is one.
-pub(super) fn unlock(c: &Call<'_>, at: usize) {
+/// Release the lock at `at`, waking one waiter if the lock says there is one;
+/// `shared` as in [`lock`].
+pub(super) fn unlock(c: &Call<'_>, at: usize, shared: bool) {
     if swap(c, at, FREE) == Some(CONTENDED) {
-        unpark(c, at, 1);
+        unpark(c, at, 1, shared);
     }
 }
 
@@ -164,12 +166,12 @@ pub fn init(c: &mut Call<'_>) -> Dispatch {
 }
 
 pub fn acquire_exclusive(c: &mut Call<'_>) -> Dispatch {
-    lock(c, c.arg(0));
+    lock(c, c.arg(0), false);
     c.finish(0)
 }
 
 pub fn release_exclusive(c: &mut Call<'_>) -> Dispatch {
-    unlock(c, c.arg(0));
+    unlock(c, c.arg(0), false);
     c.finish(0)
 }
 
@@ -182,12 +184,12 @@ pub fn try_acquire_exclusive(c: &mut Call<'_>) -> Dispatch {
 /// would let them run together, which is slower but never wrong; a reader
 /// count would need its own protocol to keep writers from starving.
 pub fn acquire_shared(c: &mut Call<'_>) -> Dispatch {
-    lock(c, c.arg(0));
+    lock(c, c.arg(0), false);
     c.finish(0)
 }
 
 pub fn release_shared(c: &mut Call<'_>) -> Dispatch {
-    unlock(c, c.arg(0));
+    unlock(c, c.arg(0), false);
     c.finish(0)
 }
 
@@ -201,7 +203,7 @@ pub fn try_acquire_shared(c: &mut Call<'_>) -> Dispatch {
 pub fn wake_condition(c: &mut Call<'_>, all: bool) -> Dispatch {
     let at = c.arg(0);
     add(c, at, 1);
-    unpark(c, at, if all { u32::MAX } else { 1 });
+    unpark(c, at, if all { u32::MAX } else { 1 }, false);
     c.finish(0)
 }
 
@@ -215,9 +217,9 @@ pub fn sleep_condition(c: &mut Call<'_>, lock_at: usize, timeout_ms: u32) -> boo
     let Some(seen) = c.read_u32(cond) else {
         return false;
     };
-    unlock(c, lock_at);
-    let woken = park(c, cond, seen, timeout_ms);
-    lock(c, lock_at);
+    unlock(c, lock_at, false);
+    let woken = park(c, cond, seen, timeout_ms, false);
+    lock(c, lock_at, false);
     woken
 }
 
@@ -273,6 +275,7 @@ pub(super) fn signal(c: &Call<'_>, handle: usize) {
         } else {
             1
         },
+        false,
     );
     announce(c);
 }
@@ -288,13 +291,13 @@ fn announce(c: &Call<'_>) {
     let Some(peb) = c.peb() else { return };
     let at = peb + super::PEB_SIGNAL_SEQ;
     add(c, at, 1);
-    unpark(c, at, u32::MAX);
+    unpark(c, at, u32::MAX, false);
 }
 
 /// Park until the signal counter leaves `seen`, or the deadline passes.
 pub(super) fn wait_for_signal(c: &Call<'_>, seen: u32, timeout_ms: u32) -> bool {
     let Some(peb) = c.peb() else { return false };
-    park(c, peb + super::PEB_SIGNAL_SEQ, seen, timeout_ms)
+    park(c, peb + super::PEB_SIGNAL_SEQ, seen, timeout_ms, false)
 }
 
 /// The process heap a new object is carved from.
@@ -362,7 +365,7 @@ pub(super) fn close(c: &mut Call<'_>, handle: usize) -> bool {
     };
     // Anyone still parked on it is woken rather than left waiting on memory
     // that is about to be handed out again.
-    unpark(c, block + STATE, u32::MAX);
+    unpark(c, block + STATE, u32::MAX, false);
     announce(c);
     c.write_u64(block, 0);
     if let Some(heap) = heap_of(c) {
@@ -378,7 +381,7 @@ pub(super) fn close_shared(c: &mut Call<'_>, fd: i32) {
         if block_at(c, block).is_some() {
             // Anyone still parked is woken rather than left waiting on a page
             // that is about to go.
-            unpark(c, block + STATE, u32::MAX);
+            unpark(c, block + STATE, u32::MAX, true);
             announce(c);
         }
         super::section::detach(c, fd);
@@ -418,6 +421,7 @@ pub fn set_event(c: &mut Call<'_>) -> Dispatch {
         } else {
             1
         },
+        false,
     );
     announce(c);
     c.finish(TRUE)
@@ -450,7 +454,7 @@ pub(super) fn end_thread(c: &Call<'_>, handle: usize, code: u32) {
     };
     c.write_u32(block + EXIT_CODE, code);
     swap(c, block + STATE, 1);
-    unpark(c, block + STATE, u32::MAX);
+    unpark(c, block + STATE, u32::MAX, false);
     announce(c);
 }
 
@@ -565,22 +569,22 @@ pub fn release_semaphore(c: &mut Call<'_>) -> Dispatch {
         }
         return c.finish(TRUE);
     };
-    lock(c, block + GUARD);
+    lock(c, block + GUARD, true);
     let previous = c.read_u32(block + STATE).unwrap_or(0);
     let maximum = c.read_u32(block + MAXIMUM).unwrap_or(u32::MAX);
     // Past the ceiling nothing is added and the count is left where it was:
     // a lock released twice has to be told so, not quietly counted up.
     if count == 0 || previous.saturating_add(count) > maximum {
-        unlock(c, block + GUARD);
+        unlock(c, block + GUARD, true);
         return c.fail(ERROR_TOO_MANY_POSTS, FALSE);
     }
     c.write_u32(block + STATE, previous + count);
-    unlock(c, block + GUARD);
+    unlock(c, block + GUARD, true);
     if previous_out != 0 {
         c.write_u32(previous_out, previous);
     }
     // One thread can take each count that was added.
-    unpark(c, block + STATE, count.max(1));
+    unpark(c, block + STATE, count.max(1), true);
     announce(c);
     c.finish(TRUE)
 }
@@ -614,7 +618,7 @@ pub fn release_mutex(c: &mut Call<'_>) -> Dispatch {
     }
     c.write_u32(block + DEPTH, 0);
     c.write_u32(block + OWNER, 0);
-    unlock(c, block + STATE);
+    unlock(c, block + STATE, false);
     announce(c);
     c.finish(TRUE)
 }
@@ -663,12 +667,12 @@ pub(super) fn wait_object(c: &mut Call<'_>, handle: usize, timeout_ms: u32) -> O
             // An auto reset event and a semaphore each hand out one.
             Kind::AutoEvent => swap(c, state, 0) == Some(1),
             Kind::Semaphore => {
-                lock(c, block + GUARD);
+                lock(c, block + GUARD, true);
                 let count = c.read_u32(state).unwrap_or(0);
                 if count > 0 {
                     c.write_u32(state, count - 1);
                 }
-                unlock(c, block + GUARD);
+                unlock(c, block + GUARD, true);
                 count > 0
             }
             Kind::Mutex => try_lock_word(c, state),
@@ -704,6 +708,6 @@ pub(super) fn wait_object(c: &mut Call<'_>, handle: usize, timeout_ms: u32) -> O
             Some(due) => left.min(due),
             None => left,
         };
-        park(c, state, 0, left);
+        park(c, state, 0, left, kind == Kind::Semaphore);
     }
 }

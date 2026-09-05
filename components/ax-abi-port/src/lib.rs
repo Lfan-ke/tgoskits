@@ -859,10 +859,21 @@ pub trait Wait: Sync {
     /// means woken, `Ok(false)` that the deadline passed first; a word that
     /// already differs is `Err(EAGAIN)`, which is the caller's signal to look
     /// again rather than an error.
-    fn wait(&self, addr: usize, expected: u32, timeout_ns: Option<u64>) -> Result<bool, i32>;
+    ///
+    /// `shared` says the word is one another process can also see - a mapping
+    /// two of them hold - which is the difference between a futex keyed by
+    /// this address space and one keyed by what backs the memory. A word only
+    /// this process can reach is cheaper to wait on and must say so.
+    fn wait(
+        &self,
+        addr: usize,
+        expected: u32,
+        timeout_ns: Option<u64>,
+        shared: bool,
+    ) -> Result<bool, i32>;
 
     /// Wake at most `count` threads blocked on `addr`, and say how many were.
-    fn wake(&self, addr: usize, count: u32) -> Result<u32, i32>;
+    fn wake(&self, addr: usize, count: u32, shared: bool) -> Result<u32, i32>;
 
     /// Atomically put `value` in the `u32` at `addr` and return what it held.
     fn swap(&self, addr: usize, value: u32) -> Result<u32, i32>;

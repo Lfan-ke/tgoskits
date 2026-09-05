@@ -843,18 +843,24 @@ fn set_to_bits(set: SignalSet) -> u64 {
 /// `timespec` in user memory, so a personality can wait on a deadline it
 /// computed itself.
 ///
-/// The key is resolved the way an unflagged Linux futex resolves it: a word in
-/// a shared mapping is keyed by what backs it, so two processes parking on the
-/// same page find each other. A personality that builds a cross-process object
-/// out of shared memory - a Windows semaphore a child inherits, say - needs
-/// that; a private word is unaffected.
+/// A caller that says its word is shared gets the key an unflagged Linux futex
+/// gets: one taken from what backs the memory, so two processes parking on the
+/// same page find each other. That is what a personality building a
+/// cross-process object out of shared memory - a Windows semaphore a child
+/// inherits, say - needs; everything else stays keyed by this address space.
 impl Wait for KernelHost {
-    fn wait(&self, addr: usize, expected: u32, timeout_ns: Option<u64>) -> Result<bool, i32> {
+    fn wait(
+        &self,
+        addr: usize,
+        expected: u32,
+        timeout_ns: Option<u64>,
+        shared: bool,
+    ) -> Result<bool, i32> {
         let word = addr as *const u32;
         if !addr.is_multiple_of(align_of::<u32>()) {
             return Err(errno(StarryError::InvalidInput));
         }
-        let key = FutexKey::new_current(addr, FutexKeyMode::Auto);
+        let key = FutexKey::new_current(addr, mode(shared));
         let table = futex_table_for(&key);
         // The word is read once before parking so a caller that is already
         // out of date is told to look again instead of sleeping on a value
@@ -910,16 +916,27 @@ impl Wait for KernelHost {
         atomic(addr, UserAtomicU32Op::Add, value)
     }
 
-    fn wake(&self, addr: usize, count: u32) -> Result<u32, i32> {
+    fn wake(&self, addr: usize, count: u32, shared: bool) -> Result<u32, i32> {
         if !addr.is_multiple_of(align_of::<u32>()) {
             return Err(errno(StarryError::InvalidInput));
         }
-        let key = FutexKey::new_current(addr, FutexKeyMode::Auto);
+        let key = FutexKey::new_current(addr, mode(shared));
         let woken = futex_table_for(&key)
             .get(&key)
             .map_or(0, |futex| futex.wq.wake(count as usize, u32::MAX));
         ax_task::yield_now();
         Ok(woken as u32)
+    }
+}
+
+/// How a futex key is resolved: a word another process can see is keyed by
+/// what backs it, the way a Linux futex without `FUTEX_PRIVATE_FLAG` is, and
+/// every other word is keyed by this address space alone.
+fn mode(shared: bool) -> FutexKeyMode {
+    if shared {
+        FutexKeyMode::Auto
+    } else {
+        FutexKeyMode::Private
     }
 }
 

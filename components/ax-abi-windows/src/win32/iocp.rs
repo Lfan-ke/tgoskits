@@ -212,16 +212,16 @@ fn port_of(c: &Call<'_>, fd: i32) -> Option<(usize, usize)> {
 
 /// Put an operation on its port's list.
 fn attach(c: &mut Call<'_>, port: usize, op: usize) {
-    sync::lock(c, port + PORT_LOCK);
+    sync::lock(c, port + PORT_LOCK, false);
     let head = c.read_u64(port + PORT_OPS).unwrap_or(0);
     c.write_u64(op + OP_NEXT, head);
     c.write_u64(port + PORT_OPS, op as u64);
-    sync::unlock(c, port + PORT_LOCK);
+    sync::unlock(c, port + PORT_LOCK, false);
 }
 
 /// Take an operation off its port's list.
 fn detach(c: &mut Call<'_>, port: usize, op: usize) {
-    sync::lock(c, port + PORT_LOCK);
+    sync::lock(c, port + PORT_LOCK, false);
     let mut at = c.read_u64(port + PORT_OPS).unwrap_or(0) as usize;
     let next = c.read_u64(op + OP_NEXT).unwrap_or(0);
     if at == op {
@@ -236,7 +236,7 @@ fn detach(c: &mut Call<'_>, port: usize, op: usize) {
             at = following;
         }
     }
-    sync::unlock(c, port + PORT_LOCK);
+    sync::unlock(c, port + PORT_LOCK, false);
 }
 
 /// Every operation on a port, oldest last, as the list holds them.
