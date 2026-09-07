@@ -77,6 +77,16 @@ done
 # ---- Firefox profile + prefs (software WebRender, no sandbox, no dbus, no first-run) ----
 PROFILE=/root/ffprofile
 rm -rf "$PROFILE"; mkdir -p "$PROFILE"
+# A fresh profile makes every run a first run, and Firefox's first-run flow
+# swallows both the command-line URL and the homepage: the window comes up on
+# New Tab with an empty address bar, having navigated nowhere. That failure is
+# invisible from outside - it looks exactly like a page that loaded and painted
+# nothing, and several runs were read the wrong way because of it. Seeding the
+# two files Firefox uses to recognise an existing profile makes the run a
+# subsequent one, so the address it was given is the address it opens.
+printf '{"created":1700000000000,"firstUse":1700000000000}' > "$PROFILE/times.json"
+: > "$PROFILE/prefs.js"
+
 cat > "$PROFILE/user.js" <<'EOF'
 user_pref("gfx.webrender.software", true);
 user_pref("gfx.webrender.all", true);
