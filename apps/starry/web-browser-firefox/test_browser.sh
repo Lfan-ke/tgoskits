@@ -141,8 +141,12 @@ relay_up=0
 # an HTTP proxy answers. A plain GET of / draws a 400 from any correct proxy,
 # and BusyBox nc has no -z, so the previous probe reported every working
 # relay as absent and sent every page down the slow direct path.
+# Answering at all is not enough either: a plain file server replies 404 to
+# an absolute-URI request, and pointing Firefox at something that cannot
+# forward leaves every page blank - the same symptom as a failed render. A
+# forward proxy relays the origin's own status, so only 1xx-3xx counts.
 if printf 'HEAD http://www.4399.com/ HTTP/1.0\r\nHost: www.4399.com\r\n\r\n' \
-   | nc -w 8 10.0.2.2 8899 2>/dev/null | head -n 1 | grep -q '^HTTP/1'; then
+   | nc -w 8 10.0.2.2 8899 2>/dev/null | head -n 1 | grep -qE '^HTTP/1\.[01] [123]'; then
     relay_up=1
 fi
 
@@ -172,7 +176,7 @@ user_pref("network.proxy.http_port", 8899);
 user_pref("network.proxy.ssl", "10.0.2.2");
 user_pref("network.proxy.ssl_port", 8899);
 user_pref("network.proxy.share_proxy_settings", true);
-user_pref("network.proxy.no_proxies_on", "");
+user_pref("network.proxy.no_proxies_on", "10.0.2.2");
 PX
 else
     echo "WEB_BROWSER_DIAG host relay unreachable, using the guest's own network"
