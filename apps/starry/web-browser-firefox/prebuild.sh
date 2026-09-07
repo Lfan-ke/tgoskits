@@ -18,6 +18,17 @@ overlay_dir="${STARRY_OVERLAY_DIR:-}"
 # dl-cdn over the local proxy is unreliable for a 600 MB+ pull.
 apk_cache="${STARRY_WORKSPACE:-$(cd "$app_dir/../../.." && pwd)}/target/qalc-apk-cache-${arch}"
 
+# Debian ships the qemu-user binaries from qemu-user-static as qemu-<arch>-static;
+# Ubuntu 26.04 ships the same statically linked binaries from qemu-user under the
+# plain qemu-<arch> name. Either one runs the target apk, so accept both rather
+# than demanding a package whose name is virtual on one of them.
+qemu_user_bin() {
+    local a="$1"
+    if command -v "qemu-$a-static" >/dev/null 2>&1; then echo "qemu-$a-static"
+    elif command -v "qemu-$a" >/dev/null 2>&1; then echo "qemu-$a"
+    fi
+}
+
 require_env() {
     local name="$1"
     local value="$2"
@@ -33,12 +44,9 @@ ensure_host_packages() {
     command -v install >/dev/null 2>&1 || missing+=(coreutils)
     command -v readelf >/dev/null 2>&1 || missing+=(binutils)
 
-    case "$arch" in
-        aarch64)     command -v qemu-aarch64-static >/dev/null 2>&1 || missing+=(qemu-user-static) ;;
-        riscv64)     command -v qemu-riscv64-static >/dev/null 2>&1 || missing+=(qemu-user-static) ;;
-        x86_64)      command -v qemu-x86_64-static >/dev/null 2>&1 || missing+=(qemu-user-static) ;;
-        loongarch64) command -v qemu-loongarch64-static >/dev/null 2>&1 || missing+=(qemu-user-static) ;;
-    esac
+    if [[ -z "$(qemu_user_bin "$arch")" ]]; then
+        missing+=(qemu-user-static)
+    fi
 
     if [[ ${#missing[@]} -eq 0 ]]; then
         return
@@ -96,15 +104,13 @@ resize_rootfs() {
 install_packages() {
     local qemu_runner
     case "$arch" in
-        aarch64)     qemu_runner="qemu-aarch64-static" ;;
-        riscv64)     qemu_runner="qemu-riscv64-static" ;;
-        x86_64)      qemu_runner="qemu-x86_64-static" ;;
-        loongarch64) qemu_runner="qemu-loongarch64-static" ;;
+        aarch64|riscv64|x86_64|loongarch64) ;;
         *)           echo "error: unsupported arch: $arch" >&2; exit 1 ;;
     esac
+    qemu_runner="$(qemu_user_bin "$arch")"
 
-    if ! command -v "$qemu_runner" >/dev/null 2>&1; then
-        echo "error: $qemu_runner not found" >&2
+    if [[ -z "$qemu_runner" ]]; then
+        echo "error: no qemu-user binary for $arch: neither qemu-$arch-static nor qemu-$arch" >&2
         exit 1
     fi
 
