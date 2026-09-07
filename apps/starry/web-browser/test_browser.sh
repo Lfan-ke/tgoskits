@@ -172,10 +172,12 @@ busybox httpd -p 0.0.0.0:8080 -h /usr/share/web-browser >/tmp/httpd.log 2>&1 \
 # actual web content either way.
 local_page="http://$guest_ip:8080/test.html"
 page="$local_page"
+used_fallback=0
 if wget -q -T 4 -O /dev/null "$local_page" 2>/dev/null; then
     echo "WEB_BROWSER_STAGE local http server reachable, serving test.html"
 else
-    page="http://example.com/"
+    used_fallback=1
+    page="${BROWSER_URL:-http://example.com/}"
     echo "WEB_BROWSER_STAGE local server not self-reachable, loading real site $page"
 fi
 echo "WEB_BROWSER_STAGE launching netsurf on $page ..."
@@ -252,6 +254,17 @@ for i in 1 2 3 4 5; do
 done
 kill -9 "$weston_pid" 2>/dev/null || true
 weston_pid=""
+
+# Reaching the end is not a result. This printed a pass whether NetSurf had
+# rendered the page, died on its first frame, or had quietly been pointed at a
+# live website because the bundled one could not be reached - three outcomes
+# this test exists to tell apart.
+if [ "$ns_exit" != 0 ]; then
+    fail "netsurf exited during the hold with status $ns_exit"
+fi
+if [ "$used_fallback" = 1 ] && [ -z "${BROWSER_URL:-}" ]; then
+    fail "the bundled page was unreachable so the run fell back to $page; a merged test must not depend on a live site - set BROWSER_URL to ask for one on purpose"
+fi
 
 test_done=1
 printf "%sWEB_BROWSER_TEST_PASSED%s\n" "$green" "$reset"
