@@ -1,0 +1,37 @@
+args = [
+    "-machine",
+    "virt",
+    "-cpu",
+    "la464",
+    "-serial",
+    "stdio",
+    "-display",
+    "none",
+    "-vga",
+    "none",
+    "-m",
+    "3G",
+    "-smp",
+    "4",
+    "-device",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-alpine.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0,hostfwd=tcp:127.0.0.1:5904-:5900",
+    "-accel", "tcg",
+]
+uefi = true
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = "/usr/bin/test-remote.sh"
+success_regex = ["(?m)^REMOTE_DESKTOP_TEST_PASSED\\s*$"]
+fail_regex = [
+    '(?i)\bpanic(?:ked)?\b',
+    '(?i)segfault',
+    '(?i)page fault',
+    "(?m)^REMOTE_DESKTOP_TEST_FAILED(?:[: ].*)?$",
+]
+timeout = 1200
