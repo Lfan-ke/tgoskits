@@ -1040,6 +1040,16 @@ impl VmaMap {
         range: VirtAddrRange,
         mut visit: impl FnMut(&Arc<VmaSnapshot>) -> bool,
     ) {
+        self.for_each_overlapping_entry(range, |entry| visit(&entry.snapshot));
+    }
+
+    /// [`Self::for_each_overlapping`] over the entries, for the callers that
+    /// need the mapping operation and not just the snapshot.
+    pub(super) fn for_each_overlapping_entry(
+        &self,
+        range: VirtAddrRange,
+        mut visit: impl FnMut(&Arc<VmaEntry>) -> bool,
+    ) {
         let mut visited = 0;
         Self::visit_overlapping(&self.root, range, &mut visited, &mut visit);
     }
@@ -1052,7 +1062,7 @@ impl VmaMap {
         node: &Option<Arc<VmaNode>>,
         range: VirtAddrRange,
         visited: &mut usize,
-        visit: &mut impl FnMut(&Arc<VmaSnapshot>) -> bool,
+        visit: &mut impl FnMut(&Arc<VmaEntry>) -> bool,
     ) -> bool {
         let Some(current) = node else {
             return true;
@@ -1064,7 +1074,7 @@ impl VmaMap {
         {
             return false;
         }
-        if vma.overlaps(range) && !visit(&current.entry.snapshot) {
+        if vma.overlaps(range) && !visit(&current.entry) {
             return false;
         }
         if range.end > vma.end
@@ -1787,9 +1797,9 @@ mod tests {
         let mut visited = 0;
         let mut found = 0;
         let mut first = None;
-        VmaMap::visit_overlapping(&map.root, range, &mut visited, &mut |vma| {
+        VmaMap::visit_overlapping(&map.root, range, &mut visited, &mut |entry| {
             found += 1;
-            first.get_or_insert(vma.range.start);
+            first.get_or_insert(entry.snapshot.range.start);
             true
         });
 
