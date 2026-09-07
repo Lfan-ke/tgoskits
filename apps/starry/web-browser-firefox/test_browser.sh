@@ -285,6 +285,7 @@ stalled=0
 last_entries=0
 flat=0
 STALL_LIMIT=20
+DEAD_LIMIT=16
 cache_count() { find "$PROFILE" -path '*cache2/entries/*' -type f 2>/dev/null | wc -l; }
 while [ "$i" -lt 80 ]; do
     sleep 15; i=$((i+1))
@@ -299,6 +300,15 @@ while [ "$i" -lt 80 ]; do
     echo "WEB_BROWSER_DIAG alive t=$((i*15))s fetched=$n flat=$flat"
     if [ "$n" -gt 0 ] && [ "$flat" -ge "$STALL_LIMIT" ]; then
         echo "WEB_BROWSER_DIAG load stopped advancing at $n resources"
+        stalled=1
+        break
+    fi
+    # A run that never fetched anything cannot trip the check above, because
+    # that one waits for a count to stop moving and this count never started.
+    # Such a run used to sit out the whole hold before the final check caught
+    # it, which is twenty minutes spent learning nothing.
+    if [ "$n" -eq 0 ] && [ "$i" -ge "$DEAD_LIMIT" ]; then
+        echo "WEB_BROWSER_DIAG nothing fetched after $((i*15))s; the page never started loading"
         stalled=1
         break
     fi
