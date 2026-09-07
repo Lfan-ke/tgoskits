@@ -147,7 +147,11 @@ mkdir -p /tmp/fontconfig /var/cache/fontconfig 2>/dev/null || true
 fc-cache -f >/dev/null 2>&1 || true
 gdk-pixbuf-query-loaders --update-cache >/dev/null 2>&1 || true
 glib-compile-schemas /usr/share/glib-2.0/schemas >/dev/null 2>&1 || true
-update-mime-database /usr/share/mime >/dev/null 2>&1 || true
+# update-mime-database walks shared-mime-info's multi-megabyte XML; on an
+# emulated target over a slow disk that alone can block for 20+ minutes. NetSurf
+# picks content handlers from the HTTP Content-Type, not the freedesktop mime
+# cache, so build it in the background instead of gating the browser launch.
+update-mime-database /usr/share/mime >/dev/null 2>&1 &
 
 # ---- Serve the page over http, launch NetSurf, then capture ----
 # NetSurf's file:// navigation left the window on about:blank; its http fetcher

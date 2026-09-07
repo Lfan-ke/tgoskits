@@ -16,7 +16,7 @@ overlay_dir="${STARRY_OVERLAY_DIR:-}"
 # NetSurf + GTK3 packages are newly downloaded. Alpine's aliyun mirror is the
 # one empirically proven to work here (qt-calc installs 200+ pkgs through it);
 # dl-cdn over the local proxy is unreliable for a 600 MB+ pull.
-apk_cache="${STARRY_WORKSPACE:-$(cd "$app_dir/../../.." && pwd)}/target/qalc-apk-cache"
+apk_cache="${STARRY_WORKSPACE:-$(cd "$app_dir/../../.." && pwd)}/target/qalc-apk-cache-${arch}"
 
 require_env() {
     local name="$1"
@@ -69,7 +69,9 @@ resize_rootfs() {
     local extra=$((target_mib - current_mib))
     echo "[browser prebuild] enlarging rootfs from ${current_mib}M to ${target_mib}M (+${extra}M)..."
     dd if=/dev/zero bs=1M count="$extra" >> "$img" 2>/dev/null
-    e2fsck -f "$img" >/dev/null 2>&1 || true
+    # -y so a freshly extracted image that needs repair is fixed non-interactively;
+    # without it resize2fs refuses with "run e2fsck -f first" and prebuild aborts.
+    e2fsck -fy "$img" >/dev/null 2>&1 || true
     resize2fs "$img" >/dev/null
 }
 
