@@ -95,7 +95,12 @@ user_pref("app.update.enabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.startup.homepage_override.mstone", "ignore");
 user_pref("browser.aboutwelcome.enabled", false);
-user_pref("browser.startup.firstrunSkipsHomepage", true);
+// The load is driven through browser.startup.homepage below, and every run
+// gets a fresh profile, so every run is a first run. Skipping the homepage on
+// a first run therefore skipped the page under test: the window stayed on New
+// Tab with an empty address bar, which is indistinguishable from a page that
+// loaded and painted nothing.
+user_pref("browser.startup.firstrunSkipsHomepage", false);
 // open 4399 as the startup homepage: a fresh profile's first-run swallows the CLI
 // URL and lands on New Tab, so drive navigation through the homepage pref instead.
 user_pref("browser.startup.homepage", "https://www.4399.com/");
@@ -283,12 +288,25 @@ echo "WEB_BROWSER_DIAG frame is on the VNC display; capture it there"
 # A fetch over http leaves entries in Gecko's own cache, so a load that got
 # anywhere leaves a countable artifact inside the guest. A file:// page caches
 # nothing, so it is held only to the weaker check that Firefox survived.
+# Navigation is not a given. A run that never left New Tab reaches this point
+# looking exactly like a page that loaded and painted nothing, so check that the
+# browser actually went where it was sent: Firefox records visited addresses in
+# the profile, and the target appears there only if it navigated.
+navigated=0
+if grep -qs -- "$PAGE" "$PROFILE"/places.sqlite "$PROFILE"/sessionstore-backups/* 2>/dev/null; then
+    navigated=1
+fi
+echo "WEB_BROWSER_DIAG navigated=$navigated page=$PAGE"
+
 cache_entries=$(find "$PROFILE" -path '*cache2/entries/*' -type f 2>/dev/null | wc -l)
 echo "WEB_BROWSER_DIAG cache_entries=$cache_entries died=$ff_died"
 kill "$ff_pid" 2>/dev/null || true
 
 if [ "$ff_died" = 1 ]; then
     fail "firefox exited before the hold finished"
+fi
+if [ "$navigated" = 0 ]; then
+    fail "firefox never navigated to $PAGE - it stayed on the new-tab page"
 fi
 if [ "$stalled" = 1 ]; then
     fail "$PAGE stopped advancing at $cache_entries resources: the load never finished"
