@@ -6,6 +6,10 @@
 set -euo pipefail
 
 overlay_dir="${STARRY_OVERLAY_DIR:-}"
+# Everything staged from the checkout is found through this script's own
+# location. Naming a working copy instead ties the app to one machine.
+app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+apps_dir="$(cd "$app_dir/.." && pwd)"
 dll_dir="${STARRY_WIN_DLL_DIR:-$HOME/rcore/wt-personality/tmp/win}"
 
 if [[ -z "$overlay_dir" ]]; then
@@ -69,15 +73,22 @@ done
 
 # Stage the extended python-lang suite (shared with the Linux personality)
 # so the Windows python.exe runs the same t01..t22 modules.
-suite_src="$HOME/rcore/wt-personality/apps/starry/python-lang/python"
+suite_src="${STARRY_PY_SUITE:-$apps_dir/python-lang/python}"
 install -d "$overlay_dir/suite"
-for f in "$suite_src"/*.py; do
+shopt -s nullglob
+suite_files=("$suite_src"/*.py)
+shopt -u nullglob
+if [[ ${#suite_files[@]} -eq 0 ]]; then
+    echo "ERROR: no suite modules under $suite_src; set STARRY_PY_SUITE" >&2
+    exit 1
+fi
+for f in "${suite_files[@]}"; do
     install -m 0644 "$f" "$overlay_dir/suite/$(basename "$f")"
 done
 
 # A small import smoke: exercises the C-runtime heap and directory
 # enumeration by importing real stdlib modules, then prints IMPORT-OK.
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe.py" "$overlay_dir/python/probe.py"
+install -m 0644 "$app_dir/probe.py" "$overlay_dir/python/probe.py"
 
 # The C extension modules shipped beside the interpreter (unicodedata,
 # _socket, _decimal, ...): LoadLibraryExW brings each in on first import.
@@ -89,19 +100,19 @@ done
 # In-process runner for the extended suite: the suite's own run_all.py spawns
 # a child interpreter per module, which needs CreateProcessW; this runs them
 # in one interpreter instead.
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/suite_inproc.py" "$overlay_dir/python/suite_inproc.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_thread.py" "$overlay_dir/python/probe_thread.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/child_capture.py" "$overlay_dir/python/child_capture.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_gaps.py" "$overlay_dir/python/probe_gaps.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_wait.py" "$overlay_dir/python/probe_wait.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_failing.py" "$overlay_dir/python/probe_failing.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_cli.py" "$overlay_dir/python/probe_cli.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_crt.py" "$overlay_dir/python/probe_crt.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_shm.py" "$overlay_dir/python/probe_shm.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_mp.py" "$overlay_dir/python/probe_mp.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_sem.py" "$overlay_dir/python/probe_sem.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_exit.py" "$overlay_dir/python/probe_exit.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_queue.py" "$overlay_dir/python/probe_queue.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_t19.py" "$overlay_dir/python/probe_t19.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_pool.py" "$overlay_dir/python/probe_pool.py"
-install -m 0644 "$HOME/rcore/wt-personality/apps/starry/win-py/probe_msgsize.py" "$overlay_dir/python/probe_msgsize.py"
+install -m 0644 "$app_dir/suite_inproc.py" "$overlay_dir/python/suite_inproc.py"
+install -m 0644 "$app_dir/probe_thread.py" "$overlay_dir/python/probe_thread.py"
+install -m 0644 "$app_dir/child_capture.py" "$overlay_dir/python/child_capture.py"
+install -m 0644 "$app_dir/probe_gaps.py" "$overlay_dir/python/probe_gaps.py"
+install -m 0644 "$app_dir/probe_wait.py" "$overlay_dir/python/probe_wait.py"
+install -m 0644 "$app_dir/probe_failing.py" "$overlay_dir/python/probe_failing.py"
+install -m 0644 "$app_dir/probe_cli.py" "$overlay_dir/python/probe_cli.py"
+install -m 0644 "$app_dir/probe_crt.py" "$overlay_dir/python/probe_crt.py"
+install -m 0644 "$app_dir/probe_shm.py" "$overlay_dir/python/probe_shm.py"
+install -m 0644 "$app_dir/probe_mp.py" "$overlay_dir/python/probe_mp.py"
+install -m 0644 "$app_dir/probe_sem.py" "$overlay_dir/python/probe_sem.py"
+install -m 0644 "$app_dir/probe_exit.py" "$overlay_dir/python/probe_exit.py"
+install -m 0644 "$app_dir/probe_queue.py" "$overlay_dir/python/probe_queue.py"
+install -m 0644 "$app_dir/probe_t19.py" "$overlay_dir/python/probe_t19.py"
+install -m 0644 "$app_dir/probe_pool.py" "$overlay_dir/python/probe_pool.py"
+install -m 0644 "$app_dir/probe_msgsize.py" "$overlay_dir/python/probe_msgsize.py"
