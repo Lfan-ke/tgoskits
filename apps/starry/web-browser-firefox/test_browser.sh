@@ -238,10 +238,36 @@ PAGE="${BROWSER_URL:-http://example.com/}"
 cat >> "$PROFILE/user.js" <<EOF
 user_pref("browser.startup.homepage", "$PAGE");
 EOF
-echo "WEB_BROWSER_STAGE launching firefox on $PAGE ..."
-"$FF" --no-remote --new-instance --profile "$PROFILE" "$PAGE" \
-    >/tmp/ff_stdout.log 2>/tmp/ff_err.log &
-ff_pid=$!
+# Launching is not reliable: the same command has come up navigated, come up on
+# the new-tab page having gone nowhere, and not come up at all. Booting costs
+# minutes and a launch costs seconds, so retry inside the one boot rather than
+# spending another boot to find out. A launch counts once the address given
+# actually appears in the profile, which is the same evidence the gate uses.
+navigated_ok=0
+attempt=0
+while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt+1))
+    echo "WEB_BROWSER_STAGE launching firefox on $PAGE (attempt $attempt) ..."
+    "$FF" --no-remote --new-instance --profile "$PROFILE" "$PAGE"         >/tmp/ff_stdout.log 2>/tmp/ff_err.log &
+    ff_pid=$!
+    k=0
+    while [ "$k" -lt 12 ]; do
+        sleep 10; k=$((k+1))
+        kill -0 "$ff_pid" 2>/dev/null || break
+        if grep -qs -- "$PAGE" "$PROFILE"/places.sqlite 2>/dev/null; then
+            navigated_ok=1; break
+        fi
+    done
+    [ "$navigated_ok" = 1 ] && { echo "WEB_BROWSER_STAGE navigated on attempt $attempt"; break; }
+    echo "WEB_BROWSER_DIAG attempt $attempt did not navigate; restarting firefox"
+    kill "$ff_pid" 2>/dev/null
+    sleep 5
+done
+if [ "$navigated_ok" = 0 ]; then
+    echo "WEB_BROWSER_DIAG no attempt navigated; holding the last one anyway"
+    "$FF" --no-remote --new-instance --profile "$PROFILE" "$PAGE"         >/tmp/ff_stdout.log 2>/tmp/ff_err.log &
+    ff_pid=$!
+fi
 
 # Give Gecko time to spawn content processes, fetch over TLS, run 4399's JS and
 # paint via software WebRender, then hold the frame for a host-side VNC capture
