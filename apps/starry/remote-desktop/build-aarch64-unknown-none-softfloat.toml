@@ -1,0 +1,10 @@
+target = "aarch64-unknown-none-softfloat"
+env = {}
+log = "Warn"
+features = [
+  "qemu",
+  "ax-runtime/rtc",
+  "ax-driver/serial",
+  "ax-driver/nvme",
+  "ax-driver/virtio-net",
+]
