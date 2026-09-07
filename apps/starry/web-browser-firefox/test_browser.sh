@@ -232,11 +232,35 @@ ff_pid=$!
 # paint via software WebRender, then hold the frame for a host-side VNC capture
 # of the virtio-gpu scanout.
 echo "WEB_BROWSER_RENDER_WINDOW_OPEN"
+# A load that starts and then stops is the failure this test kept missing, so
+# the hold watches for progress instead of only counting seconds. Gecko's cache
+# gains an entry for each resource it finishes, which gives the guest a progress
+# counter it can read. Once the first entry exists, a count that does not move
+# for STALL_LIMIT samples means the page stopped advancing; a browser that is
+# merely slow keeps adding entries.
 i=0
+ff_died=0
+stalled=0
+last_entries=0
+flat=0
+STALL_LIMIT=20
+cache_count() { find "$PROFILE" -path '*cache2/entries/*' -type f 2>/dev/null | wc -l; }
 while [ "$i" -lt 80 ]; do
     sleep 15; i=$((i+1))
-    kill -0 "$ff_pid" 2>/dev/null || { echo "WEB_BROWSER_DIAG firefox exited early"; break; }
-    echo "WEB_BROWSER_DIAG alive t=$((i*15))s"
+    kill -0 "$ff_pid" 2>/dev/null || { echo "WEB_BROWSER_DIAG firefox exited early"; ff_died=1; break; }
+    n=$(cache_count)
+    if [ "$n" -eq "$last_entries" ]; then
+        flat=$((flat+1))
+    else
+        flat=0
+        last_entries="$n"
+    fi
+    echo "WEB_BROWSER_DIAG alive t=$((i*15))s fetched=$n flat=$flat"
+    if [ "$n" -gt 0 ] && [ "$flat" -ge "$STALL_LIMIT" ]; then
+        echo "WEB_BROWSER_DIAG load stopped advancing at $n resources"
+        stalled=1
+        break
+    fi
 done
 
 echo "WEB_BROWSER_DIAG gecko log lines=$(cat /tmp/ffhttp* 2>/dev/null | wc -l)"
@@ -251,7 +275,32 @@ head -40 /tmp/ff_err.log 2>/dev/null || true
 # is captured from outside rather than claimed from in here.
 echo "WEB_BROWSER_DIAG frame is on the VNC display; capture it there"
 
+# What the run must show before it may call itself a pass. Surviving the hold
+# is not evidence: a browser that painted nothing sat out the full twenty
+# minutes and still reached this line, which is the one outcome this test
+# exists to tell apart from a working render.
+#
+# A fetch over http leaves entries in Gecko's own cache, so a load that got
+# anywhere leaves a countable artifact inside the guest. A file:// page caches
+# nothing, so it is held only to the weaker check that Firefox survived.
+cache_entries=$(find "$PROFILE" -path '*cache2/entries/*' -type f 2>/dev/null | wc -l)
+echo "WEB_BROWSER_DIAG cache_entries=$cache_entries died=$ff_died"
 kill "$ff_pid" 2>/dev/null || true
+
+if [ "$ff_died" = 1 ]; then
+    fail "firefox exited before the hold finished"
+fi
+if [ "$stalled" = 1 ]; then
+    fail "$PAGE stopped advancing at $cache_entries resources: the load never finished"
+fi
+case "$PAGE" in
+    http://*|https://*)
+        if [ "$cache_entries" -lt 1 ]; then
+            fail "$PAGE fetched nothing: no cache entries, so no document was loaded"
+        fi
+        ;;
+esac
+
 test_done=1
 printf "%sWEB_BROWSER_TEST_PASSED%s\n" "$green" "$reset"
 echo "WEB_BROWSER_TEST_PASSED"
