@@ -5606,20 +5606,26 @@ impl AddrSpace {
         if range.is_empty() {
             return false;
         }
+        // This sits under every user-pointer check, so it must not allocate or
+        // touch a reference count per VMA: an ordinary `clock_gettime` writing
+        // one `timespec` was flattening the whole VMA tree.
         let mut cursor = range.start;
-        for vma in self.vma_root.lookup_range(range) {
+        let mut permitted = false;
+        self.vma_root.for_each_overlapping(range, |vma| {
             if vma.range.end <= cursor {
-                continue;
+                return true;
             }
             if vma.range.start > cursor || !vma.rights.contains(access_flags) {
                 return false;
             }
             cursor = vma.range.end.min(range.end);
             if cursor >= range.end {
-                return true;
+                permitted = true;
+                return false;
             }
-        }
-        false
+            true
+        });
+        permitted
     }
 
     /// Chooses the materialized leaf size for one fault without changing the
