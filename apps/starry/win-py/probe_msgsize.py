@@ -13,6 +13,12 @@ def say(*a):
     print(*a, flush=True)
 
 
+def sender(w):
+    for n in SIZES:
+        w.send_bytes(b"z" * n)
+    w.close()
+
+
 def main():
     ctx = mp.get_context("spawn")
 
@@ -27,6 +33,21 @@ def main():
         say("pipe %7d %s%s" % (n, "ok" if ok else "WRONG", "" if ok else " got %d" % len(got)))
         if not ok:
             break
+
+    # The same sizes again, but written by another process. A pool's result
+    # comes back this way, and the difference between the two is the whole
+    # question: same-process worked above.
+    r2, w2 = ctx.Pipe(duplex=False)
+    p = ctx.Process(target=sender, args=(w2,))
+    p.start()
+    w2.close()
+    for n in SIZES:
+        got = r2.recv_bytes()
+        ok = len(got) == n and got == b"z" * n
+        say("child %7d %s%s" % (n, "ok" if ok else "WRONG", "" if ok else " got %d" % len(got)))
+        if not ok:
+            break
+    p.join(timeout=120)
 
     # An exception with a traceback is what a pool sends back when its work
     # raises, and it is far bigger than any result above.

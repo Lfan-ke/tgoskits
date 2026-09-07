@@ -15,4 +15,4 @@ success_regex = ['PROBE-MSGSIZE-DONE']
 # t19 drives the interpreter's own error paths on purpose - a child that dies
 # with "Fatal Python error" is a check passing, not the run failing.
 fail_regex = ['(?i)panic']
-timeout = 900
+timeout = 1500
