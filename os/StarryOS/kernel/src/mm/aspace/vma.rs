@@ -1780,6 +1780,7 @@ mod tests {
     }
 
     /// One VMA per 0x2000, so VMA `i` covers `[0x1000 + i * 0x2000, +0x1000)`.
+    #[cfg(all(test, not(axtest)))]
     fn map_of(count: usize) -> VmaMap {
         let mut map = VmaMap::default();
         for i in 0..count {
@@ -1788,6 +1789,7 @@ mod tests {
         map
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn a_range_lookup_walks_the_search_path_not_the_whole_tree() {
         let map = map_of(256);
@@ -1811,6 +1813,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn a_spanning_lookup_returns_every_intersecting_vma_in_order() {
         let map = map_of(64);
@@ -1829,6 +1832,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, not(axtest)))]
     #[test]
     fn a_lookup_starting_inside_a_vma_still_reaches_its_predecessor() {
         let map = map_of(32);
