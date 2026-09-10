@@ -1,10 +1,7 @@
 //! Receive bursts through the runtime-owned interrupt console, including a
 //! second transaction after the first subscription has been drained.
 
-use std::{
-    os::arceos::modules::ax_runtime::{console, serial},
-    println,
-};
+use ax_std::os::arceos::modules::ax_runtime::{console, serial};
 
 pub fn run() -> crate::TestResult {
     let runtime = serial::runtimes()
