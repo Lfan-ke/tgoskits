@@ -1,0 +1,52 @@
+# The G side of this app: virgl through a 3D-capable virtio-gpu. Same kernel,
+# image, page and checks as qemu-x86_64.toml; only the GPU device, the host
+# display and the guest backend switch differ. egl-headless needs a host DRM
+# render node and also exports the GL scanout over VNC for the render check.
+# Run it with --qemu-config qemu-x86_64-gpu.toml.
+args = [
+    "-machine",
+    "q35,accel=kvm:tcg",
+    "-cpu",
+    "max",
+    "-serial",
+    "stdio",
+    "-display",
+    "egl-headless,gl=on",
+    "-vnc",
+    ":0",
+    "-vga",
+    "none",
+    "-m",
+    "6G",
+    "-smp",
+    "4",
+    "-device",
+    "virtio-vga-gl,xres=1024,yres=768",
+    "-device",
+    "virtio-tablet-pci",
+    "-device",
+    "virtio-keyboard-pci",
+    "-device",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/target/axbuild/rootfs/rootfs-x86_64-alpine.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0",
+    "-rtc", "base=localtime",
+]
+uefi = true
+to_bin = true
+fail_regex = [
+    '(?i)\bpanic(?:ked)?\b',
+    '(?i)segfault',
+    '(?i)page fault',
+    "(?m)^WEB_BROWSER_TEST_FAILED(?:[: ].*)?$",
+]
+timeout = 2400
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = "WEB_BROWSER_RENDERER=gl /usr/bin/test-browser.sh"
+success_regex = ["(?m)^WEB_BROWSER_TEST_PASSED\\s*$"]
