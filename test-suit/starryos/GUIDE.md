@@ -312,6 +312,13 @@ Pipeline 创建的副本只负责资产注入，不承担 QEMU 运行期写隔�
 `fakeroot`，避免产生大量权限警告。如果此时缺少 `fakeroot`，xtask 会在启动
 `debugfs` 前明确失败，不会先执行再过滤警告或静默回退。
 
+C、分组 C 和 Rust 资产通过 `write_cross_bin_wrappers()` 统一选择 binutils：优先使用
+qemu-user 执行 staging root 内的工具，否则使用宿主原生 `<gnu_tool_prefix>-<tool>`
+交叉工具。原生模式仍需要目标 sysroot；缺少任一所需工具会在构建前失败。
+`prebuild.sh` 仍由 `prepare_guest_prebuild_env()` 要求 qemu-user，不能因为缺少模拟器
+而跳过脚本或依赖其产物的测试。当前 `qemu/system` 有共享 prebuild，仍需要 qemu-user；
+完整套件应在具备该能力的 Linux 环境执行。
+
 ## QEMU TOML
 
 每个 `qemu-<arch>.toml` 定义运行配置，而不是构建配置。常用字段如下：
