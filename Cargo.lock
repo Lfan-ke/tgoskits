@@ -2197,6 +2197,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -7989,6 +7990,7 @@ dependencies = [
  "bitmaps",
  "bytemuck",
  "cfg-if",
+ "chacha20",
  "chrono",
  "crab-usb",
  "cvi-vdec-uapi",
@@ -8029,6 +8031,7 @@ dependencies = [
  "sg2002-tpu",
  "sg200x-bsp",
  "sg200x-jpu",
+ "sha2 0.10.9",
  "slab",
  "some-serial",
  "somehal",
@@ -8044,6 +8047,7 @@ dependencies = [
  "x86",
  "xmas-elf",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
