@@ -42,6 +42,19 @@ use crate::{
 };
 
 const EMPTY_MAC: EthernetAddress = EthernetAddress([0; 6]);
+
+/// Destination filter applied before a frame reaches ARP or the IP stack.
+fn accepts_destination(
+    destination: EthernetAddress,
+    own: EthernetAddress,
+    accept_multicast: bool,
+) -> bool {
+    destination.is_broadcast()
+        || destination == EMPTY_MAC
+        || destination == own
+        || (accept_multicast && destination.is_multicast())
+}
+
 struct Neighbor {
     hardware_address: EthernetAddress,
     expires_at: Instant,
@@ -57,6 +70,7 @@ pub struct EthernetDevice {
     neighbors: HashMap<IpAddress, Neighbor>,
     pending_neighbors: HashMap<IpAddress, PendingNeighbor>,
     ip: Option<Ipv4Cidr>,
+    accept_multicast: bool,
 
     pending_packets: PacketBuffer<'static, IpAddress>,
     /// Replies owned by the protocol executor until TX space is available.
@@ -116,6 +130,7 @@ impl EthernetDevice {
             neighbors: HashMap::new(),
             pending_neighbors: HashMap::new(),
             ip,
+            accept_multicast: false,
 
             pending_packets,
             pending_arp_replies: VecDeque::new(),
@@ -133,6 +148,11 @@ impl EthernetDevice {
         EthernetAddress(self.inner.mac_address())
     }
 
+    /// Also passes frames sent to multicast addresses up the stack.
+    pub(crate) fn set_accept_multicast(&mut self, accept: bool) {
+        self.accept_multicast = accept;
+    }
+
     fn transmit_ip_to(
         &mut self,
         destination: EthernetAddress,
@@ -146,14 +166,21 @@ impl EthernetDevice {
             Ok(IpVersion::Ipv6) => EthernetProtocol::Ipv6,
             Err(_) => return Err(NetDeviceError::InvalidParam),
         };
-        Self::send_to_with_options(
+        // The frame is gone either way, so a drop is neither sent nor retried.
+        match Self::send_to_with_options(
             &mut *self.inner,
             destination,
             packet.len(),
             |buffer| buffer.copy_from_slice(packet),
             protocol,
             TxNotify::Deferred,
-        )
+        ) {
+            Err(NetDeviceError::Dropped) => {
+                self.deferred_tx_drops += 1;
+                Ok(0)
+            }
+            result => result,
+        }
     }
 
     /// Builds an Ethernet frame around `size` bytes of payload written by `f`,
@@ -234,6 +261,7 @@ impl EthernetDevice {
             ) {
                 Ok(frame_len) => self.deferred_tx_frame_lens.push(frame_len),
                 Err(NetDeviceError::Again) => return false,
+                Err(NetDeviceError::Dropped) => self.deferred_tx_drops += 1,
                 Err(error) => {
                     warn!("{}: failed to send ARP reply: {error:?}", self.name);
                     self.deferred_tx_errors += 1;
@@ -265,10 +293,11 @@ impl EthernetDevice {
             return 0;
         };
 
-        if !repr.dst_addr.is_broadcast()
-            && repr.dst_addr != EMPTY_MAC
-            && repr.dst_addr != self.hardware_address()
-        {
+        if !accepts_destination(
+            repr.dst_addr,
+            self.hardware_address(),
+            self.accept_multicast,
+        ) {
             return 0;
         }
 
@@ -345,16 +374,21 @@ impl EthernetDevice {
             target_protocol_addr: target_ipv4,
         };
 
-        let arp_frame_len = Self::send_to(
+        match Self::send_to(
             &mut *self.inner,
             EthernetAddress::BROADCAST,
             arp_repr.buffer_len(),
             |buf| arp_repr.emit(&mut ArpPacket::new_unchecked(buf)),
             EthernetProtocol::Arp,
-        )?;
-        // ARP requests are successfully transmitted L2 frames — record
-        // their length so the protocol executor can count them in TX stats.
-        self.deferred_tx_frame_lens.push(arp_frame_len);
+        ) {
+            // ARP requests are successfully transmitted L2 frames — record
+            // their length so the protocol executor can count them in TX stats.
+            Ok(arp_frame_len) => self.deferred_tx_frame_lens.push(arp_frame_len),
+            // A dropped request is retried after `ARP_REQUEST_RETRY`, as one
+            // lost on the wire would be.
+            Err(NetDeviceError::Dropped) => self.deferred_tx_drops += 1,
+            Err(error) => return Err(error),
+        }
 
         self.pending_neighbors.insert(
             target_ip,
@@ -481,6 +515,7 @@ impl EthernetDevice {
                             self.name, next_hop, mac
                         );
                         match self.transmit_ip_to(mac, &payload) {
+                            Ok(0) => {}
                             Ok(frame_len) => self.deferred_tx_frame_lens.push(frame_len),
                             Err(NetDeviceError::Again) => kept.push((next_hop, payload)),
                             Err(err) => {
@@ -578,6 +613,7 @@ impl Device for EthernetDevice {
                 }
             };
             let hardware_address = self.hardware_address();
+            let accept_multicast = self.accept_multicast;
             let mut malformed = false;
             let mut side_frame = false;
             let packet_range = frame.read_with(|packet| {
@@ -590,10 +626,7 @@ impl Device for EthernetDevice {
                     malformed = true;
                     return None;
                 };
-                if !repr.dst_addr.is_broadcast()
-                    && repr.dst_addr != EMPTY_MAC
-                    && repr.dst_addr != hardware_address
-                {
+                if !accepts_destination(repr.dst_addr, hardware_address, accept_multicast) {
                     return None;
                 }
                 match repr.ethertype {
@@ -634,6 +667,7 @@ impl Device for EthernetDevice {
         self.flush_arp_replies();
         loop {
             let hardware_address = self.hardware_address();
+            let accept_multicast = self.accept_multicast;
             let mut side_frame = None;
             let mut malformed = false;
             let mut dropped = false;
@@ -647,10 +681,7 @@ impl Device for EthernetDevice {
                     malformed = true;
                     return 0;
                 };
-                if !repr.dst_addr.is_broadcast()
-                    && repr.dst_addr != EMPTY_MAC
-                    && repr.dst_addr != hardware_address
-                {
+                if !accepts_destination(repr.dst_addr, hardware_address, accept_multicast) {
                     return 0;
                 }
                 match repr.ethertype {

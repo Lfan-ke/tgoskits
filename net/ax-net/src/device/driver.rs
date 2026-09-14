@@ -30,6 +30,10 @@ pub enum NetDeviceError {
     /// A required DMA allocation could not be obtained.
     #[error("network frame port memory allocation failed")]
     NoMemory,
+    /// The port discarded the frame, as a full software queue does. The caller
+    /// counts a TX drop and does not retry, like Linux `NET_XMIT_DROP`.
+    #[error("network frame port dropped the frame")]
+    Dropped,
 }
 
 pub type NetDeviceResult<T = ()> = Result<T, NetDeviceError>;
