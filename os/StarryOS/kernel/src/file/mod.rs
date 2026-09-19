@@ -949,7 +949,12 @@ pub fn release_locks_on_close(fd: FileDescriptor) {
     notify_close_write(&fd);
     if let Some(k) = key {
         crate::syscall::release_inode_posix_locks(owner, k);
-        if !fd_tables_contain_file(&fd.inner) {
+        // A descriptor holding the only reference to its open file description
+        // cannot share it with any other table, so the scan over every task
+        // could only answer no. That is the common close, and the scan costs
+        // tasks x open descriptors under the task list, so it is left for
+        // descriptions that are still shared (dup, fork, a queued SCM_RIGHTS).
+        if Arc::strong_count(&fd.inner) == 1 || !fd_tables_contain_file(&fd.inner) {
             crate::syscall::release_flock_lock(k, &fd.inner);
         }
     }
