@@ -1535,6 +1535,20 @@ impl VmaMap {
         limit: VirtAddrRange,
         align: usize,
     ) -> Option<VirtAddr> {
+        self.find_free_area_visiting(hint, size, limit, align, &mut 0)
+    }
+
+    /// [`Self::find_free_area`] with the node count the descent paid, which is
+    /// what the regression test asserts on: the address it returns is the same
+    /// whether or not the tree was walked in full, so only the cost differs.
+    fn find_free_area_visiting(
+        &self,
+        hint: VirtAddr,
+        size: usize,
+        limit: VirtAddrRange,
+        align: usize,
+        visited: &mut usize,
+    ) -> Option<VirtAddr> {
         // An empty/invalid search interval must never be treated as an
         // unbounded one.  In particular `start == end` used to let the final
         // candidate check succeed after arithmetic was rounded, returning an
@@ -1557,30 +1571,31 @@ impl VmaMap {
         if candidate < limit.start || candidate >= limit.end {
             return None;
         }
-        for vma in self.iter() {
-            if vma.range.end <= candidate {
-                continue;
+        loop {
+            // The candidate only ever moves forward, so once the interval runs
+            // past the limit no later one can fit either.
+            let end = candidate.checked_add(size)?;
+            if end > limit.end {
+                return None;
             }
-            if vma.range.start > candidate
-                && candidate >= limit.start
-                && candidate
-                    .checked_add(size)
-                    .is_some_and(|end| end <= vma.range.start)
-                && candidate
-                    .checked_add(size)
-                    .is_some_and(|end| end <= limit.end)
-            {
+            let mut blocked_at = None;
+            Self::visit_overlapping(
+                &self.root,
+                VirtAddrRange::new(candidate, end),
+                visited,
+                &mut |entry: &Arc<VmaEntry>| {
+                    blocked_at = Some(entry.snapshot.range.end);
+                    false
+                },
+            );
+            let Some(occupied_until) = blocked_at else {
                 return Some(candidate);
-            }
-            candidate = align_up(vma.range.end.max(limit.start))?;
+            };
+            candidate = align_up(occupied_until.max(limit.start))?;
             if candidate >= limit.end {
                 return None;
             }
         }
-        candidate
-            .checked_add(size)
-            .is_some_and(|end| end <= limit.end)
-            .then_some(candidate)
     }
 
     pub(super) fn insert_entry(&self, entry: Arc<VmaEntry>) -> Option<Self> {
@@ -1849,6 +1864,114 @@ mod tests {
         assert_eq!(merged.len(), carved.len());
         assert_eq!(merged.len(), walked_count(&merged));
         assert_eq!(map.len(), 65);
+    }
+
+    /// The scan `find_free_area` used to be, kept as the oracle the search path
+    /// is compared against.
+    #[cfg(all(test, not(axtest)))]
+    fn free_area_by_full_scan(
+        map: &VmaMap,
+        hint: VirtAddr,
+        size: usize,
+        limit: VirtAddrRange,
+        align: usize,
+    ) -> Option<VirtAddr> {
+        if limit.start >= limit.end
+            || size == 0
+            || align == 0
+            || !align.is_power_of_two()
+            || !size.is_multiple_of(align)
+        {
+            return None;
+        }
+        let align_up = |address: VirtAddr| {
+            address
+                .as_usize()
+                .checked_add(align - 1)
+                .map(|value| VirtAddr::from_usize(value & !(align - 1)))
+        };
+        let mut candidate = align_up(hint.max(limit.start))?;
+        if candidate < limit.start || candidate >= limit.end {
+            return None;
+        }
+        for vma in map.iter() {
+            if vma.range.end <= candidate {
+                continue;
+            }
+            if vma.range.start > candidate
+                && candidate >= limit.start
+                && candidate
+                    .checked_add(size)
+                    .is_some_and(|end| end <= vma.range.start)
+                && candidate
+                    .checked_add(size)
+                    .is_some_and(|end| end <= limit.end)
+            {
+                return Some(candidate);
+            }
+            candidate = align_up(vma.range.end.max(limit.start))?;
+            if candidate >= limit.end {
+                return None;
+            }
+        }
+        candidate
+            .checked_add(size)
+            .is_some_and(|end| end <= limit.end)
+            .then_some(candidate)
+    }
+
+    #[cfg(all(test, not(axtest)))]
+    #[test]
+    fn a_free_area_search_stops_at_the_first_gap() {
+        let map = map_of(256);
+        let span = VirtAddrRange::new(
+            VirtAddr::from_usize(0x1000),
+            VirtAddr::from_usize(0x1000 + 256 * 0x2000),
+        );
+
+        let mut visited = 0;
+        let found = map.find_free_area_visiting(
+            VirtAddr::from_usize(0x1000),
+            0x1000,
+            span,
+            0x1000,
+            &mut visited,
+        );
+        assert_eq!(found, Some(VirtAddr::from_usize(0x2000)));
+        assert!(visited <= 64, "the search visited {visited} nodes");
+
+        // A hint inside a mapping, a hint past every mapping, a request larger
+        // than one gap, a coarser alignment, and an exhausted limit.
+        let cases = [
+            (0x1000usize, 0x1000usize, 0x1000usize, span),
+            (0x1000 + 3 * 0x2000, 0x1000, 0x1000, span),
+            (0x1800, 0x1000, 0x1000, span),
+            (0x1000, 0x2000, 0x1000, span),
+            (0x1000, 0x1000, 0x2000, span),
+            (
+                0x1000 + 255 * 0x2000,
+                0x1000,
+                0x1000,
+                VirtAddrRange::new(
+                    VirtAddr::from_usize(0x1000),
+                    VirtAddr::from_usize(0x1000 + 255 * 0x2000),
+                ),
+            ),
+        ];
+        for (hint, size, align, limit) in cases {
+            let hint = VirtAddr::from_usize(hint);
+            assert_eq!(
+                map.find_free_area(hint, size, limit, align),
+                free_area_by_full_scan(&map, hint, size, limit, align),
+                "hint {hint:?} size {size:#x} align {align:#x}"
+            );
+        }
+
+        let empty = VmaMap::default();
+        assert_eq!(
+            empty.find_free_area(VirtAddr::from_usize(0x1000), 0x1000, span, 0x1000),
+            free_area_by_full_scan(&empty, VirtAddr::from_usize(0x1000), 0x1000, span, 0x1000)
+        );
     }
 
     #[cfg(all(test, not(axtest)))]
