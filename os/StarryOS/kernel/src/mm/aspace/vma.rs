@@ -810,6 +810,7 @@ struct VmaNode {
     left: Option<Arc<VmaNode>>,
     right: Option<Arc<VmaNode>>,
     height: u8,
+    size: u32,
 }
 
 impl VmaNode {
@@ -819,6 +820,7 @@ impl VmaNode {
             left: None,
             right: None,
             height: 1,
+            size: 1,
         })
     }
 
@@ -830,6 +832,7 @@ impl VmaNode {
         Arc::new(Self {
             entry,
             height: 1 + node_height(&left).max(node_height(&right)),
+            size: 1 + node_size(&left) + node_size(&right),
             left,
             right,
         })
@@ -838,6 +841,10 @@ impl VmaNode {
 
 fn node_height(node: &Option<Arc<VmaNode>>) -> u8 {
     node.as_ref().map_or(0, |node| node.height)
+}
+
+fn node_size(node: &Option<Arc<VmaNode>>) -> u32 {
+    node.as_ref().map_or(0, |node| node.size)
 }
 
 fn balance_factor(node: &VmaNode) -> i16 {
@@ -984,7 +991,7 @@ fn remove_node(
 
 impl VmaMap {
     pub fn len(&self) -> usize {
-        self.iter().count()
+        self.root.as_ref().map_or(0, |node| node.size as usize)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1787,6 +1794,65 @@ mod tests {
             map = insert(&map, 0x1000 + i * 0x2000, 0x1000).unwrap();
         }
         map
+    }
+
+    #[cfg(all(test, not(axtest)))]
+    fn walked_count(map: &VmaMap) -> usize {
+        let everything =
+            VirtAddrRange::new(VirtAddr::from_usize(0), VirtAddr::from_usize(usize::MAX));
+        let mut counted = 0;
+        map.for_each_overlapping_entry(everything, |_| {
+            counted += 1;
+            true
+        });
+        counted
+    }
+
+    #[cfg(all(test, not(axtest)))]
+    #[test]
+    fn the_vma_count_matches_a_walk_after_every_mutation() {
+        // The small mappings are one page each, so the carves and splits below
+        // work on a wider one placed past them.
+        let base = 0x1000 + 64 * 0x2000;
+        let map = insert(&map_of(64), base, 0x4000).unwrap();
+        assert_eq!(map.len(), 65);
+        assert_eq!(map.len(), walked_count(&map));
+
+        let (shrunk, _) = map
+            .remove_entry(VirtAddr::from_usize(0x1000 + 7 * 0x2000))
+            .unwrap();
+        assert_eq!(shrunk.len(), 64);
+        assert_eq!(shrunk.len(), walked_count(&shrunk));
+
+        let carved = shrunk
+            .without_range(VirtAddrRange::from_start_size(
+                VirtAddr::from_usize(base + 0x1000),
+                0x1000,
+            ))
+            .unwrap();
+        assert_eq!(carved.len(), 65);
+        assert_eq!(carved.len(), walked_count(&carved));
+
+        let split = carved
+            .with_permissions(
+                VirtAddrRange::from_start_size(VirtAddr::from_usize(base + 0x2000), 0x1000),
+                MappingFlags::READ | MappingFlags::WRITE,
+                MappingFlags::READ | MappingFlags::WRITE,
+            )
+            .unwrap();
+        assert_eq!(split.len(), carved.len() + 1);
+        assert_eq!(split.len(), walked_count(&split));
+
+        let merged = split
+            .with_permissions(
+                VirtAddrRange::from_start_size(VirtAddr::from_usize(base + 0x2000), 0x1000),
+                MappingFlags::READ,
+                MappingFlags::READ,
+            )
+            .unwrap();
+        assert_eq!(merged.len(), carved.len());
+        assert_eq!(merged.len(), walked_count(&merged));
+        assert_eq!(map.len(), 65);
     }
 
     #[cfg(all(test, not(axtest)))]
