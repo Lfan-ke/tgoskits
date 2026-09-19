@@ -1104,6 +1104,17 @@ impl VmaMap {
         found
     }
 
+    /// [`Self::lookup_range`] for the mutators, which need the executable
+    /// operation next to the snapshot to path-copy an entry.
+    pub(super) fn entries_in_range(&self, range: VirtAddrRange) -> Vec<Arc<VmaEntry>> {
+        let mut found = Vec::new();
+        self.for_each_overlapping_entry(range, |entry| {
+            found.push(entry.clone());
+            true
+        });
+        found
+    }
+
     pub fn contains_range(&self, start: VirtAddr, size: usize) -> bool {
         let Some(request) = VirtAddrRange::try_from_start_size(start, size) else {
             return false;
@@ -1204,10 +1215,7 @@ impl VmaMap {
             return Some(self.clone());
         }
 
-        let affected: Vec<_> = self
-            .iter_entries()
-            .filter(|entry| entry.snapshot.range.overlaps(range))
-            .collect();
+        let affected = self.entries_in_range(range);
         let mut updated = self.clone();
         for source in affected {
             let (next, removed) = updated.remove_entry(source.snapshot.range.start)?;
@@ -1251,10 +1259,7 @@ impl VmaMap {
             return None;
         }
 
-        let affected: Vec<_> = self
-            .iter_entries()
-            .filter(|entry| entry.snapshot.range.overlaps(range))
-            .collect();
+        let affected = self.entries_in_range(range);
         let mut updated = self.clone();
         for source in affected {
             let (next, removed) = updated.remove_entry(source.snapshot.range.start)?;
@@ -1312,10 +1317,7 @@ impl VmaMap {
             return None;
         }
 
-        let affected: Vec<_> = self
-            .iter_entries()
-            .filter(|entry| entry.snapshot.range.overlaps(range))
-            .collect();
+        let affected = self.entries_in_range(range);
         let mut updated = self.clone();
         for source in affected {
             let (next, removed) = updated.remove_entry(source.snapshot.range.start)?;
@@ -1370,10 +1372,7 @@ impl VmaMap {
             return None;
         }
 
-        let affected: Vec<_> = self
-            .iter_entries()
-            .filter(|entry| entry.snapshot.range.overlaps(range))
-            .collect();
+        let affected = self.entries_in_range(range);
         let mut updated = self.clone();
         for source in affected {
             let (next, removed) = updated.remove_entry(source.snapshot.range.start)?;
@@ -1516,10 +1515,7 @@ impl VmaMap {
         if range.is_empty() || !self.contains_range(range.start, range.size()) {
             return None;
         }
-        let affected: Vec<_> = self
-            .iter_entries()
-            .filter(|entry| entry.snapshot.range.overlaps(range))
-            .collect();
+        let affected = self.entries_in_range(range);
         let mut updated = self.clone();
         for source in affected {
             let fragment = VirtAddrRange::new(
