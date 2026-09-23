@@ -1,6 +1,6 @@
 <h1 align="center">TGOSKits</h1>
 
-<p align="center">An integrated Rust workspace for operating system and virtualization development</p>
+<p align="center">An integrated Rust workspace for operating system and virtualization development.</p>
 
 <div align="center">
 
