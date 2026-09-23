@@ -211,6 +211,21 @@ pub struct UnixSocket {
     /// of its namespace entry, while duplicated descriptors share this whole
     /// socket object and therefore release the entry only on the final close.
     owns_bind: AtomicBool,
+    /// Set while this socket is in the namespace on its way to a local address.
+    ///
+    /// Resolving a path sleeps, so the address spinlock cannot be held across
+    /// it (#2351) and the check and the publication below sit in separate
+    /// critical sections. This claim spans both, so the namespace creates the
+    /// socket node once and a racing bind gets the `EINVAL` an already bound
+    /// socket gets, without a node left behind. Linux holds `u->bindlock`
+    /// across the same work and unlinks at `unix_bind_bsd`'s `out_unlink`.
+    binding: AtomicBool,
+    /// Set while this socket is in the namespace on its way to a peer.
+    ///
+    /// The same window, for the same reason: without it two connects both pass
+    /// the unconnected check and the seqpacket transport queues two requests on
+    /// one listener, the second overwriting this socket's receive channel.
+    connecting: AtomicBool,
 }
 impl UnixSocket {
     /// Create a new Unix socket with the given transport.
@@ -220,6 +235,8 @@ impl UnixSocket {
             local_addr: SpinLock::new(UnixSocketAddr::Unnamed),
             remote_addr: SpinLock::new(None),
             owns_bind: AtomicBool::new(false),
+            binding: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
         }
     }
 
@@ -230,6 +247,8 @@ impl UnixSocket {
             local_addr: SpinLock::new(UnixSocketAddr::Unnamed),
             remote_addr: SpinLock::new(Some(UnixSocketAddr::Unnamed)),
             owns_bind: AtomicBool::new(false),
+            binding: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
         }
     }
 
@@ -257,9 +276,17 @@ impl SocketOps for UnixSocket {
             return Err(NetError::InvalidInput);
         }
         // Like Linux `unix_bind_bsd`, the node is created without a socket
-        // spinlock held: the filesystem namespace can sleep. A second bind that
-        // races past the check above is refused by the transport.
-        with_slot_or_insert(&local_addr, |slot| self.transport.bind(slot, &local_addr))?;
+        // spinlock held: the filesystem namespace can sleep. The claim covers
+        // that whole stretch, so only one bind ever creates a node.
+        if self.binding.swap(true, Ordering::AcqRel) {
+            return Err(NetError::InvalidInput);
+        }
+        if let Err(err) =
+            with_slot_or_insert(&local_addr, |slot| self.transport.bind(slot, &local_addr))
+        {
+            self.binding.store(false, Ordering::Release);
+            return Err(err);
+        }
         *self.local_addr.lock() = local_addr;
         self.owns_bind.store(true, Ordering::Release);
         Ok(())
@@ -270,12 +297,22 @@ impl SocketOps for UnixSocket {
         if self.remote_addr.lock().is_some() {
             return Err(NetError::InvalidInput);
         }
-        let local_addr = self.local_addr.lock().clone();
         // Like Linux `unix_stream_connect`, the peer is looked up before any
-        // socket state lock is taken; the transport refuses a racing connect.
-        let accept_poll = with_slot(&remote_addr, |slot| {
+        // socket state lock is taken. The claim covers the lookup and the
+        // publication together, so one connect reaches the listener once.
+        if self.connecting.swap(true, Ordering::AcqRel) {
+            return Err(NetError::InvalidInput);
+        }
+        let local_addr = self.local_addr.lock().clone();
+        let accept_poll = match with_slot(&remote_addr, |slot| {
             self.transport.connect(slot, &local_addr)
-        })?;
+        }) {
+            Ok(accept_poll) => accept_poll,
+            Err(err) => {
+                self.connecting.store(false, Ordering::Release);
+                return Err(err);
+            }
+        };
         *self.remote_addr.lock() = Some(remote_addr);
         self.transport.finish_connect(accept_poll);
         Ok(ConnectStatus::Connected)
@@ -296,6 +333,8 @@ impl SocketOps for UnixSocket {
             local_addr: SpinLock::new(self.local_addr.lock().clone()),
             remote_addr: SpinLock::new(Some(peer_addr)),
             owns_bind: AtomicBool::new(false),
+            binding: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
         }
         .into())
     }
@@ -394,6 +433,8 @@ mod tests {
             local_addr: SpinLock::new(UnixSocketAddr::Unnamed),
             remote_addr: SpinLock::new(Some(UnixSocketAddr::Path(Arc::from("server.sock")))),
             owns_bind: AtomicBool::new(false),
+            binding: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
         };
 
         let mut from = SocketAddrEx::Unix(UnixSocketAddr::Unnamed);
@@ -402,6 +443,32 @@ mod tests {
             from,
             SocketAddrEx::Unix(UnixSocketAddr::Path(path)) if path.as_ref() == "server.sock"
         ));
+    }
+
+    /// Sockets a namespace call re-enters once, to stand in for the thread
+    /// that would otherwise arrive in that same window.
+    static REENTRANT: SpinLock<alloc::vec::Vec<(&'static str, Arc<UnixSocket>, bool)>> =
+        SpinLock::new(alloc::vec::Vec::new());
+    static NS_CALLS: SpinLock<alloc::vec::Vec<alloc::string::String>> =
+        SpinLock::new(alloc::vec::Vec::new());
+
+    /// Runs the second caller's operation from inside the first one's namespace
+    /// call, which is the interleaving the address spinlock used to rule out.
+    fn reenter(path: &str, again: impl FnOnce(&UnixSocket) -> bool) {
+        let claimed = {
+            let mut reentrant = REENTRANT.lock();
+            let found = reentrant
+                .iter_mut()
+                .find(|(name, _, done)| *name == path && !*done);
+            match found {
+                Some((_, socket, done)) => {
+                    *done = true;
+                    socket.clone()
+                }
+                None => return,
+            }
+        };
+        assert!(again(&claimed), "第二次调用本该被拒");
     }
 
     /// Stands in for the filesystem namespace and records, on every call,
@@ -429,6 +496,11 @@ mod tests {
     impl UnixNamespace for ProbeNamespace {
         fn resolve(&self, path: &str) -> NetResult<Arc<BindSlot>> {
             Self::observe(path);
+            NS_CALLS.lock().push(path.into());
+            reenter(path, |socket| {
+                let address = SocketAddrEx::Unix(UnixSocketAddr::Path(Arc::from(path)));
+                matches!(socket.start_connect(address), Err(NetError::InvalidInput))
+            });
             self.slots
                 .lock()
                 .get(path)
@@ -438,6 +510,11 @@ mod tests {
 
         fn bind(&self, path: &str) -> NetResult<Arc<BindSlot>> {
             Self::observe(path);
+            NS_CALLS.lock().push(path.into());
+            reenter(path, |socket| {
+                let address = SocketAddrEx::Unix(UnixSocketAddr::Path(Arc::from(path)));
+                matches!(socket.bind(address), Err(NetError::InvalidInput))
+            });
             Ok(self.slots.lock().entry(path.into()).or_default().clone())
         }
 
@@ -471,6 +548,46 @@ mod tests {
             .map(|(_, free)| *free)
             .collect();
         assert_eq!(observed, [true, true, true]);
+    }
+
+    fn namespace_calls_for(path: &str) -> usize {
+        NS_CALLS.lock().iter().filter(|name| *name == path).count()
+    }
+
+    #[test]
+    fn a_second_bind_in_the_namespace_window_creates_no_second_node() {
+        const PATH: &str = "bind-window.sock";
+        register_unix_namespace(ProbeNamespace::default());
+        let socket = Arc::new(UnixSocket::new(StreamTransport::new(3)));
+        REENTRANT.lock().push((PATH, socket.clone(), false));
+
+        socket
+            .bind(SocketAddrEx::Unix(UnixSocketAddr::Path(Arc::from(PATH))))
+            .unwrap();
+
+        assert_eq!(namespace_calls_for(PATH), 1);
+        assert!(matches!(
+            socket.local_addr(),
+            Ok(SocketAddrEx::Unix(UnixSocketAddr::Path(_)))
+        ));
+    }
+
+    #[test]
+    fn a_second_connect_in_the_namespace_window_reaches_the_listener_once() {
+        const PATH: &str = "connect-window.sock";
+        register_unix_namespace(ProbeNamespace::default());
+        let server = Arc::new(UnixSocket::new(StreamTransport::new(4)));
+        let address = || SocketAddrEx::Unix(UnixSocketAddr::Path(Arc::from(PATH)));
+        server.bind(address()).unwrap();
+        server.listen(1).unwrap();
+
+        let client = Arc::new(UnixSocket::new(StreamTransport::new(5)));
+        REENTRANT.lock().push((PATH, client.clone(), false));
+        client.start_connect(address()).unwrap();
+
+        // One bind and one resolve; a second resolve would mean the reentrant
+        // connect reached the listener as well.
+        assert_eq!(namespace_calls_for(PATH), 2);
     }
 
     #[test]
