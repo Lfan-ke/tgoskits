@@ -57,8 +57,14 @@ const FRAMEBUFFER_RESOURCE_ID: u32 = 0xbabe;
 /// instead of being sent anyway.
 pub struct VirtIoGpu<H: Hal, T: Transport> {
     transport: T,
-    /// Rectangle of the current framebuffer, if one was set up.
+    /// Scanout window inside the framebuffer, if one was set up.
     rect: Option<Rect>,
+    /// Size the framebuffer resource was allocated for.
+    ///
+    /// Every scanout window fits inside it, so a display resize moves the
+    /// window instead of moving the framebuffer, which nothing that already
+    /// maps it could follow.
+    allocation: Option<Rect>,
     /// DMA region backing the default framebuffer.
     frame_buffer_dma: Option<Dma<H>>,
     /// Queue carrying control commands.
@@ -116,6 +122,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         Ok(Self {
             transport,
             rect: None,
+            allocation: None,
             frame_buffer_dma: None,
             control_queue,
             queue_buf_recv,
@@ -198,13 +205,64 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
     /// is bound, so a failure part-way leaves no state claiming a framebuffer
     /// that the device is not actually scanning out.
     pub fn change_resolution(&mut self, width: u32, height: u32) -> Result<&mut [u8], Error> {
-        let rect = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
+        let rect = whole(width, height);
+        self.create_framebuffer(rect, rect)
+    }
+
+    /// Sets up a framebuffer big enough for `max_width` by `max_height` and
+    /// scans out the mode the device advertises now.
+    ///
+    /// The framebuffer backs every mode taken afterwards, so allocating for the
+    /// largest one up front is what lets a later resize be taken in place.
+    /// Where that much memory cannot be backed, the advertised mode is
+    /// allocated instead: the display still comes up, it just cannot grow.
+    pub fn setup_framebuffer_up_to(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<&mut [u8], Error> {
+        let mode = self.display_info()?.rect;
+        let visible = whole(mode.width, mode.height);
+        let wanted = whole(max_width.max(mode.width), max_height.max(mode.height));
+        let allocation = if self.can_back(wanted) {
+            wanted
+        } else {
+            visible
         };
-        let size = framebuffer_size(width, height)?;
+        self.create_framebuffer(allocation, visible)
+    }
+
+    /// Moves the scanout window to `width` by `height` within the framebuffer
+    /// already allocated.
+    ///
+    /// This is how a new display size is taken: the framebuffer keeps its
+    /// address, so every mapping of it stays valid.
+    pub fn set_framebuffer_size(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        let allocation = self.allocation.ok_or(Error::NotReady)?;
+        if width > allocation.width || height > allocation.height {
+            return Err(Error::InvalidParam);
+        }
+        let rect = whole(width, height);
+        self.set_scanout(rect, SCANOUT_ID, FRAMEBUFFER_RESOURCE_ID)?;
+        self.rect = Some(rect);
+        Ok(())
+    }
+
+    /// The size the framebuffer was allocated for, once it exists.
+    pub fn framebuffer_allocation(&self) -> Option<Rect> {
+        self.allocation
+    }
+
+    /// Whether a framebuffer that size can be backed. The probe allocation is
+    /// released right here; the device never learns about it.
+    fn can_back(&self, allocation: Rect) -> bool {
+        framebuffer_size(allocation.width, allocation.height)
+            .is_ok_and(|size| Dma::<H>::new(size as usize, BufferDirection::DriverToDevice).is_ok())
+    }
+
+    /// Allocates a framebuffer of `allocation` and scans out `visible` of it.
+    fn create_framebuffer(&mut self, allocation: Rect, visible: Rect) -> Result<&mut [u8], Error> {
+        let size = framebuffer_size(allocation.width, allocation.height)?;
 
         // Stop any existing framebuffer before touching the device again. The
         // teardown keeps the old DMA in `self.frame_buffer_dma` on failure so
@@ -223,7 +281,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
 
         // Create the resource. If this fails the DMA drops here (the device has
         // never seen it) and there is nothing to roll back.
-        self.resource_create_2d(FRAMEBUFFER_RESOURCE_ID, width, height)?;
+        self.resource_create_2d(FRAMEBUFFER_RESOURCE_ID, allocation.width, allocation.height)?;
 
         // SAFETY: `frame_buffer_dma` owns a live, zeroed, at least `size` byte
         // DMA region (the allocation is rounded up to whole pages). On the
@@ -247,7 +305,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         // unref. Only a confirmed detach lets the DMA be released; otherwise it
         // is kept in `self.frame_buffer_dma` so a later retry, or the `Drop`
         // device reset, can release it once the device is known to be done.
-        if let Err(err) = self.set_scanout(rect, SCANOUT_ID, FRAMEBUFFER_RESOURCE_ID) {
+        if let Err(err) = self.set_scanout(visible, SCANOUT_ID, FRAMEBUFFER_RESOURCE_ID) {
             let detached = self
                 .resource_detach_backing(FRAMEBUFFER_RESOURCE_ID)
                 .is_ok();
@@ -267,7 +325,8 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         let buffer: &mut [u8] = unsafe { raw.as_mut() };
 
         self.frame_buffer_dma = Some(frame_buffer_dma);
-        self.rect = Some(rect);
+        self.rect = Some(visible);
+        self.allocation = Some(allocation);
         Ok(buffer)
     }
 
@@ -284,6 +343,7 @@ impl<H: Hal, T: Transport> VirtIoGpu<H, T> {
         // The scanout is stopped, so any previously published framebuffer is
         // no longer live.
         self.rect = None;
+        self.allocation = None;
         self.resource_detach_backing(FRAMEBUFFER_RESOURCE_ID)?;
         self.resource_unref(FRAMEBUFFER_RESOURCE_ID)?;
         self.frame_buffer_dma = None;
@@ -898,6 +958,16 @@ impl<H: Hal, T: Transport> Drop for VirtIoGpu<H, T> {
 }
 
 /// Size in bytes of a `width * height` `B8G8R8A8_UNORM` framebuffer.
+/// The rectangle covering a whole `width` by `height` surface.
+const fn whole(width: u32, height: u32) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
+}
+
 fn framebuffer_size(width: u32, height: u32) -> Result<u32, Error> {
     width
         .checked_mul(height)

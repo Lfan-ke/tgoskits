@@ -139,8 +139,10 @@ impl DeviceOps for FrameBuffer {
             // FBIOGET_VSCREENINFO
             0x4600 => {
                 let info = ax_display::framebuffer_info();
-                let line_length = (info.fb_size / info.height as usize) as u32;
-                let bpp = line_length / info.width;
+                // Xrgb8888 throughout. The stride is not a way to work this
+                // out any more: it spans the framebuffer's own width, which a
+                // mode smaller than it does not fill.
+                let bpp = 4u32;
                 (arg as *mut VarScreenInfo)
                     .vm_write(
                         current,
@@ -214,7 +216,7 @@ impl DeviceOps for FrameBuffer {
                             ypanstep: 0,
                             ywrapstep: 0,
                             _padding0: 0,
-                            line_length: (info.fb_size / info.height as usize) as u32,
+                            line_length: info.line_length() as u32,
                             _padding1: 0,
                             mmio_start: 0,
                             mmio_len: 0,

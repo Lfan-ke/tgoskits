@@ -54,6 +54,28 @@ pub fn register_transport_with_info<T: Transport + 'static>(
     Ok(())
 }
 
+/// The largest display this driver allocates a framebuffer for.
+///
+/// The host can grow the display while the guest runs and the framebuffer
+/// cannot move underneath a mapping, so it is allocated for this size up
+/// front - 8 MiB at four bytes a pixel. A device that already advertises more
+/// at probe raises it rather than losing pixels.
+const MAX_SCANOUT: (u32, u32) = (1920, 1080);
+
+/// The framebuffer a mode scanning out of `allocation` describes.
+///
+/// Every mode shares one allocation, so the row stride follows the allocation
+/// and not the visible width; consumers copy row by row into it.
+fn display_info_for(allocation: (u32, u32), mode: (u32, u32), fb_size: usize) -> DisplayInfo {
+    DisplayInfo {
+        width: mode.0,
+        height: mode.1,
+        stride: allocation.0 as usize * 4,
+        format: PixelFormat::Xrgb8888,
+        fb_size,
+    }
+}
+
 struct VirtIoDisplay<T: Transport + 'static> {
     raw: VirtIoGpu<VirtIoHalImpl, T>,
     info: DisplayInfo,
@@ -68,17 +90,18 @@ unsafe impl<T: Transport + 'static> Send for VirtIoDisplay<T> {}
 impl<T: Transport + 'static> VirtIoDisplay<T> {
     fn new(transport: T, irq_num: Option<usize>) -> Result<Self, virtio_gpu::Error> {
         let mut raw = VirtIoGpu::new(transport)?;
-        let framebuffer = raw.setup_framebuffer()?;
+        let framebuffer = raw.setup_framebuffer_up_to(MAX_SCANOUT.0, MAX_SCANOUT.1)?;
         let fb_base = framebuffer.as_mut_ptr();
         let fb_size = framebuffer.len();
+        let allocation = raw
+            .framebuffer_allocation()
+            .ok_or(virtio_gpu::Error::NotReady)?;
         let (width, height) = raw.resolution()?;
-        let info = DisplayInfo {
-            width,
-            height,
-            stride: width as usize * 4,
-            format: PixelFormat::Xrgb8888,
+        let info = display_info_for(
+            (allocation.width, allocation.height),
+            (width, height),
             fb_size,
-        };
+        );
         let _ = raw.ack_interrupt();
         Ok(Self {
             raw,
@@ -126,19 +149,20 @@ impl<T: Transport + 'static> rdif_display::Interface for VirtIoDisplay<T> {
 
     fn refresh_info(&mut self) -> Result<DisplayInfo, DisplayError> {
         let (width, height) = self.raw.resolution().map_err(map_display_err)?;
-        let stride = width as usize * 4;
-        // The framebuffer was allocated for the size the device reported at
-        // probe, so a larger mode has nowhere to land; reporting the old one is
-        // the only answer that cannot scan out past that allocation.
-        if stride.saturating_mul(height as usize) <= self.info.fb_size {
-            self.info.width = width;
-            self.info.height = height;
-            self.info.stride = stride;
-        } else {
-            log::warn!(
-                "virtio-gpu offers {width}x{height}, past the {} byte framebuffer",
-                self.info.fb_size
-            );
+        if (width, height) == (self.info.width, self.info.height) {
+            return Ok(self.info);
+        }
+        // A mode past the allocation is not taken: the framebuffer cannot move
+        // while anything maps it, so the old mode stays on screen.
+        match self.raw.set_framebuffer_size(width, height) {
+            Ok(()) => {
+                self.info.width = width;
+                self.info.height = height;
+            }
+            Err(err) => log::warn!(
+                "virtio-gpu offers {width}x{height}, which the framebuffer cannot scan out: \
+                 {err:?}"
+            ),
         }
         Ok(self.info)
     }
@@ -450,6 +474,15 @@ fn map_gpu3d_err(err: virtio_gpu::Error) -> DisplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mode_smaller_than_the_framebuffer_keeps_the_framebuffer_stride() {
+        let info = display_info_for((1920, 1080), (800, 600), 1920 * 1080 * 4);
+
+        assert_eq!((info.width, info.height), (800, 600));
+        assert_eq!(info.stride, 1920 * 4);
+        assert_eq!(info.fb_size, 1920 * 1080 * 4);
+    }
 
     #[test]
     fn display_irq_is_ignored_until_driver_enables_it() {
