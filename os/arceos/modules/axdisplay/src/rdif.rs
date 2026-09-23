@@ -7,8 +7,8 @@ use rdif_display::{
 };
 
 use crate::{
-    BlobMemory, CapsetInfo, DisplayDevice, DisplayError, DisplayInfo, Gpu3dErrorKind, PixelFormat,
-    ResourceCreate3d, ResourceCreateBlob, Transfer3d, TransferBox,
+    BlobMemory, CapsetInfo, DisplayDevice, DisplayError, DisplayInfo, DisplayIrq, Gpu3dErrorKind,
+    PixelFormat, ResourceCreate3d, ResourceCreateBlob, Transfer3d, TransferBox,
 };
 
 pub struct RdifDisplayDevice {
@@ -94,8 +94,17 @@ impl DisplayDevice for RdifDisplayDevice {
         self.device.is_irq_enabled()
     }
 
-    fn handle_irq(&mut self) -> bool {
-        self.device.handle_irq().handled
+    fn handle_irq(&mut self) -> DisplayIrq {
+        let event = self.device.handle_irq();
+        DisplayIrq {
+            handled: event.handled,
+            changed: event.changed,
+        }
+    }
+
+    fn refresh_info(&mut self) -> DisplayInfo {
+        let _ = self.device.refresh_info();
+        self.info()
     }
 
     // --- 2D resource / scanout forwarding ---

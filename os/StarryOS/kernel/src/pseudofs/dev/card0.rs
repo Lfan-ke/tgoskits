@@ -769,8 +769,13 @@ impl Card0 {
             return;
         };
 
+        super::drm_hotplug::start_worker();
         let request = ax_runtime::hal::irq::IrqRequest::new(|_| {
-            if ax_display::framebuffer_handle_irq() {
+            let irq = ax_display::framebuffer_handle_irq();
+            if irq.changed {
+                super::drm_hotplug::notify_display_changed();
+            }
+            if irq.handled {
                 ax_runtime::hal::irq::IrqReturn::Handled
             } else {
                 ax_runtime::hal::irq::IrqReturn::Unhandled

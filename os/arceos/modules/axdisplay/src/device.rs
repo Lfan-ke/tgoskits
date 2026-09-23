@@ -25,6 +25,15 @@ pub enum DisplayError {
     Gpu3dError(Gpu3dErrorKind),
 }
 
+/// What one display interrupt carried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisplayIrq {
+    /// The interrupt belonged to this device.
+    pub handled: bool,
+    /// The host changed the display configuration, so the cached size is stale.
+    pub changed: bool,
+}
+
 /// Domain boundary consumed by graphics modules and device files.
 pub trait DisplayDevice: Send {
     // --- 2D ---
@@ -51,8 +60,13 @@ pub trait DisplayDevice: Send {
         false
     }
 
-    fn handle_irq(&mut self) -> bool {
-        false
+    fn handle_irq(&mut self) -> DisplayIrq {
+        DisplayIrq::default()
+    }
+
+    /// Re-read the display configuration; runs in task context.
+    fn refresh_info(&mut self) -> DisplayInfo {
+        self.info()
     }
 
     // --- 2D resource / scanout primitives (default: unsupported) ---
@@ -228,8 +242,12 @@ impl DisplayDevice for ErasedDisplayDevice {
         self.inner.is_irq_enabled()
     }
 
-    fn handle_irq(&mut self) -> bool {
+    fn handle_irq(&mut self) -> DisplayIrq {
         self.inner.handle_irq()
+    }
+
+    fn refresh_info(&mut self) -> DisplayInfo {
+        self.inner.refresh_info()
     }
 
     fn set_scanout(

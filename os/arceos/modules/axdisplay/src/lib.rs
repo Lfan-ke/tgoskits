@@ -12,7 +12,9 @@ mod types;
 
 use ax_lazyinit::LazyInit;
 use ax_task::sync::RawSpinLock as Mutex;
-pub use device::{DisplayDevice, DisplayError, DisplayResult, ErasedDisplayDevice, Gpu3dErrorKind};
+pub use device::{
+    DisplayDevice, DisplayError, DisplayIrq, DisplayResult, ErasedDisplayDevice, Gpu3dErrorKind,
+};
 pub use types::{
     BlobMemory, CapsetInfo, DisplayInfo, PixelFormat, ResourceCreate3d, ResourceCreateBlob,
     Transfer3d, TransferBox,
@@ -68,9 +70,17 @@ pub fn framebuffer_disable_irq() {
 }
 
 /// Acknowledges the main display IRQ source.
-pub fn framebuffer_handle_irq() -> bool {
+pub fn framebuffer_handle_irq() -> DisplayIrq {
     let mut display = MAIN_DISPLAY.lock_irqsave();
-    display.is_irq_enabled() && display.handle_irq()
+    if !display.is_irq_enabled() {
+        return DisplayIrq::default();
+    }
+    display.handle_irq()
+}
+
+/// Re-reads the display configuration after the host changed it.
+pub fn framebuffer_refresh_info() -> DisplayInfo {
+    MAIN_DISPLAY.lock_irqsave().refresh_info()
 }
 
 // --- 3D API ---

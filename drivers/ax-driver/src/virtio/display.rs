@@ -124,6 +124,25 @@ impl<T: Transport + 'static> rdif_display::Interface for VirtIoDisplay<T> {
             .map_err(map_display_err)
     }
 
+    fn refresh_info(&mut self) -> Result<DisplayInfo, DisplayError> {
+        let (width, height) = self.raw.resolution().map_err(map_display_err)?;
+        let stride = width as usize * 4;
+        // The framebuffer was allocated for the size the device reported at
+        // probe, so a larger mode has nowhere to land; reporting the old one is
+        // the only answer that cannot scan out past that allocation.
+        if stride.saturating_mul(height as usize) <= self.info.fb_size {
+            self.info.width = width;
+            self.info.height = height;
+            self.info.stride = stride;
+        } else {
+            log::warn!(
+                "virtio-gpu offers {width}x{height}, past the {} byte framebuffer",
+                self.info.fb_size
+            );
+        }
+        Ok(self.info)
+    }
+
     fn enable_irq(&mut self) {
         self.irq_enabled = true;
     }

@@ -42,6 +42,15 @@ pub trait Interface: DriverGeneric {
         Ok(())
     }
 
+    /// Re-read the display configuration the host advertises now.
+    ///
+    /// The host can resize the display while the guest runs, which leaves the
+    /// size read at probe stale. The query travels the device's control queue,
+    /// so callers run it in task context rather than from an interrupt.
+    fn refresh_info(&mut self) -> Result<DisplayInfo, DisplayError> {
+        Ok(self.info())
+    }
+
     fn enable_irq(&mut self) {}
 
     fn disable_irq(&mut self) {}

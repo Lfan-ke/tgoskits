@@ -2,6 +2,7 @@
 
 mod axivc;
 pub(crate) mod card0;
+mod drm_hotplug;
 #[cfg(feature = "rknpu")]
 pub(crate) mod card1;
 // The real contiguous coherent dma-heap is shared by every accelerator that
