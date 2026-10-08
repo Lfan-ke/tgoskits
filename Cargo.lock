@@ -733,6 +733,7 @@ dependencies = [
  "ax-binfmt",
  "ax-crate-interface",
  "ax-dispatch",
+ "ax-sync",
 ]
 
 [[package]]
