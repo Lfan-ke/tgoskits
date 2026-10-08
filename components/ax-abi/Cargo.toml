@@ -50,3 +50,8 @@ auto-dispatch = []
 # Cross-cutting compatibility shims.
 driver-compat = ["dep:ax-abi-driver"]
 path-compat = ["dep:ax-abi-path"]
+
+[dev-dependencies]
+# The Windows package takes its locks from ax-sync, whose lock operations a
+# kernel provides; a host test links the stand-in that feature supplies.
+ax-sync = { path = "../../os/arceos/modules/axsync", features = ["host-test"] }
