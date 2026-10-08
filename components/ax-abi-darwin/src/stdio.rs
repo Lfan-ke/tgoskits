@@ -1,8 +1,12 @@
 //! The `FILE` family.
 //!
-//! A `FILE` here is four words in the program's own memory: the descriptor it
+//! A `FILE` here is a few words in the program's own memory: the descriptor it
 //! stands for and the two flags C asks a stream to remember, whether it has
-//! reached the end and whether something went wrong. The three a program
+//! reached the end and whether something went wrong. Its first words are laid
+//! out as Darwin's own `FILE` is, because `<stdio.h>` reads them inline:
+//! `getc_unlocked` is a macro that takes a byte from `_p` while `_r` says the
+//! buffer has one, and calls `__srget` when it does not. Here `_r` stays at
+//! zero, so the macro always calls. The three streams a program
 //! starts with sit in the synthesized library's private area, and
 //! `__stdinp`, `__stdoutp` and `__stderrp` are filled in with their addresses
 //! at load, which is what makes `stdout` a usable pointer from the first
@@ -19,16 +23,20 @@ use ax_abi_port::{Host, SysResult};
 use crate::system::{Library, PRIVATE_STREAMS};
 
 /// How much room one stream takes.
-pub const FILE_LEN: u64 = 16;
-/// Its descriptor, then the two things C asks it to remember.
-const FD: u64 = 0;
-const FLAGS: u64 = 4;
-/// A word of its own the stream lends to a caller that has a byte to write
-/// and nowhere in its own memory to write it from.
-const SPARE: u64 = 8;
-/// `feof` and `ferror` in one word.
-const EOF_SEEN: u32 = 1;
-const ERROR_SEEN: u32 = 2;
+pub const FILE_LEN: u64 = 40;
+/// Darwin's `_r`: how many buffered bytes are left to read, which is none.
+const BUFFERED: u64 = 8;
+/// Darwin's `_flags` and `_file`, where its own macros expect them.
+const FLAGS: u64 = 16;
+const FD: u64 = 18;
+/// A word of its own the stream lends to a caller that has a byte to move
+/// and nowhere in its own memory to move it through.
+const SPARE: u64 = 24;
+/// The byte `ungetc` put back, or -1.
+const UNGOT: u64 = 32;
+/// `feof` and `ferror`, as Darwin's `__SEOF` and `__SERR`.
+const EOF_SEEN: u32 = 0x20;
+const ERROR_SEEN: u32 = 0x40;
 
 /// `EOF`, which every one of these reports failure with.
 const EOF: isize = -1;
@@ -47,11 +55,142 @@ pub fn standard(at: &Library, which: u64) -> u64 {
 /// The three streams as they start out, for the loader to place.
 pub fn initial() -> alloc::vec::Vec<u8> {
     let mut out = alloc::vec![0u8; 3 * FILE_LEN as usize];
-    for fd in 0..3u32 {
-        let at = fd as usize * FILE_LEN as usize;
-        out[at..at + 4].copy_from_slice(&fd.to_le_bytes());
+    for fd in 0..3usize {
+        let at = fd * FILE_LEN as usize;
+        out[at..at + FILE_LEN as usize].copy_from_slice(&blank(fd as i32));
     }
     out
+}
+
+/// A stream over `fd` with nothing remembered.
+fn blank(fd: i32) -> [u8; FILE_LEN as usize] {
+    let mut out = [0u8; FILE_LEN as usize];
+    out[FD as usize..FD as usize + 2].copy_from_slice(&(fd as i16).to_le_bytes());
+    out[UNGOT as usize..UNGOT as usize + 4].copy_from_slice(&(-1i32).to_le_bytes());
+    out
+}
+
+/// Write bytes that are not in the program's memory to `file`. A write names
+/// memory the program owns, so they go through a block borrowed from its heap.
+pub fn emit(host: &dyn Host, at: &Library, file: usize, text: &[u8]) -> SysResult {
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let scratch = crate::heap::malloc(host, at, text.len())? as usize;
+    host.platform().write_user(scratch, text)?;
+    let wrote = write(host, file, scratch, text.len());
+    crate::heap::free(host, at, scratch)?;
+    match wrote {
+        Ok(wrote) => Ok(wrote as isize),
+        Err(_) => Ok(EOF),
+    }
+}
+
+/// One byte from `file`, or `None` at the end.
+fn take(host: &dyn Host, file: usize) -> Result<Option<u8>, i32> {
+    let mut ungot = [0u8; 4];
+    host.platform()
+        .read_user(file + UNGOT as usize, &mut ungot)?;
+    let ungot = i32::from_le_bytes(ungot);
+    if ungot >= 0 {
+        host.platform()
+            .write_user(file + UNGOT as usize, &(-1i32).to_le_bytes())?;
+        return Ok(Some(ungot as u8));
+    }
+    let fd = descriptor(host, file)?;
+    let scratch = file + SPARE as usize;
+    match host.files().ok_or(EBADF)?.read(fd, scratch, 1) {
+        Ok(0) => {
+            mark(host, file, EOF_SEEN)?;
+            Ok(None)
+        }
+        Ok(_) => {
+            let mut byte = [0u8; 1];
+            host.platform().read_user(scratch, &mut byte)?;
+            Ok(Some(byte[0]))
+        }
+        Err(errno) => {
+            mark(host, file, ERROR_SEEN)?;
+            Err(errno)
+        }
+    }
+}
+
+/// `getc(file)`, and `__srget(file)`, which is what the `getc_unlocked` macro
+/// calls once it has counted `_r` below zero. The count is put back so the
+/// next use of the macro calls again.
+pub fn getc(host: &dyn Host, file: usize) -> SysResult {
+    host.platform()
+        .write_user(file + BUFFERED as usize, &0i32.to_le_bytes())?;
+    Ok(take(host, file).ok().flatten().map_or(EOF, isize::from))
+}
+
+/// `ungetc(c, file)`: one byte of pushback, which is all C promises.
+pub fn ungetc(host: &dyn Host, byte: usize, file: usize) -> SysResult {
+    if byte as i32 == -1 {
+        return Ok(EOF);
+    }
+    host.platform()
+        .write_user(file + UNGOT as usize, &(byte as u8 as i32).to_le_bytes())?;
+    let now = flags(host, file)? & !EOF_SEEN;
+    host.platform()
+        .write_user(file + FLAGS as usize, &(now as u16).to_le_bytes())?;
+    Ok(isize::from(byte as u8))
+}
+
+/// `fgets(buf, size, file)`: a line with its newline, or what there was before
+/// the end. Null when nothing was read at all.
+pub fn fgets(host: &dyn Host, buf: usize, size: usize, file: usize) -> SysResult {
+    if size == 0 {
+        return Ok(0);
+    }
+    let mut line = alloc::vec::Vec::new();
+    while line.len() + 1 < size {
+        match take(host, file) {
+            Ok(Some(byte)) => {
+                line.push(byte);
+                if byte == b'\n' {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return Ok(0),
+        }
+    }
+    if line.is_empty() {
+        return Ok(0);
+    }
+    line.push(0);
+    host.platform().write_user(buf, &line)?;
+    Ok(buf as isize)
+}
+
+/// `fseek(file, offset, whence)`. What `ungetc` put back is forgotten, as C
+/// says a reposition does.
+pub fn fseek(host: &dyn Host, file: usize, offset: isize, whence: usize) -> SysResult {
+    let to = match whence {
+        0 if offset < 0 => return Err(EINVAL),
+        0 => ax_abi_port::SeekFrom::Start(offset as u64),
+        1 => ax_abi_port::SeekFrom::Current(offset as i64),
+        2 => ax_abi_port::SeekFrom::End(offset as i64),
+        _ => return Err(EINVAL),
+    };
+    let fd = descriptor(host, file)?;
+    host.files().ok_or(EBADF)?.seek(fd, to)?;
+    host.platform()
+        .write_user(file + UNGOT as usize, &(-1i32).to_le_bytes())?;
+    let now = flags(host, file)? & !EOF_SEEN;
+    host.platform()
+        .write_user(file + FLAGS as usize, &(now as u16).to_le_bytes())?;
+    Ok(0)
+}
+
+/// `ftell(file)`.
+pub fn ftell(host: &dyn Host, file: usize) -> SysResult {
+    let fd = descriptor(host, file)?;
+    host.files()
+        .ok_or(EBADF)?
+        .seek(fd, ax_abi_port::SeekFrom::Current(0))
 }
 
 /// Write `len` bytes at `uaddr` to `file`'s descriptor, reporting how many
@@ -155,13 +294,14 @@ pub fn fileno(host: &dyn Host, file: usize) -> SysResult {
 
 /// `feof(file)` and `ferror(file)`.
 pub fn status(host: &dyn Host, file: usize, which: u32) -> SysResult {
-    Ok(isize::from(flags(host, file)? & which != 0))
+    let bit = if which == 1 { EOF_SEEN } else { ERROR_SEEN };
+    Ok(isize::from(flags(host, file)? & bit != 0))
 }
 
 /// `clearerr(file)`: both flags go.
 pub fn clearerr(host: &dyn Host, file: usize) -> SysResult {
     host.platform()
-        .write_user((file as u64 + FLAGS) as usize, &0u32.to_le_bytes())?;
+        .write_user((file as u64 + FLAGS) as usize, &0u16.to_le_bytes())?;
     Ok(0)
 }
 
@@ -176,22 +316,22 @@ fn descriptor(host: &dyn Host, file: usize) -> Result<i32, i32> {
     if file == 0 {
         return Err(EBADF);
     }
-    let mut word = [0u8; 4];
+    let mut word = [0u8; 2];
     host.platform().read_user(file + FD as usize, &mut word)?;
-    Ok(i32::from_le_bytes(word))
+    Ok(i32::from(i16::from_le_bytes(word)))
 }
 
 fn flags(host: &dyn Host, file: usize) -> Result<u32, i32> {
-    let mut word = [0u8; 4];
+    let mut word = [0u8; 2];
     host.platform()
         .read_user(file + FLAGS as usize, &mut word)?;
-    Ok(u32::from_le_bytes(word))
+    Ok(u32::from(u16::from_le_bytes(word)))
 }
 
 fn mark(host: &dyn Host, file: usize, which: u32) -> Result<(), i32> {
     let now = flags(host, file)? | which;
     host.platform()
-        .write_user(file + FLAGS as usize, &now.to_le_bytes())?;
+        .write_user(file + FLAGS as usize, &(now as u16).to_le_bytes())?;
     Ok(())
 }
 
@@ -274,7 +414,8 @@ mod tests {
         let (host, at) = ready();
         let file = standard(&at, 1) as usize;
         // A stream over a descriptor the host will not take.
-        host.write_user(file, &(-1i32).to_le_bytes()).unwrap();
+        host.write_user(file + FD as usize, &(-1i16).to_le_bytes())
+            .unwrap();
         host.write_user(0x200, b"x").unwrap();
         assert_eq!(fwrite(&host, &[0x200, 1, 1, file, 0, 0]).unwrap(), 0);
         assert_eq!(status(&host, file, 2).unwrap(), 1, "ferror says so");
@@ -334,9 +475,7 @@ pub fn fdopen(host: &dyn Host, at: &Library, fd: i32) -> SysResult {
     if file == 0 {
         return Err(ENOMEM);
     }
-    host.platform()
-        .write_user(file, &[0u8; FILE_LEN as usize])?;
-    host.platform().write_user(file, &fd.to_le_bytes())?;
+    host.platform().write_user(file, &blank(fd))?;
     Ok(file as isize)
 }
 

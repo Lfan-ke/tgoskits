@@ -8,16 +8,20 @@
 //! about a process's heap is kept here, so a second process has a second heap
 //! by construction and an `exec` forgets the first one for free.
 //!
-//! It is a first-fit free list over runs taken from the memory port, which is
-//! what a small allocator is before anyone measures it. Three things it does
-//! not do, all worth doing once a program runs long enough to care: runs are
-//! never given back, neighbouring free blocks are never merged, and what is
-//! left of a run when a request outgrows it is abandoned rather than put on
-//! the list.
+//! Free blocks are kept in lists by size, over runs taken from the memory
+//! port. One list walked from the front is what this was first, and an
+//! interpreter compiling its own library showed what that costs: every
+//! request read its way past every block too small for it, each read a
+//! call into the host, and the list only grew. With a list per size a
+//! request reads the list heads once and takes the first block that fits.
+//!
+//! Three things it still does not do: runs are never given back,
+//! neighbouring free blocks are never merged, and what is left of a run when
+//! a request outgrows it is abandoned rather than put on a list.
 
 use ax_abi_port::{Host, MapRequest, MapSource, Prot, SysResult};
 
-use crate::system::Library;
+use crate::system::{Library, PRIVATE_BINS};
 
 /// `ENOMEM`.
 const ENOMEM: i32 = 12;
@@ -32,11 +36,26 @@ const RUN: usize = 1 << 20;
 /// A block is only split when the remainder can hold a header and something.
 const SPLIT: usize = HEADER + ALIGN;
 
-/// Where the allocator keeps its three words, inside the library's private
-/// area: the free list, and the bounds of the run being carved up.
-const FREE_LIST: u64 = 0;
+/// Where the allocator keeps the bounds of the run being carved up, inside
+/// the library's private area.
 const NEXT: u64 = 8;
 const END: u64 = 16;
+
+/// Up to this size a list holds blocks of exactly one size, so whatever is
+/// on it fits.
+const EXACT: usize = 1024;
+/// How many lists there are: one per multiple of [`ALIGN`] up to [`EXACT`],
+/// then one per doubling.
+const BINS: usize = 96;
+
+/// Which list a block of `whole` bytes is kept on.
+fn bin_of(whole: usize) -> usize {
+    if whole <= EXACT {
+        return whole / ALIGN;
+    }
+    let doublings = (usize::BITS - (whole - 1).leading_zeros()) as usize - 10;
+    (EXACT / ALIGN + doublings).min(BINS - 1)
+}
 
 /// Hand back `len` bytes, or zero if there is no room.
 pub fn malloc(host: &dyn Host, at: &Library, len: usize) -> SysResult {
@@ -66,9 +85,10 @@ pub fn free(host: &dyn Host, at: &Library, addr: usize) -> SysResult {
         return Ok(0);
     }
     let block = addr - HEADER;
-    let head = word(host, at, FREE_LIST)?;
+    let list = PRIVATE_BINS + (bin_of(read_word(host, block as u64)? as usize) * 8) as u64;
+    let head = word(host, at, list)?;
     put(host, block as u64 + 8, head)?;
-    put_private(host, at, FREE_LIST, block as u64)?;
+    put_private(host, at, list, block as u64)?;
     Ok(0)
 }
 
@@ -102,29 +122,36 @@ pub fn realloc(host: &dyn Host, at: &Library, addr: usize, len: usize) -> SysRes
     Ok(moved as isize)
 }
 
-/// The first free block big enough, unlinked and split if there is enough
-/// left over to be worth a header.
+/// A free block big enough, unlinked and split if there is enough left over
+/// to be worth a header: the head of the smallest list that can hold one.
 fn take_free(host: &dyn Host, at: &Library, want: usize) -> Result<Option<usize>, i32> {
-    let mut previous: Option<u64> = None;
-    let mut block = word(host, at, FREE_LIST)?;
-    while block != 0 {
-        let whole = read_word(host, block)? as usize;
-        let next = read_word(host, block + 8)?;
-        if whole >= want {
-            match previous {
-                Some(before) => put(host, before + 8, next)?,
-                None => put_private(host, at, FREE_LIST, next)?,
-            }
-            if whole - want >= SPLIT {
-                let rest = block + want as u64;
-                put(host, rest, (whole - want) as u64)?;
-                put(host, block, want as u64)?;
-                free(host, at, rest as usize + HEADER)?;
-            }
-            return Ok(Some(block as usize + HEADER));
+    let mut heads = [0u8; BINS * 8];
+    host.platform()
+        .read_user((at.private() + PRIVATE_BINS) as usize, &mut heads)?;
+    let first = bin_of(want);
+    for bin in first..BINS {
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&heads[bin * 8..bin * 8 + 8]);
+        let block = u64::from_le_bytes(head);
+        if block == 0 {
+            continue;
         }
-        previous = Some(block);
-        block = next;
+        let whole = read_word(host, block)? as usize;
+        // A list past the exact ones holds a range of sizes, and only its
+        // head is looked at; one that is too small sends the request on
+        // to the next list, where everything is big enough.
+        if whole < want {
+            continue;
+        }
+        let next = read_word(host, block + 8)?;
+        put_private(host, at, PRIVATE_BINS + (bin * 8) as u64, next)?;
+        if whole - want >= SPLIT {
+            let rest = block + want as u64;
+            put(host, rest, (whole - want) as u64)?;
+            put(host, block, want as u64)?;
+            free(host, at, rest as usize + HEADER)?;
+        }
+        return Ok(Some(block as usize + HEADER));
     }
     Ok(None)
 }
@@ -179,7 +206,7 @@ fn put(host: &dyn Host, addr: u64, value: u64) -> Result<(), i32> {
 /// Fill `len` bytes at `addr` with zeroes, a chunk at a time so a large
 /// request does not want a buffer its own size.
 fn zero(host: &dyn Host, addr: usize, len: usize) -> Result<(), i32> {
-    let empty = [0u8; 256];
+    let empty = [0u8; 4096];
     let mut done = 0;
     while done < len {
         let step = empty.len().min(len - done);
@@ -191,7 +218,7 @@ fn zero(host: &dyn Host, addr: usize, len: usize) -> Result<(), i32> {
 
 /// Move `len` bytes from `from` to `to`, likewise.
 fn copy(host: &dyn Host, to: usize, from: usize, len: usize) -> Result<(), i32> {
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 4096];
     let mut done = 0;
     while done < len {
         let step = buf.len().min(len - done);
@@ -258,6 +285,36 @@ mod tests {
             rest > small && rest < small + 512,
             "{rest:#x} came from the tail"
         );
+    }
+
+    #[test]
+    fn a_request_does_not_read_past_blocks_too_small_for_it() {
+        let (host, at) = ready();
+        // A thousand small free blocks, then one request they cannot serve.
+        let small: alloc::vec::Vec<usize> = (0..1000)
+            .map(|_| malloc(&host, &at, 16).unwrap() as usize)
+            .collect();
+        for block in small {
+            free(&host, &at, block).unwrap();
+        }
+        let before = host.reads.get();
+        let big = malloc(&host, &at, 4000).unwrap() as usize;
+        assert_ne!(big, 0);
+        assert!(
+            host.reads.get() - before < 8,
+            "{} reads for one request",
+            host.reads.get() - before
+        );
+    }
+
+    #[test]
+    fn a_block_goes_on_the_list_its_size_names() {
+        assert_eq!(bin_of(32), 2);
+        assert_eq!(bin_of(EXACT), EXACT / ALIGN);
+        assert_eq!(bin_of(EXACT + ALIGN), EXACT / ALIGN + 1);
+        assert_eq!(bin_of(2048), EXACT / ALIGN + 1);
+        assert_eq!(bin_of(2064), EXACT / ALIGN + 2);
+        assert_eq!(bin_of(usize::MAX / 2), BINS - 1);
     }
 
     #[test]

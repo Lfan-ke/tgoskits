@@ -19,7 +19,7 @@ pub const DARWIN_BASE: u32 = 0x0F00_0000;
 /// handful of entries that are pure computation carry their own code instead
 /// and the longest of those is thirty-nine, so this is what keeps every entry
 /// at an address its index alone can name.
-pub const STUB_LEN: usize = 48;
+pub const STUB_LEN: usize = 64;
 
 /// What a variable's slot is aligned and rounded to, so one slot's size never
 /// decides the next one's alignment.
@@ -28,14 +28,46 @@ const SLOT_ALIGN: u64 = 16;
 /// How much room past the variables this layer keeps for itself - the
 /// allocator's three words, the path the program was run by, the three
 /// standard streams, and whatever comes after.
-pub const PRIVATE_LEN: u64 = 256;
+pub const PRIVATE_LEN: u64 = 4096;
 
 /// Where the program's own path is, inside the private area. What is kept is
 /// the address of the string on the stack, not a copy of it.
 pub const PRIVATE_EXEC_PATH: u64 = 24;
 
 /// Where the three streams every program starts with are, one after another.
-pub const PRIVATE_STREAMS: u64 = 32;
+pub const PRIVATE_STREAMS: u64 = 128;
+
+/// The next thread-specific key `pthread_key_create` hands out.
+pub const PRIVATE_NEXT_KEY: u64 = 248;
+
+/// Whether `dlerror` has a message to hand back, and the message.
+pub const PRIVATE_DL_ERROR: u64 = 256;
+pub const PRIVATE_DL_TEXT: u64 = 1280;
+
+/// Where the table of loaded images is, and how many it holds.
+pub const PRIVATE_MODULES_AT: u64 = 264;
+pub const PRIVATE_MODULES: u64 = 272;
+
+/// The few strings entry points answer with a pointer to: the locale's
+/// name, its character set, the time zone's name, and the empty string.
+pub const PRIVATE_TEXT_C: u64 = 320;
+pub const PRIVATE_TEXT_UTF8: u64 = 328;
+pub const PRIVATE_TEXT_UTC: u64 = 336;
+pub const PRIVATE_TEXT_EMPTY: u64 = 344;
+
+/// What `sigaction` was last told for each signal, sixteen bytes a signal.
+/// Signal 0 does not exist, so its slot holds this layer's own note.
+pub const PRIVATE_SIGNALS: u64 = 512;
+
+/// The buffer `strerror` answers out of.
+pub const PRIVATE_STRERROR: u64 = 1024;
+
+/// The allocator's free lists, one word a list.
+pub const PRIVATE_BINS: u64 = 2048;
+
+/// What `atexit` was given: how many, then the functions themselves.
+pub const PRIVATE_ATEXIT: u64 = 1536;
+pub const ATEXIT_LIMIT: u64 = 32;
 
 /// How many entries the environment's array has room for, once this layer has
 /// taken it over. Zero means it is still the run the kernel left on the stack,
@@ -67,6 +99,7 @@ pub const TABLE: &[Entry] = &[
     text("__NSGetExecutablePath"),
     text("____chkstk_darwin"),
     text("___bzero"),
+    text("___darwin_check_fd_set_overflow"),
     text("___error"),
     text("___maskrune"),
     text("___memcpy_chk"),
@@ -80,8 +113,10 @@ pub const TABLE: &[Entry] = &[
     data("___stderrp", 0x8),
     data("___stdinp", 0x8),
     data("___stdoutp", 0x8),
+    text("___strcat_chk"),
     text("___strcpy_chk"),
     text("___strlcat_chk"),
+    text("___strncat_chk"),
     text("___tolower"),
     text("___toupper"),
     text("__availability_version_check"),
@@ -91,12 +126,20 @@ pub const TABLE: &[Entry] = &[
     text("__tlv_bootstrap"),
     text("_abort"),
     text("_access"),
+    text("_acos"),
+    text("_acosh"),
     text("_alarm"),
+    text("_aligned_alloc"),
+    text("_asin"),
+    text("_asinh"),
+    text("_atan"),
     text("_atan2"),
+    text("_atanh"),
     text("_atexit"),
     text("_backtrace"),
     text("_btowc"),
     text("_calloc"),
+    text("_cbrt"),
     text("_chdir"),
     text("_chflags"),
     text("_chmod"),
@@ -110,20 +153,30 @@ pub const TABLE: &[Entry] = &[
     text("_close"),
     text("_closedir"),
     text("_confstr"),
+    text("_copysign"),
+    text("_cos"),
+    text("_cosh"),
+    text("_crc32"),
     text("_ctermid_r"),
+    text("_dirfd"),
     text("_dispatch_once_f"),
     text("_dladdr"),
     text("_dlerror"),
     text("_dlopen"),
     text("_dlsym"),
+    text("_dup"),
     text("_dup2"),
     text("_endpwent"),
     data("_environ", 0x8),
+    text("_erf"),
+    text("_erfc"),
     text("_err"),
     text("_execv"),
     text("_execve"),
     text("_exit"),
     text("_exp"),
+    text("_exp2"),
+    text("_expm1"),
     text("_faccessat"),
     text("_fchdir"),
     text("_fchmod"),
@@ -140,7 +193,9 @@ pub const TABLE: &[Entry] = &[
     text("_fflush"),
     text("_fgets"),
     text("_fileno"),
+    text("_flock"),
     text("_flockfile"),
+    text("_fma"),
     text("_fmod"),
     text("_fopen"),
     text("_fopen$DARWIN_EXTSN"),
@@ -187,6 +242,7 @@ pub const TABLE: &[Entry] = &[
     text("_getrlimit"),
     text("_getrusage"),
     text("_getsid"),
+    text("_gettimeofday"),
     text("_getuid"),
     text("_gmtime_r"),
     text("_grantpt"),
@@ -194,8 +250,10 @@ pub const TABLE: &[Entry] = &[
     text("_initgroups"),
     text("_ioctl"),
     text("_isatty"),
+    text("_kevent"),
     text("_kill"),
     text("_killpg"),
+    text("_kqueue"),
     text("_lchflags"),
     text("_lchmod"),
     text("_lchown"),
@@ -205,6 +263,9 @@ pub const TABLE: &[Entry] = &[
     text("_localtime_r"),
     text("_lockf"),
     text("_log"),
+    text("_log10"),
+    text("_log1p"),
+    text("_log2"),
     text("_login_tty"),
     text("_lseek"),
     text("_lstat$INODE64"),
@@ -224,6 +285,7 @@ pub const TABLE: &[Entry] = &[
     text("_memmove"),
     text("_memset"),
     text("_memset_pattern16"),
+    text("_memset_s"),
     text("_mkdir"),
     text("_mkdirat"),
     text("_mkfifo"),
@@ -234,8 +296,10 @@ pub const TABLE: &[Entry] = &[
     text("_mmap"),
     text("_modf"),
     text("_mprotect"),
+    text("_msync"),
     text("_munmap"),
     text("_nanosleep"),
+    text("_nextafter"),
     text("_nice"),
     text("_nl_langinfo"),
     text("_open"),
@@ -247,6 +311,7 @@ pub const TABLE: &[Entry] = &[
     text("_pause"),
     text("_perror"),
     text("_pipe"),
+    text("_poll"),
     text("_posix_openpt"),
     text("_posix_spawn"),
     text("_posix_spawn_file_actions_addclose"),
@@ -319,6 +384,7 @@ pub const TABLE: &[Entry] = &[
     text("_sched_get_priority_max"),
     text("_sched_get_priority_min"),
     text("_sched_yield"),
+    text("_select$DARWIN_EXTSN"),
     text("_sendfile"),
     text("_setegid"),
     text("_setenv"),
@@ -341,8 +407,11 @@ pub const TABLE: &[Entry] = &[
     text("_sigaltstack"),
     text("_sigpending"),
     text("_sigwait"),
+    text("_sin"),
+    text("_sinh"),
     text("_snprintf"),
     text("_sprintf"),
+    text("_sqrt"),
     text("_sscanf"),
     text("_stat$INODE64"),
     text("_statfs$INODE64"),
@@ -361,6 +430,7 @@ pub const TABLE: &[Entry] = &[
     text("_strsignal"),
     text("_strstr"),
     text("_strtol"),
+    text("_strtoll"),
     text("_strtoul"),
     text("_symlink"),
     text("_symlinkat"),
@@ -368,6 +438,8 @@ pub const TABLE: &[Entry] = &[
     text("_sysconf"),
     text("_sysctlbyname"),
     text("_system"),
+    text("_tan"),
+    text("_tanh"),
     text("_task_for_pid"),
     text("_task_info"),
     text("_task_threads"),
@@ -498,9 +570,10 @@ impl Library {
                 continue;
             }
             let call = DarwinCall(index as u32);
-            match body(call) {
-                Some(code) => out[at..at + code.len()].copy_from_slice(code),
-                None => out[at..at + STUB_LEN].copy_from_slice(&stub(call)),
+            match (built(call), body(call)) {
+                (Some(code), _) => out[at..at + code.len()].copy_from_slice(&code),
+                (None, Some(code)) => out[at..at + code.len()].copy_from_slice(code),
+                (None, None) => out[at..at + STUB_LEN].copy_from_slice(&stub(call)),
             }
             at += STUB_LEN;
         }
@@ -518,6 +591,31 @@ impl Library {
 /// what the ABI lets it.
 pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
     Some(match call.name() {
+        // A thread-local variable is reached through a descriptor of three
+        // words: a function, where the thread's storage is, and the
+        // variable's offset in it. The loader fills in the second; this is
+        // the first, and it preserves every register but the one it
+        // answers in, as the callers assume.
+        "__tlv_bootstrap" => &[
+            0x48, 0x8B, 0x47, 0x08, // mov 8(%rdi),%rax
+            0x48, 0x03, 0x47, 0x10, // add 16(%rdi),%rax
+            0xC3,
+        ],
+        // Calling the caller's function is something only code on the
+        // caller's side can do, so this cannot be a trap.
+        "_dispatch_once_f" => &[
+            0x48, 0x83, 0x3F, 0x00, // cmpq $0,(%rdi)
+            0x75, 0x0C, // jne done
+            0x48, 0xC7, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, // movq $-1,(%rdi)
+            0x48, 0x89, 0xF7, // mov %rsi,%rdi
+            0xFF, 0xE2, // jmp *%rdx
+            0xC3, // done: ret
+        ],
+        "_sqrt" => &[0xF2, 0x0F, 0x51, 0xC0, 0xC3], // sqrtsd %xmm0,%xmm0; ret
+        // No character above ASCII has a class in the C locale.
+        "___maskrune" => &[0x31, 0xC0, 0xC3],
+        // A thread's handle is the address of its own block.
+        "_pthread_self" => &[0x65, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xC3],
         // The ASCII case pair, which is what these are in the C locale.
         "___toupper" => &[
             0x89, 0xF8, // mov %edi,%eax
@@ -606,9 +704,9 @@ pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
             0xC3,
         ],
         // mov rax,rdi; mov rcx,rdx; rep movsb; ret
-        "_memcpy" => &[0x48, 0x89, 0xF8, 0x48, 0x89, 0xD1, 0xF3, 0xA4, 0xC3],
+        "_memcpy" | "___memcpy_chk" => &[0x48, 0x89, 0xF8, 0x48, 0x89, 0xD1, 0xF3, 0xA4, 0xC3],
         // As memcpy, but copying downwards when the two overlap the wrong way.
-        "_memmove" => &[
+        "_memmove" | "___memmove_chk" => &[
             0x48, 0x89, 0xF8, // mov rax,rdi
             0x48, 0x89, 0xD1, // mov rcx,rdx
             0x48, 0x39, 0xF7, // cmp rdi,rsi
@@ -622,7 +720,7 @@ pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
             0xF3, 0xA4, 0xC3, // forwards: rep movsb; ret
         ],
         // mov r8,rdi; mov eax,esi; mov rcx,rdx; rep stosb; mov rax,r8; ret
-        "_memset" => &[
+        "_memset" | "___memset_chk" => &[
             0x49, 0x89, 0xF8, 0x89, 0xF0, 0x48, 0x89, 0xD1, 0xF3, 0xAA, 0x4C, 0x89, 0xC0, 0xC3,
         ],
         // mov rcx,rsi; xor eax,eax; rep stosb; ret
@@ -715,7 +813,7 @@ pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
             0x75, 0xE4, // jne back - not the end, keep going
             0xC3, // done: ret
         ],
-        "_strcpy" => &[
+        "_strcpy" | "___strcpy_chk" => &[
             0x48, 0x89, 0xF8, // mov %rdi,%rax
             0x0F, 0xB6, 0x0E, // movzbl (%rsi),%ecx
             0x88, 0x0F, // mov %cl,(%rdi)
@@ -854,6 +952,105 @@ pub fn body(call: DarwinCall) -> Option<&'static [u8]> {
     })
 }
 
+/// The entries whose code names something only known once the table is laid
+/// out: their own trap number, or where this library keeps its words.
+pub fn built(call: DarwinCall) -> Option<alloc::vec::Vec<u8>> {
+    use crate::math::Shape;
+    const FIRST: [u8; 5] = [0x66, 0x48, 0x0F, 0x7E, 0xC7]; // movq %xmm0,%rdi
+    const SECOND: [u8; 5] = [0x66, 0x48, 0x0F, 0x7E, 0xCE]; // movq %xmm1,%rsi
+    const THIRD: [u8; 5] = [0x66, 0x48, 0x0F, 0x7E, 0xD2]; // movq %xmm2,%rdx
+    const ANSWER: [u8; 6] = [0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xC3]; // movq %rax,%xmm0; ret
+    let nr = call.nr().to_le_bytes();
+    let trap = [0xB8, nr[0], nr[1], nr[2], nr[3], 0x0F, 0x05]; // mov $nr,%eax; syscall
+    let mut out = alloc::vec::Vec::new();
+    match crate::math::shape(call.name()) {
+        Some(Shape::Unary) => {
+            out.extend(FIRST);
+            out.extend(trap);
+            out.extend(ANSWER);
+        }
+        Some(Shape::Binary) => {
+            out.extend(FIRST);
+            out.extend(SECOND);
+            out.extend(trap);
+            out.extend(ANSWER);
+        }
+        Some(Shape::Ternary) => {
+            out.extend(FIRST);
+            out.extend(SECOND);
+            out.extend(THIRD);
+            out.extend(trap);
+            out.extend(ANSWER);
+        }
+        // The integer or pointer arrives in the register the number's bits
+        // are about to take, so it moves over first.
+        Some(Shape::WithInteger) => {
+            out.extend([0x48, 0x89, 0xFE]); // mov %rdi,%rsi
+            out.extend(FIRST);
+            out.extend(trap);
+            out.extend(ANSWER);
+        }
+        // Two answers come back through memory, since a trap returns one.
+        Some(Shape::Pair) => {
+            out.extend([0x48, 0x83, 0xEC, 0x18]); // sub $24,%rsp
+            out.extend(FIRST);
+            out.extend([0x48, 0x89, 0xE6]); // mov %rsp,%rsi
+            out.extend(trap);
+            out.extend([0xF2, 0x0F, 0x10, 0x04, 0x24]); // movsd (%rsp),%xmm0
+            out.extend([0xF2, 0x0F, 0x10, 0x4C, 0x24, 0x08]); // movsd 8(%rsp),%xmm1
+            out.extend([0x48, 0x83, 0xC4, 0x18]); // add $24,%rsp
+            out.push(0xC3);
+        }
+        None if call.name() == "_exit" => out = exit_code(),
+        None => return None,
+    }
+    Some(out)
+}
+
+/// `exit(status)`: what `atexit` was given, last first, and then the
+/// process ends. The functions are the program's own, so the calling has to
+/// happen on its side of the trap.
+fn exit_code() -> alloc::vec::Vec<u8> {
+    let list = (Library::new(0).private() + PRIVATE_ATEXIT) as u32;
+    let leave = Library::call("__exit").map_or(0, DarwinCall::nr);
+    let mut out = alloc::vec![
+        0x41,
+        0x89,
+        0xFC, // mov %edi,%r12d
+        0x48,
+        0x83,
+        0xE4,
+        0xF0, // and $-16,%rsp
+        0x65,
+        0x48,
+        0x8B,
+        0x1C,
+        0x25, // mov %gs:TSD_LIBRARY,%rbx
+        crate::start::TSD_LIBRARY as u8,
+        0,
+        0,
+        0,
+        0x48,
+        0x81,
+        0xC3, // add $list,%rbx
+    ];
+    out.extend(list.to_le_bytes());
+    out.extend([
+        0x48, 0x8B, 0x03, // again: mov (%rbx),%rax
+        0x48, 0x85, 0xC0, // test %rax,%rax
+        0x74, 0x0C, // jz leave
+        0x48, 0xFF, 0xC8, // dec %rax
+        0x48, 0x89, 0x03, // mov %rax,(%rbx)
+        0xFF, 0x54, 0xC3, 0x08, // call *8(%rbx,%rax,8)
+        0xEB, 0xEC, // jmp again
+        0x44, 0x89, 0xE7, // leave: mov %r12d,%edi
+        0xB8, // mov $leave,%eax
+    ]);
+    out.extend(leave.to_le_bytes());
+    out.extend([0x0F, 0x05]); // syscall
+    out
+}
+
 /// One stub: the Darwin C ABI hands arguments over in the registers a trap
 /// reads, except that `syscall` destroys `rcx`, so the fourth argument moves
 /// to `r10` first - which is what every libSystem stub does too.
@@ -891,7 +1088,7 @@ fn place(index: usize) -> u64 {
             .sum();
     }
     let before = TABLE[..index].iter().filter(|e| e.len == 0).count();
-    page_up(vars_len()) + (before * STUB_LEN) as u64
+    page_up(vars_len() + PRIVATE_LEN) + (before * STUB_LEN) as u64
 }
 
 /// How much room the variables take together.
@@ -1298,7 +1495,7 @@ mod tests {
         assert!(stderr < lib.base + lib.code_off(), "{stderr:#x} is a slot");
         assert!(write >= lib.base + lib.code_off(), "{write:#x} is a stub");
         assert_eq!(
-            write % STUB_LEN as u64,
+            (write - lib.base - lib.code_off()) % STUB_LEN as u64,
             0,
             "a stub starts where its index says"
         );

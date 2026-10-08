@@ -86,6 +86,9 @@ pub struct MockHost {
     pub advised: RefCell<Option<Advice>>,
     /// User memory, as one flat buffer starting at address zero.
     pub mem: RefCell<Vec<u8>>,
+    /// How many times that memory has been read, each one a call into the
+    /// host on a real machine.
+    pub reads: core::cell::Cell<usize>,
     pub opened: RefCell<Option<(At, String, OpenHow)>>,
     pub asked: RefCell<Option<(String, bool)>>,
     pub describes: Option<Attributes>,
@@ -95,6 +98,7 @@ unsafe impl Sync for MockHost {}
 
 impl Platform for MockHost {
     fn read_user(&self, uaddr: usize, out: &mut [u8]) -> SysResult {
+        self.reads.set(self.reads.get() + 1);
         let mem = self.mem.borrow();
         let end = uaddr + out.len();
         if end > mem.len() {

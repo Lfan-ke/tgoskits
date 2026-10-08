@@ -36,9 +36,21 @@ pub const TSD_ERRNO: u64 = 8;
 /// have state of their own - the allocator - find it from here.
 pub const TSD_LIBRARY: u64 = 16;
 
-/// How big the block is. Only three words are spoken for; the rest is room
-/// for what the pthread family will need.
-pub const TSD_LEN: u64 = 64;
+/// The high end of the thread's stack and how long it is, which is what
+/// `pthread_get_stackaddr_np` and `pthread_get_stacksize_np` answer with.
+pub const TSD_STACK_TOP: u64 = 24;
+pub const TSD_STACK_LEN: u64 = 32;
+
+/// The thread's signal mask.
+pub const TSD_SIGMASK: u64 = 40;
+
+/// Where the values of thread-specific keys begin, one word a key, and how
+/// many keys there is room for.
+pub const TSD_KEYS: u64 = 128;
+pub const TSD_KEY_LIMIT: u64 = 64;
+
+/// How big the block is.
+pub const TSD_LEN: u64 = TSD_KEYS + TSD_KEY_LIMIT * 8;
 
 /// The block a thread reaches through `gs`, placed at `at`, for a process
 /// whose synthesized library is at `library`.

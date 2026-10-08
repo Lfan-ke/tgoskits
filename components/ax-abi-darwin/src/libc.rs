@@ -32,6 +32,41 @@ const ENAMETOOLONG: i32 = 63;
 /// exit code of its own.
 const SIGABRT: i32 = 6;
 
+/// What a call arrives with besides its number: the six argument registers,
+/// the stack pointer, which is where a variadic call keeps the rest, and the
+/// thread's block.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    pub a: [usize; 6],
+    pub sp: usize,
+    pub tsd: usize,
+}
+
+/// The entry points that answer with a pointer, whose failure is therefore a
+/// null one with `errno` set rather than -1.
+const NULL_ON_FAILURE: &[&str] = &[
+    "_calloc",
+    "_dlopen",
+    "_dlsym",
+    "_fdopen$DARWIN_EXTSN",
+    "_fdopendir$INODE64",
+    "_fgets",
+    "_fopen",
+    "_fopen$DARWIN_EXTSN",
+    "_getcwd",
+    "_gmtime_r",
+    "_localtime_r",
+    "_malloc",
+    "_opendir$INODE64",
+    "_readdir$INODE64",
+    "_realloc",
+    "_realpath$DARWIN_EXTSN",
+    "_setlocale",
+    "_strdup",
+    "_strerror",
+    "_strstr",
+];
+
 /// Service a call that came through one of the library's stubs.
 pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
     let Ok(nr) = u32::try_from(env.nr()) else {
@@ -61,7 +96,12 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         return Dispatch::Passthrough;
     }
     let library = Library::new(u64::from_le_bytes(base));
-    let outcome = route(host, library, call, &a).unwrap_or_else(|| {
+    let frame = Frame {
+        a,
+        sp: env.stack_pointer(),
+        tsd,
+    };
+    let outcome = route(host, library, call, &frame).unwrap_or_else(|| {
         host.platform()
             .trace(&alloc::format!("{} is not implemented", call.name()));
         Err(ENOSYS)
@@ -70,6 +110,13 @@ pub fn dispatch(env: &mut dyn TrapEnv, host: &dyn Host) -> Dispatch {
         Ok(value) => {
             env.set_error(false);
             env.set_result(value as usize);
+        }
+        Err(errno) if NULL_ON_FAILURE.contains(&call.name()) => {
+            let _ = host
+                .platform()
+                .write_user(tsd + crate::start::TSD_ERRNO as usize, &errno.to_le_bytes());
+            env.set_error(false);
+            env.set_result(0);
         }
         Err(errno) => {
             // The C entry points report failure the way C does - a negative
@@ -105,6 +152,7 @@ const CALLS: &[(&str, usize)] = &[
     ("_madvise", nr::MADVISE),
     ("_mmap", nr::MMAP),
     ("_mprotect", nr::MPROTECT),
+    ("_msync", nr::MSYNC),
     ("_munmap", nr::MUNMAP),
     ("_open", nr::OPEN),
     ("_openat", nr::OPENAT),
@@ -121,15 +169,14 @@ const CALLS: &[(&str, usize)] = &[
 ///
 /// `library` is where the synthesized library was placed, which the entries
 /// that keep state - the allocator - need to find their own words.
-fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) -> Option<SysResult> {
+fn route(host: &dyn Host, library: Library, call: DarwinCall, f: &Frame) -> Option<SysResult> {
     let name = call.name();
+    let a = &f.a;
+    let errno = f.tsd + crate::start::TSD_ERRNO as usize;
     if let Ok(at) = CALLS.binary_search_by_key(&name, |entry| entry.0) {
         return crate::bsd::route(host, CALLS[at].1, a);
     }
     Some(match name {
-        // `exit(3)`. Flushing what stdio holds belongs here once there is
-        // stdio to flush; until then it is the same as leaving.
-        "_exit" => host.tasks()?.exit_group((a[0] as i32) << 8),
         "_dup" => host.files()?.dup(a[0] as i32),
         // The allocator: the code is here, but every byte it hands out and
         // every word it remembers is the program's own.
@@ -173,7 +220,105 @@ fn route(host: &dyn Host, library: Library, call: DarwinCall, a: &[usize; 6]) ->
                 .trace(&alloc::format!("{name} ended the program"));
             host.tasks()?.exit_group(SIGABRT)
         }
-        _ => return None,
+        "_CCRandomGenerateBytes" => crate::node::random(host, a[0], a[1]),
+        "_getentropy" => crate::node::getentropy(host, a[0], a[1]),
+        "_clock_gettime" => crate::clock::gettime(host, a[0], a[1]),
+        "_clock_getres" => crate::clock::getres(host, a[0], a[1]),
+        "_mach_absolute_time" => crate::clock::absolute(host),
+        "_mach_timebase_info" => crate::clock::timebase(host, a[0]),
+        "_time" => crate::clock::time(host, a[0]),
+        "_nanosleep" => crate::clock::nanosleep(host, a[0], a[1]),
+        "_gmtime_r" | "_localtime_r" => crate::clock::gmtime(host, &library, a[0], a[1]),
+        "_mktime" => crate::clock::mktime(host, &library, a[0]),
+        // There is one zone, so there is nothing to read.
+        "_tzset" => Ok(0),
+        "_pthread_mutex_init" => crate::thread::mutex_init(host, a[0], a[1]),
+        "_pthread_mutex_lock" => crate::thread::mutex_lock(host, a[0], false),
+        "_pthread_mutex_trylock" => crate::thread::mutex_lock(host, a[0], true),
+        "_pthread_mutex_unlock" => crate::thread::mutex_unlock(host, a[0]),
+        // With one thread there is nothing to tear down, nobody to wake, and
+        // no second stack for an attribute to size.
+        "_pthread_mutex_destroy"
+        | "_pthread_cond_init"
+        | "_pthread_cond_destroy"
+        | "_pthread_cond_signal"
+        | "_pthread_attr_init"
+        | "_pthread_attr_destroy"
+        | "_pthread_attr_setstacksize"
+        | "_pthread_attr_setscope"
+        | "_pthread_setname_np"
+        | "_pthread_key_delete" => Ok(0),
+        "_pthread_cond_wait" => crate::thread::cond_wait(host),
+        "_pthread_cond_timedwait" => crate::thread::cond_timedwait(host, a[2]),
+        "_pthread_cond_timedwait_relative_np" => crate::thread::cond_timedwait_relative(host, a[2]),
+        "_pthread_key_create" => crate::thread::key_create(host, &library, a[0]),
+        "_pthread_getspecific" => crate::thread::getspecific(host, f, a[0]),
+        "_pthread_setspecific" => crate::thread::setspecific(host, f, a[0], a[1]),
+        "_pthread_get_stackaddr_np" => crate::thread::stack_top(host, a[0]),
+        "_pthread_get_stacksize_np" => crate::thread::stack_len(host, a[0]),
+        "_pthread_threadid_np" => crate::thread::thread_id(host, a[1]),
+        "_pthread_sigmask" => crate::thread::sigmask(host, f, a[0], a[1], a[2]),
+        "_pthread_create" => crate::thread::create(host),
+        "_sched_yield" => host.tasks()?.sched_yield(),
+        "_sigaction" => crate::node::sigaction(host, &library, a[0], a[1], a[2]),
+        "_fcntl" => crate::node::fcntl(host, a[0] as i32, a[1], a[2]),
+        "_ioctl" => crate::node::ioctl(host, a[0] as i32, a[1]),
+        "_isatty" => crate::node::isatty(host, errno, a[0] as i32),
+        "_opendir$INODE64" => crate::node::opendir(host, &library, a[0]),
+        "_fdopendir$INODE64" => crate::node::fdopendir(host, &library, a[0] as i32),
+        "_readdir$INODE64" => crate::node::readdir(host, a[0]),
+        "_rewinddir$INODE64" => crate::node::rewinddir(host, a[0]),
+        "_closedir" => crate::node::closedir(host, &library, a[0]),
+        "_getcwd" => crate::node::getcwd(host, &library, a[0], a[1]),
+        "_realpath$DARWIN_EXTSN" => crate::node::realpath(host, &library, a[0], a[1]),
+        "_readlink" => crate::node::readlink(host, a[0], a[1], a[2]),
+        "_pthread_getname_np" => crate::thread::name(host, a[1], a[2]),
+        "_uname" => crate::node::uname(host, a[0]),
+        "__availability_version_check" => crate::node::available(host, a[0], a[1]),
+        "_strtol" => crate::text::strtol(host, errno, a, false),
+        "_strtoul" => crate::text::strtol(host, errno, a, true),
+        "_wcstol" => crate::text::wcstol(host, errno, a),
+        "_strstr" => crate::text::strstr(host, a[0], a[1]),
+        "_strdup" => crate::text::strdup(host, &library, a[0]),
+        "___strlcat_chk" => crate::text::strlcat(host, a[0], a[1], a[2]),
+        "_wcsncpy" => crate::text::wcsncpy(host, a[0], a[1], a[2]),
+        "_strerror" => crate::text::strerror(host, &library, a[0]),
+        "_setlocale" => crate::text::setlocale(host, &library, a[1]),
+        "_nl_langinfo" => crate::text::nl_langinfo(&library, a[0]),
+        "_mbstowcs" => crate::text::mbstowcs(host, a[0], a[1], a[2]),
+        "_wcstombs" => crate::text::wcstombs(host, a[0], a[1], a[2]),
+        "_mbrtowc" => crate::text::mbrtowc(host, a[0], a[1], a[2]),
+        "_snprintf" => crate::fmt::snprintf(host, f),
+        "_sprintf" => crate::fmt::sprintf(host, f),
+        "___sprintf_chk" => crate::fmt::sprintf_chk(host, f),
+        "_vsnprintf" => crate::fmt::vsnprintf(host, f),
+        "_fprintf" => crate::fmt::fprintf(host, &library, f),
+        "_vfprintf" => crate::fmt::vfprintf(host, &library, f),
+        "_printf" => crate::fmt::printf(host, &library, f),
+        "_fgets" => crate::stdio::fgets(host, a[0], a[1], a[2]),
+        "_getc" | "___srget" => crate::stdio::getc(host, a[0]),
+        "_ungetc" => crate::stdio::ungetc(host, a[0], a[1]),
+        "_fseek" => crate::stdio::fseek(host, a[0], a[1] as isize, a[2]),
+        "_ftell" => crate::stdio::ftell(host, a[0]),
+        "_rewind" => crate::stdio::fseek(host, a[0], 0, 0),
+        "_dlopen" => crate::dl::dlopen(host, &library, a[0]),
+        "_dlsym" => crate::dl::dlsym(host, &library, a[0], a[1]),
+        "_dlerror" => crate::dl::dlerror(host, &library),
+        "_dladdr" => crate::dl::dladdr(host, &library, a[0], a[1]),
+        "_atexit" => crate::node::atexit(host, &library, a[0]),
+        "_unlink" => crate::node::unlink(host, a[0], false),
+        "_rmdir" => crate::node::unlink(host, a[0], true),
+        "_rename" => crate::node::rename(host, a[0], a[1]),
+        "_mkdir" => crate::node::mkdir(host, a[0], a[1] as u32),
+        "_dirfd" => crate::node::dirfd(host, a[0]),
+        "_gettimeofday" => crate::clock::gettimeofday(host, a[0]),
+        "_strtoll" => crate::text::strtol(host, errno, a, false),
+        "___strcat_chk" => crate::text::strcat(host, a[0], a[1], usize::MAX),
+        "___strncat_chk" => crate::text::strcat(host, a[0], a[1], a[2]),
+        // An `fd_set` holds 1024 descriptors, and this says whether one fits.
+        "___darwin_check_fd_set_overflow" => Ok(isize::from(a[0] < 1024)),
+        "_crc32" => crc32(host, a[0] as u32, a[1], a[2]),
+        _ => return crate::math::route(host, name, a),
     })
 }
 
@@ -349,6 +494,17 @@ mod tests {
     }
 
     #[test]
+    fn crc32_matches_the_check_value_and_continues_across_calls() {
+        let host = MockHost::default();
+        host.mem.borrow_mut().resize(0x1000, 0);
+        host.mem.borrow_mut()[0x100..0x109].copy_from_slice(b"123456789");
+        assert_eq!(crc32(&host, 0, 0x100, 9), Ok(0xCBF4_3926));
+        let first = crc32(&host, 0, 0x100, 4).unwrap() as u32;
+        assert_eq!(crc32(&host, first, 0x104, 5), Ok(0xCBF4_3926));
+        assert_eq!(crc32(&host, 7, 0, 9), Ok(0), "a null buffer starts over");
+    }
+
+    #[test]
     fn abort_ends_the_program_rather_than_returning_to_it() {
         let host = MockHost::default();
         let mut env = call("_abort", &host, [0; 6]);
@@ -362,10 +518,32 @@ mod tests {
     #[test]
     fn an_entry_point_with_no_body_yet_says_so_rather_than_answer() {
         let host = MockHost::default();
-        let mut env = call("_fprintf", &host, [0; 6]);
+        let mut env = call("_forkpty", &host, [0; 6]);
         assert_eq!(dispatch(&mut env, &host), Dispatch::Handled);
         assert_eq!(env.answer(), (Some(ENOSYS as usize), Some(true)));
     }
+}
+
+/// zlib's `crc32(crc, buf, len)`. libz is one of the libraries a Darwin system
+/// provides, and this is the one entry of it the shipped modules bind. A null
+/// buffer asks for the starting value.
+fn crc32(host: &dyn Host, crc: u32, buf: usize, len: usize) -> SysResult {
+    if buf == 0 {
+        return Ok(0);
+    }
+    let mut crc = !crc;
+    let mut done = 0;
+    while done < len {
+        let step = (len - done).min(4096);
+        for byte in crate::user::bytes(host, buf + done, step)? {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        done += step;
+    }
+    Ok(!crc as isize)
 }
 
 /// `_NSGetExecutablePath(buf, &size)`: the path the program was run by, copied
@@ -431,6 +609,7 @@ fn getenv(host: &dyn Host, library: &Library, name_at: usize) -> SysResult {
 
 /// The `_SC_*` names this layer can answer, from Darwin's `<unistd.h>`.
 mod sc {
+    pub const CLK_TCK: usize = 3;
     pub const PAGESIZE: usize = 29;
 }
 
@@ -444,6 +623,8 @@ fn sysconf(host: &dyn Host, name: usize) -> SysResult {
     match name {
         // The page size is this personality's own, not something to ask about.
         sc::PAGESIZE => Ok(crate::PAGE as isize),
+        // What `times` counts in, which on Darwin is hundredths of a second.
+        sc::CLK_TCK => Ok(100),
         _ => {
             host.platform()
                 .trace(&alloc::format!("sysconf({name}) has no answer here"));

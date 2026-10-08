@@ -78,7 +78,7 @@ impl Module {
     }
 
     /// The address one past the last byte the image occupies.
-    fn end(&self) -> u64 {
+    pub(crate) fn end(&self) -> u64 {
         self.segments
             .iter()
             .filter(|s| s.vmsize != 0)
@@ -173,14 +173,15 @@ pub fn link(bytes: Vec<u8>, path: &str, env: &mut dyn LoadEnv) -> AbiResult<Link
 
     let system = Library::new(next);
     for at in 0..modules.len() {
-        let fixed = fixups(&modules, at, &system, env)?;
+        let fixed = fixups_with(&modules, at, &system, env, &|_| None)?;
         apply(&mut modules[at], fixed);
+        thread_locals(&mut modules[at]);
     }
     Ok(Linked { modules, system })
 }
 
 /// Read one image's header and settle where it goes.
-fn module(name: String, bytes: Vec<u8>, info: MachoInfo, slide: u64) -> Module {
+pub(crate) fn module(name: String, bytes: Vec<u8>, info: MachoInfo, slide: u64) -> Module {
     let segments: Vec<Segment> = info.segments(&bytes).collect();
     // An image's own addresses are measured from its mach header, which is in
     // whichever segment starts at the front of the file - not `__PAGEZERO`,
@@ -246,19 +247,22 @@ pub fn read_all(env: &mut dyn LoadEnv) -> AbiResult<Vec<u8>> {
 
 /// One place to write, named by where it is in the file and in memory, since
 /// a fixup past the file's own bytes can only be written once mapped.
-struct Fix {
+pub(crate) struct Fix {
     file: u64,
     va: u64,
     value: u64,
     kind: RebaseKind,
 }
 
-/// What both streams of module `at` say to write.
-fn fixups(
+/// What both streams of module `at` say to write. `elsewhere` is asked for a
+/// symbol the set itself does not have, which is how an image loaded after
+/// start reaches the images that were already there.
+pub(crate) fn fixups_with(
     modules: &[Module],
     at: usize,
     system: &Library,
     env: &mut dyn LoadEnv,
+    elsewhere: &dyn Fn(&str) -> Option<u64>,
 ) -> AbiResult<Vec<Fix>> {
     let module = &modules[at];
     let Some(info) = dyld::info(
@@ -306,7 +310,7 @@ fn fixups(
                 ));
                 return;
             };
-            let target = resolve(modules, at, system, &bind);
+            let target = resolve(modules, at, system, &bind).or_else(|| elsewhere(bind.symbol));
             let value = match target {
                 Some(target) => target.wrapping_add(bind.addend as u64),
                 // A weak import the set does not have is a zero the program is
@@ -381,7 +385,7 @@ fn resolve(modules: &[Module], at: usize, system: &Library, bind: &Bind<'_>) -> 
 
 /// Write what the streams said into the image, leaving what falls past the
 /// file's own bytes for the caller to write once the segment is mapped.
-fn apply(module: &mut Module, fixed: Vec<Fix>) {
+pub(crate) fn apply(module: &mut Module, fixed: Vec<Fix>) {
     for fix in fixed {
         let at = fix.file as usize;
         let wrote = match fix.kind {
@@ -396,6 +400,102 @@ fn apply(module: &mut Module, fixed: Vec<Fix>) {
         };
         if wrote.is_none() {
             module.late.push((fix.va, fix.value));
+        }
+    }
+}
+
+/// Section types from `<mach-o/loader.h>`: thread-local storage with initial
+/// content, without, and the descriptors that name variables in either.
+const S_THREAD_LOCAL_REGULAR: u8 = 0x11;
+const S_THREAD_LOCAL_ZEROFILL: u8 = 0x12;
+const S_THREAD_LOCAL_VARIABLES: u8 = 0x13;
+const LC_SEGMENT_64: u32 = 0x19;
+
+/// Every section the image declares: where it is, how long, and its type.
+fn sections(module: &Module) -> Vec<(u64, u64, u8)> {
+    let bytes = &module.bytes;
+    let word = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let long = |at: usize| {
+        bytes
+            .get(at..at + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])))
+    };
+    let mut out = Vec::new();
+    let mut at = module.info.commands_off;
+    let end = at + module.info.sizeofcmds as usize;
+    for _ in 0..module.info.ncmds {
+        let (Some(cmd), Some(size)) = (word(at), word(at + 4)) else {
+            break;
+        };
+        let size = size as usize;
+        if size < 8 || at + size > end {
+            break;
+        }
+        if cmd == LC_SEGMENT_64 {
+            // A segment command is 72 bytes, with its section count 64 in,
+            // and each section header after it is 80.
+            let count = word(at + 64).unwrap_or(0) as usize;
+            for index in 0..count {
+                let section = at + 72 + index * 80;
+                if section + 80 > at + size {
+                    break;
+                }
+                if let (Some(addr), Some(len), Some(flags)) =
+                    (long(section + 32), long(section + 40), word(section + 64))
+                {
+                    out.push((addr, len, flags as u8));
+                }
+            }
+        }
+        at += size;
+    }
+    out
+}
+
+/// Point each thread-local descriptor at its storage.
+///
+/// A thread's variables are a copy of the image's template, and dyld makes
+/// the copy when a thread first asks. With one thread the template is that
+/// copy, so a descriptor's second word is simply where the image keeps it;
+/// a second thread needs a copy of its own, which is for whatever creates
+/// one to make.
+pub(crate) fn thread_locals(module: &mut Module) {
+    let sections = sections(module);
+    let Some(storage) = sections
+        .iter()
+        .filter(|s| matches!(s.2, S_THREAD_LOCAL_REGULAR | S_THREAD_LOCAL_ZEROFILL))
+        .map(|s| s.0)
+        .min()
+    else {
+        return;
+    };
+    let storage = module.slide + storage;
+    for (addr, len, kind) in sections {
+        if kind != S_THREAD_LOCAL_VARIABLES {
+            continue;
+        }
+        let Some((vmaddr, fileoff, filesize)) = module
+            .segments
+            .iter()
+            .find(|s| (s.vmaddr..s.vmaddr + s.vmsize).contains(&addr))
+            .map(|s| (s.vmaddr, s.fileoff, s.filesize))
+        else {
+            continue;
+        };
+        // A descriptor is three words; the storage goes in the second.
+        for index in 0..len / 24 {
+            let key = addr + index * 24 + 8;
+            let file = (fileoff + (key - vmaddr)) as usize;
+            match module.bytes.get_mut(file..file + 8) {
+                Some(slot) if key - vmaddr + 8 <= filesize => {
+                    slot.copy_from_slice(&storage.to_le_bytes());
+                }
+                _ => module.late.push((module.slide + key, storage)),
+            }
         }
     }
 }

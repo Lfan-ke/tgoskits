@@ -16,13 +16,21 @@
 #![feature(used_with_arg)]
 
 pub mod bsd;
+pub mod clock;
+pub mod dl;
 pub mod environ;
+pub mod fmt;
 pub mod heap;
 pub mod libc;
 pub mod link;
+pub mod math;
+pub mod node;
 pub mod start;
 pub mod stdio;
 pub mod system;
+pub mod text;
+pub mod thread;
+pub mod user;
 
 #[cfg(test)]
 mod testing;
@@ -206,10 +214,11 @@ mod tests {
             .expect("load");
         // Only __TEXT is mapped from the image; __PAGEZERO is skipped. The
         // rest of what is mapped is the system's own: its variables, its
-        // stubs, the code the process starts on, and the stack.
+        // stubs, the code the process starts on, the thread block, and the
+        // table of loaded images.
         assert_eq!(env.maps[0].0, 0x1_0000_0000);
         assert_eq!(env.maps[0].1, Prot::READ | Prot::EXEC);
-        assert_eq!(env.maps.len(), 5);
+        assert_eq!(env.maps.len(), 6);
         // The program does not begin at its own `main` any more: it begins at
         // the code that calls it and exits with what it returns.
         assert_ne!(loaded.entry, 0x1_0000_0200);
@@ -292,7 +301,7 @@ mod tests {
             )
             .expect("load");
         // __PAGEZERO skipped; __TEXT/__DATA/__LINKEDIT mapped with their prots.
-        assert_eq!(env.maps.len(), 3 + 4);
+        assert_eq!(env.maps.len(), 3 + 5);
         assert_eq!(
             env.maps[0],
             (0x1_0000_0000, Prot::READ | Prot::EXEC, 0x1000)
@@ -354,6 +363,19 @@ impl ImageFormat for MachoFormat {
             .address("_exit")
             .ok_or(AbiError::MissingLibrary)?;
         let inits = linked.initializers();
+        for module in &linked.modules {
+            env.trace(&alloc::format!(
+                "{} at {:#x}+{:#x}",
+                module.name,
+                module.base,
+                module.end() - module.base
+            ));
+        }
+        env.trace(&alloc::format!(
+            "libSystem (synthesized) at {:#x}+{:#x}",
+            linked.system.base,
+            linked.system.extent()
+        ));
         let start_va = linked.system.base + linked.system.extent();
 
         env.reset()?;
@@ -441,6 +463,48 @@ impl ImageFormat for MachoFormat {
             Prot::READ | Prot::WRITE,
             Some(&start::tsd(tsd_va, system.base)),
         )?;
+        let (stack_top, stack_len) = (env.stack_top(), env.stack_len());
+        env.write(tsd_va + start::TSD_STACK_TOP, &stack_top.to_le_bytes())?;
+        env.write(tsd_va + start::TSD_STACK_LEN, &stack_len.to_le_bytes())?;
+        // The record of what is loaded, which `dladdr` reads and `dlopen`
+        // adds to. It is the process's own, like everything else this
+        // library remembers.
+        let table_va = page_up(tsd_va + start::TSD_LEN);
+        let listed = linked.modules.len().min(dl::ENTRY_LIMIT as usize);
+        let mut table = alloc::vec::Vec::new();
+        for module in &linked.modules[..listed] {
+            table.extend(dl::entry(
+                module.base,
+                module.slide,
+                module.end(),
+                &module.name,
+            ));
+        }
+        env.map_region(
+            table_va,
+            dl::ENTRY_LEN * dl::ENTRY_LIMIT,
+            Prot::READ | Prot::WRITE,
+            Some(&table),
+        )?;
+        env.write(
+            system.private() + system::PRIVATE_MODULES_AT,
+            &table_va.to_le_bytes(),
+        )?;
+        env.write(
+            system.private() + system::PRIVATE_MODULES,
+            &(listed as u64).to_le_bytes(),
+        )?;
+        for (at, text) in [
+            (system::PRIVATE_TEXT_C, &b"C\0"[..]),
+            (system::PRIVATE_TEXT_UTF8, b"UTF-8\0"),
+            (system::PRIVATE_TEXT_UTC, b"UTC\0"),
+        ] {
+            env.write(system.private() + at, text)?;
+        }
+        // The table `isalpha` and its kin read inline.
+        if let Some(at) = system.address("__DefaultRuneLocale") {
+            env.write(at, &text::rune_locale())?;
+        }
         // The host already mapped a stack; what goes on it is written, not
         // mapped over.
         env.write(stack.sp, &stack.bytes)?;
