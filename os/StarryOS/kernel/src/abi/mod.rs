@@ -89,6 +89,22 @@ impl TrapEnv for TrapCtx<'_> {
         self.uctx.gs_base as usize
     }
 
+    // Darwin reports failure in the carry flag, which is a bit of the flags
+    // the return to user mode restores. Left alone, the bit is whatever the
+    // program's last arithmetic made it, and a call that succeeded reads as
+    // one that failed.
+    #[cfg(target_arch = "x86_64")]
+    fn set_error(&mut self, failed: bool) {
+        const CARRY: u64 = 1;
+        if self.uctx.ip() == self.entry_ip {
+            if failed {
+                self.uctx.rflags |= CARRY;
+            } else {
+                self.uctx.rflags &= !CARRY;
+            }
+        }
+    }
+
     fn set_result(&mut self, value: usize) {
         // A syscall that got a signal delivered has already moved the frame on.
         // Where the return value shares a register with the first argument,
