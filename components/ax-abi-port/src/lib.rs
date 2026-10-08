@@ -353,6 +353,26 @@ pub trait Paths: Sync {
     /// that canonicalizes a handle back to a name - Windows does this to locate
     /// itself - needs the host to say what a descriptor refers to. A host that
     /// cannot name it reports the error rather than a guess.
+    /// Remove the name `path`; `directory` says which kind it has to be.
+    fn unlink(&self, _at: At, _path: &str, _directory: bool) -> SysResult {
+        Err(ENOSYS)
+    }
+
+    /// Give `from` the name `to`, replacing what was there.
+    fn rename(&self, _from_at: At, _from: &str, _to_at: At, _to: &str) -> SysResult {
+        Err(ENOSYS)
+    }
+
+    /// Make the directory `path` with permission bits `mode`.
+    fn make_dir(&self, _at: At, _path: &str, _mode: u32) -> SysResult {
+        Err(ENOSYS)
+    }
+
+    /// What the symbolic link `path` points at.
+    fn read_link(&self, _at: At, _path: &str, _put: &mut dyn FnMut(&str)) -> Result<(), i32> {
+        Err(ENOSYS)
+    }
+
     fn path_of(&self, _fd: i32, _put: &mut dyn FnMut(&str)) -> Result<(), i32> {
         Err(ENOSYS)
     }
@@ -419,6 +439,14 @@ pub trait Files: Sync {
     /// `newfd`. The two are never equal here: what that means is the ABI's call,
     /// so a domain settles it before asking.
     fn dup_onto(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult;
+    /// Whether `fd` is closed when the process loads a new image.
+    fn close_on_exec(&self, _fd: i32) -> Result<bool, i32> {
+        Err(ENOSYS)
+    }
+    /// Set or clear that.
+    fn set_close_on_exec(&self, _fd: i32, _on: bool) -> SysResult {
+        Err(ENOSYS)
+    }
     /// Flush `fd` to backing storage. `datasync` may skip metadata not needed
     /// for data integrity.
     fn fsync(&self, fd: i32, datasync: bool) -> SysResult;

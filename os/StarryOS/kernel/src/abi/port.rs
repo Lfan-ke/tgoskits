@@ -143,6 +143,77 @@ impl Paths for KernelHost {
         describe(resolve_at(fd, None, AT_EMPTY_PATH))
     }
 
+    fn unlink(&self, at: At, path: &str, directory: bool) -> SysResult {
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        port_result(crate::file::with_fs(dirfd, |fs| {
+            if directory {
+                fs.remove_dir(path)?;
+            } else {
+                fs.remove_file(path)?;
+            }
+            Ok(0)
+        }))
+    }
+
+    fn rename(&self, from_at: At, from: &str, to_at: At, to: &str) -> SysResult {
+        use axfs_ng_vfs::path::Path;
+        let dirfd = |at| match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let (old_dir, old_name) =
+            crate::file::with_fs(dirfd(from_at), |fs| Ok(fs.resolve_parent(Path::new(from))?))
+                .map_err(errno)?;
+        let (new_dir, new_name) =
+            crate::file::with_fs(dirfd(to_at), |fs| Ok(fs.resolve_parent(Path::new(to))?))
+                .map_err(errno)?;
+        old_dir
+            .rename(&old_name, &new_dir, &new_name)
+            .map_err(|err| errno(StarryError::from(err)))?;
+        Ok(0)
+    }
+
+    fn make_dir(&self, at: At, path: &str, mode: u32) -> SysResult {
+        use axfs_ng_vfs::{NodePermission, VfsError};
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let curr = current();
+        let thread = curr.as_thread();
+        let mode = NodePermission::from_bits_truncate((mode & !thread.proc_data.umask()) as u16);
+        let cred = thread.cred();
+        let (uid, gid) = (cred.fsuid, cred.fsgid);
+        port_result(crate::file::with_fs(dirfd, |fs| {
+            match fs.create_dir(path, mode, uid, gid) {
+                Ok(_) => Ok(0),
+                Err(VfsError::InvalidInput)
+                    if !path.is_empty() && fs.resolve_no_follow(path).is_ok() =>
+                {
+                    Err(StarryError::AlreadyExists)
+                }
+                Err(err) => Err(err.into()),
+            }
+        }))
+    }
+
+    fn read_link(&self, at: At, path: &str, put: &mut dyn FnMut(&str)) -> Result<(), i32> {
+        let dirfd = match at {
+            At::Cwd => AT_FDCWD,
+            At::Dir(fd) => fd,
+        };
+        let link = crate::file::with_fs(dirfd, |fs| {
+            let entry = fs.resolve_no_follow(path)?;
+            Ok(entry.read_link()?)
+        })
+        .map_err(errno)?;
+        put(&link);
+        Ok(())
+    }
+
     fn path_of(&self, fd: i32, put: &mut dyn FnMut(&str)) -> Result<(), i32> {
         let file = get_file_like(fd).map_err(errno)?;
         put(&file.path());
@@ -319,6 +390,23 @@ impl Files for KernelHost {
 
     fn dup_onto(&self, oldfd: i32, newfd: i32, cloexec: bool) -> SysResult {
         port_result(syscall::dup_onto(oldfd, newfd, cloexec))
+    }
+
+    fn close_on_exec(&self, fd: i32) -> Result<bool, i32> {
+        crate::file::current_fd_table()
+            .read()
+            .get(fd as _)
+            .map(|entry| entry.cloexec)
+            .ok_or_else(|| errno(StarryError::BadFileDescriptor))
+    }
+
+    fn set_close_on_exec(&self, fd: i32, on: bool) -> SysResult {
+        crate::file::current_fd_table()
+            .write()
+            .get_mut(fd as _)
+            .ok_or_else(|| errno(StarryError::BadFileDescriptor))?
+            .cloexec = on;
+        Ok(0)
     }
 
     fn fsync(&self, fd: i32, datasync: bool) -> SysResult {

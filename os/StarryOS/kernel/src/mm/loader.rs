@@ -261,6 +261,10 @@ impl ax_binfmt::LoadEnv for ExecSpace<'_> {
         crate::config::USER_STACK_TOP as u64
     }
 
+    fn stack_len(&self) -> u64 {
+        crate::config::USER_STACK_SIZE as u64
+    }
+
     fn cpu_capabilities(&self) -> u64 {
         ax_runtime::hal::cpu::cap::elf_hwcap() as u64
     }

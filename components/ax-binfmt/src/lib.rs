@@ -183,6 +183,11 @@ pub trait LoadEnv {
         0
     }
 
+    /// How long that stack is, for an ABI that tells a thread the bounds of
+    /// its own stack.
+    fn stack_len(&self) -> u64 {
+        0
+    }
     /// What the processor can do, as the host reports it. Formats that hand a
     /// program a capability word (`AT_HWCAP`) pass this through.
     fn cpu_capabilities(&self) -> u64 {
